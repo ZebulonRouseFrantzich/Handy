@@ -762,9 +762,8 @@ impl ShortcutAction for TranscribeAction {
                     match transcription_result {
                         Ok(transcription) => {
                             debug!(
-                                "Transcription completed in {:?}: '{}'",
-                                transcription_time.elapsed(),
-                                utils::redact_text(&transcription)
+                                "Transcription completed in {:?}",
+                                transcription_time.elapsed()
                             );
 
                             if post_process {

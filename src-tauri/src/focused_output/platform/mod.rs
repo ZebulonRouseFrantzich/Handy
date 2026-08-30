@@ -55,6 +55,9 @@ pub trait FocusedTargetSession: Send {
 }
 
 #[cfg(test)]
+pub(crate) mod conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
