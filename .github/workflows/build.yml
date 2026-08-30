@@ -47,6 +47,10 @@ on:
         required: false
         type: boolean
         default: false
+      run-native-tests:
+        required: false
+        type: boolean
+        default: false
 
 env:
   TSC_VERSION: "0.9.0"
@@ -488,6 +492,15 @@ jobs:
           # gets its own co-located copies.)
           sudo cp -vL "$LIBDIR"/libtranscribe.so* "$LIBDIR"/libggml*.so* /usr/local/lib/ 2>/dev/null || true
           sudo ldconfig
+
+      - name: Build frontend for native tests
+        if: inputs.run-native-tests
+        run: bun run build
+
+      - name: Run native Rust library tests
+        if: inputs.run-native-tests
+        working-directory: src-tauri
+        run: cargo test --lib --target "${{ inputs.target }}"
 
       # Tauri's mirrored 2024 linuxdeploy predates support for the
       # LINUXDEPLOY_EXCLUDED_LIBRARIES environment variable. Put a current

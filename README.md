@@ -32,6 +32,10 @@ The process is entirely local:
   - **Parakeet V3** - CPU-optimized model with excellent performance and automatic language detection
 - Works on Windows, macOS, and Linux
 
+### Experimental focused-field live output
+
+With a native streaming model, Handy can optionally write live transcription into the text control that was focused when recording began. This safety-first mode is off by default and checks the target and native route before recording. See [Focused-field live output](docs/focused-field-live-output.md) for eligibility, platform support, coediting rules, permissions, privacy, and limitations.
+
 ## Quick Start
 
 ### Installation
