@@ -2588,18 +2588,14 @@ mod tests {
         }
         assert_eq!(typing_args(ToolKind::Wtype), ["-"]);
         assert_eq!(typing_args(ToolKind::Ydotool), ["type", "--file=-"]);
-        for kind in [ToolKind::Wtype, ToolKind::Ydotool] {
-            for key in [
-                AutoSubmitKey::Enter,
-                AutoSubmitKey::CtrlEnter,
-                AutoSubmitKey::CmdEnter,
-            ] {
-                let args = submit_args(kind, key);
-                assert!(!args
-                    .iter()
-                    .any(|arg| arg.contains("HANDY-PRIVACY-SENTINEL-7429")));
-            }
-        }
+        assert_eq!(
+            submit_args(ToolKind::Wtype, AutoSubmitKey::CtrlEnter),
+            ["-M", "ctrl", "-k", "Return", "-m", "ctrl"]
+        );
+        assert_eq!(
+            submit_args(ToolKind::Ydotool, AutoSubmitKey::CmdEnter),
+            ["key", "125:1", "28:1", "28:0", "125:0"]
+        );
     }
 
     #[test]
