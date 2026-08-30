@@ -32,6 +32,7 @@ use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 use env_filter::Builder as EnvFilterBuilder;
+use focused_output::NoopStreamTranscriptObserver;
 use managers::audio::AudioRecordingManager;
 use managers::history::HistoryManager;
 use managers::model::ModelManager;
@@ -159,8 +160,12 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     let model_manager =
         Arc::new(ModelManager::new(app_handle).expect("Failed to initialize model manager"));
     let transcription_manager = Arc::new(
-        TranscriptionManager::new(app_handle, model_manager.clone())
-            .expect("Failed to initialize transcription manager"),
+        TranscriptionManager::new(
+            app_handle,
+            model_manager.clone(),
+            Arc::new(NoopStreamTranscriptObserver),
+        )
+        .expect("Failed to initialize transcription manager"),
     );
     let recording_manager = Arc::new(
         AudioRecordingManager::new(app_handle, transcription_manager.stream_router())
@@ -867,8 +872,12 @@ pub fn run(cli_args: CliArgs) {
                     ModelManager::new(&app_handle).expect("Failed to initialize model manager"),
                 );
                 let transcription_manager = Arc::new(
-                    TranscriptionManager::new(&app_handle, model_manager.clone())
-                        .expect("Failed to initialize transcription manager"),
+                    TranscriptionManager::new(
+                        &app_handle,
+                        model_manager.clone(),
+                        Arc::new(NoopStreamTranscriptObserver),
+                    )
+                    .expect("Failed to initialize transcription manager"),
                 );
                 app_handle.manage(model_manager);
                 app_handle.manage(transcription_manager);

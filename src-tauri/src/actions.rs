@@ -5,8 +5,9 @@ use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
-use crate::managers::transcription::StreamWorkKind;
-use crate::managers::transcription::TranscriptionManager;
+use crate::managers::transcription::{
+    StreamFinalOutcome, StreamStartContext, StreamWorkKind, TranscriptionManager,
+};
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
@@ -514,7 +515,11 @@ impl ShortcutAction for TranscribeAction {
             VadPolicy::Offline
         };
         if model_supports_streaming {
-            tm.start_stream();
+            if let Err(error) = tm.start_stream(StreamStartContext::overlay()) {
+                warn!(
+                    "Live streaming admission failed; continuing with batch transcription: {error}"
+                );
+            }
         }
         let plan_elapsed = plan_started.elapsed();
 
@@ -717,15 +722,13 @@ impl ShortcutAction for TranscribeAction {
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
                     let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
-                        // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
-                        Err(err) => Err(err),
+                        Ok(finalization) => match finalization.outcome {
+                            StreamFinalOutcome::StreamText(text) => Ok(text),
+                            StreamFinalOutcome::BatchFallback | StreamFinalOutcome::NoWorker => {
+                                tm.transcribe(samples)
+                            }
+                        },
+                        Err(error) => Err(error),
                     };
 
                     // Await WAV save and verify

@@ -2,6 +2,10 @@ use crate::audio_toolkit::{
     apply_custom_words, detect_output_language, normalize_transcription_output,
     remove_filler_words, OutputLanguageEvidence,
 };
+use crate::focused_output::{
+    DictationSessionId, FocusedOutputReasonCode, StreamLifecycleEvent, StreamTranscriptObserver,
+    TranscriptSnapshot,
+};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{
@@ -39,16 +43,6 @@ use transcribe_rs::{
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelStateEvent {
     pub event_type: String,
@@ -60,10 +54,56 @@ pub struct ModelStateEvent {
 /// Live transcription snapshot emitted to the overlay during a streaming run.
 /// `committed` is the append-only, flicker-free prefix; `tentative` is the
 /// volatile suffix the model may still rewrite.
-#[derive(Clone, Debug, Serialize, Deserialize, Type, tauri_specta::Event)]
+#[derive(Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
 pub struct StreamTextEvent {
     pub committed: String,
     pub tentative: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamOutputTarget {
+    Overlay,
+    Focused(DictationSessionId),
+    Headless,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamStartContext {
+    pub target: StreamOutputTarget,
+}
+
+impl StreamStartContext {
+    pub const fn new(target: StreamOutputTarget) -> Self {
+        Self { target }
+    }
+
+    pub const fn overlay() -> Self {
+        Self::new(StreamOutputTarget::Overlay)
+    }
+
+    pub const fn focused(session_id: DictationSessionId) -> Self {
+        Self::new(StreamOutputTarget::Focused(session_id))
+    }
+
+    pub const fn headless() -> Self {
+        Self::new(StreamOutputTarget::Headless)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamStartReceipt {
+    pub worker_token: u64,
+}
+
+pub struct StreamFinalization {
+    pub outcome: StreamFinalOutcome,
+    pub barrier_revision: Option<u64>,
+}
+
+pub enum StreamFinalOutcome {
+    StreamText(String),
+    BatchFallback,
+    NoWorker,
 }
 
 /// Phase of the streaming overlay card, emitted to drive its UI state.
@@ -111,6 +151,195 @@ struct FinalizedStreamText {
     output_language: OutputLanguageEvidence,
     /// The streaming model's supported languages, for text-based detection.
     supported_languages: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamRunLifecycle {
+    Admitted,
+    Started,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamRunState {
+    worker_token: u64,
+    target: StreamOutputTarget,
+    barrier_revision: Option<u64>,
+    lifecycle: StreamRunLifecycle,
+    ended: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamLifecycleTransition {
+    Started,
+    Unavailable(FocusedOutputReasonCode),
+    Failed(FocusedOutputReasonCode),
+    Ended,
+}
+
+fn transition_stream_lifecycle(
+    stream_run: &Mutex<Option<StreamRunState>>,
+    observer: &dyn StreamTranscriptObserver,
+    worker_token: u64,
+    transition: StreamLifecycleTransition,
+) -> bool {
+    let (target, event) = {
+        let mut guard = stream_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(run) = guard
+            .as_mut()
+            .filter(|run| run.worker_token == worker_token)
+        else {
+            return false;
+        };
+
+        match transition {
+            StreamLifecycleTransition::Started => {
+                if run.ended
+                    || matches!(
+                        run.lifecycle,
+                        StreamRunLifecycle::Unavailable | StreamRunLifecycle::Failed
+                    )
+                {
+                    return false;
+                }
+                run.lifecycle = StreamRunLifecycle::Started;
+            }
+            StreamLifecycleTransition::Unavailable(_) => {
+                if run.ended || run.lifecycle == StreamRunLifecycle::Failed {
+                    return false;
+                }
+                run.lifecycle = StreamRunLifecycle::Unavailable;
+            }
+            StreamLifecycleTransition::Failed(_) => {
+                run.lifecycle = StreamRunLifecycle::Failed;
+            }
+            StreamLifecycleTransition::Ended => {
+                if run.ended {
+                    return true;
+                }
+                run.ended = true;
+            }
+        }
+
+        let event = match (run.target, transition) {
+            (StreamOutputTarget::Focused(session_id), StreamLifecycleTransition::Started) => {
+                Some(StreamLifecycleEvent::Started {
+                    session_id,
+                    worker_token,
+                })
+            }
+            (
+                StreamOutputTarget::Focused(session_id),
+                StreamLifecycleTransition::Unavailable(reason),
+            ) => Some(StreamLifecycleEvent::Unavailable { session_id, reason }),
+            (
+                StreamOutputTarget::Focused(session_id),
+                StreamLifecycleTransition::Failed(reason),
+            ) => Some(StreamLifecycleEvent::Failed { session_id, reason }),
+            (StreamOutputTarget::Focused(session_id), StreamLifecycleTransition::Ended) => {
+                Some(StreamLifecycleEvent::Ended {
+                    session_id,
+                    worker_token,
+                })
+            }
+            (StreamOutputTarget::Overlay | StreamOutputTarget::Headless, _) => None,
+        };
+        (run.target, event)
+    };
+
+    let Some(event) = event else {
+        return true;
+    };
+    if observer.publish_lifecycle(event).is_ok() {
+        return true;
+    }
+
+    {
+        let mut guard = stream_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(run) = guard
+            .as_mut()
+            .filter(|run| run.worker_token == worker_token)
+        {
+            run.lifecycle = StreamRunLifecycle::Failed;
+        }
+    }
+
+    if !matches!(transition, StreamLifecycleTransition::Failed(_)) {
+        if let StreamOutputTarget::Focused(session_id) = target {
+            let _ = observer.publish_lifecycle(StreamLifecycleEvent::Failed {
+                session_id,
+                reason: FocusedOutputReasonCode::StreamFailed,
+            });
+        }
+    }
+    false
+}
+
+fn record_stream_revision(
+    stream_run: &Mutex<Option<StreamRunState>>,
+    worker_token: u64,
+    revision: u64,
+) -> Option<StreamOutputTarget> {
+    let mut guard = stream_run
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let run = guard
+        .as_mut()
+        .filter(|run| run.worker_token == worker_token)?;
+    if run.ended || run.lifecycle != StreamRunLifecycle::Started {
+        return None;
+    }
+    run.barrier_revision = Some(revision);
+    Some(run.target)
+}
+
+fn route_stream_snapshot(
+    observer: &dyn StreamTranscriptObserver,
+    target: StreamOutputTarget,
+    revision: u64,
+    committed: &str,
+    tentative: &str,
+    emit_overlay: impl FnOnce(String, String),
+) {
+    match target {
+        StreamOutputTarget::Overlay => {
+            emit_overlay(committed.to_owned(), tentative.to_owned());
+        }
+        StreamOutputTarget::Focused(session_id) => {
+            observer.publish_snapshot(TranscriptSnapshot {
+                session_id,
+                revision,
+                committed: committed.to_owned(),
+                tentative: tentative.to_owned(),
+            });
+        }
+        StreamOutputTarget::Headless => {}
+    }
+}
+
+fn fallback_stream_outcome(run: StreamRunState) -> StreamFinalOutcome {
+    match (run.target, run.lifecycle) {
+        (StreamOutputTarget::Focused(_), StreamRunLifecycle::Unavailable) => {
+            StreamFinalOutcome::BatchFallback
+        }
+        (StreamOutputTarget::Focused(_), _) => StreamFinalOutcome::NoWorker,
+        (StreamOutputTarget::Overlay | StreamOutputTarget::Headless, _) => {
+            StreamFinalOutcome::BatchFallback
+        }
+    }
+}
+
+fn stream_text_outcome(text: String) -> StreamFinalOutcome {
+    if text.trim().is_empty() {
+        StreamFinalOutcome::BatchFallback
+    } else {
+        StreamFinalOutcome::StreamText(text)
+    }
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -222,10 +451,49 @@ struct StreamWorkerGuard {
     active_stream_worker: Arc<AtomicU64>,
     active_engine_lease: Arc<AtomicU64>,
     stream_active: Arc<AtomicBool>,
+    stream_run: Arc<Mutex<Option<StreamRunState>>>,
+    observer: Arc<dyn StreamTranscriptObserver>,
+    clean_exit: bool,
+}
+
+impl StreamWorkerGuard {
+    fn mark_clean(&mut self) {
+        self.clean_exit = true;
+    }
 }
 
 impl Drop for StreamWorkerGuard {
     fn drop(&mut self) {
+        let should_fail = {
+            let guard = self
+                .stream_run
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .as_ref()
+                .filter(|run| run.worker_token == self.worker_id)
+                .is_some_and(|run| {
+                    !self.clean_exit
+                        && matches!(
+                            run.lifecycle,
+                            StreamRunLifecycle::Admitted | StreamRunLifecycle::Started
+                        )
+                })
+        };
+        if should_fail {
+            transition_stream_lifecycle(
+                &self.stream_run,
+                self.observer.as_ref(),
+                self.worker_id,
+                StreamLifecycleTransition::Failed(FocusedOutputReasonCode::StreamFailed),
+            );
+        }
+        transition_stream_lifecycle(
+            &self.stream_run,
+            self.observer.as_ref(),
+            self.worker_id,
+            StreamLifecycleTransition::Ended,
+        );
         if self.active_stream_worker.load(Ordering::Acquire) == self.worker_id {
             self.stream_active.store(false, Ordering::Release);
         }
@@ -277,10 +545,16 @@ pub struct TranscriptionManager {
     /// `is_model_loaded()` consults this so the model still reports "loaded"
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
+    stream_run: Arc<Mutex<Option<StreamRunState>>>,
+    observer: Arc<dyn StreamTranscriptObserver>,
 }
 
 impl TranscriptionManager {
-    pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
+    pub fn new(
+        app_handle: &AppHandle,
+        model_manager: Arc<ModelManager>,
+        observer: Arc<dyn StreamTranscriptObserver>,
+    ) -> Result<Self> {
         let manager = Self {
             engine: Arc::new(Mutex::new(None)),
             model_manager,
@@ -297,6 +571,8 @@ impl TranscriptionManager {
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
+            stream_run: Arc::new(Mutex::new(None)),
+            observer,
         };
 
         // Start the idle watcher
@@ -791,47 +1067,140 @@ impl TranscriptionManager {
         Arc::clone(&self.router)
     }
 
-    /// Begin a live streaming transcription on the held engine's session.
-    /// Audio frames pushed via [`StreamRouter::feed`] (captured directly by the
-    /// audio recorder) are decoded incrementally and emitted to the overlay as
-    /// [`StreamTextEvent`].
+    /// Admit one tagged live transcription worker.
     ///
-    /// Non-blocking: spawns a worker that waits for any in-progress model load,
-    /// verifies the model supports streaming, then begins the stream. If the
-    /// model can't stream, the worker idles until finalize/cancel and reports
-    /// `None` so the caller falls back to batch transcription. Frames sent
-    /// before the stream begins queue on the channel and are not lost.
-    pub fn start_stream(&self) {
+    /// Audio frames pushed through [`StreamRouter::feed`] before model loading
+    /// completes remain queued. The worker later reports either usable stream
+    /// text, a structural batch fallback, or a terminal focused-stream failure.
+    pub fn start_stream(&self, context: StreamStartContext) -> Result<StreamStartReceipt> {
         if self.router.is_open() || self.active_stream_worker.load(Ordering::Acquire) != 0 {
-            warn!("start_stream called while a stream worker is already active");
-            return;
+            return Err(anyhow::anyhow!(
+                "a streaming transcription worker is already active"
+            ));
         }
-        let worker_id = self.next_stream_worker_id.fetch_add(1, Ordering::Relaxed);
+
+        let mut worker_token = self.next_stream_worker_id.fetch_add(1, Ordering::Relaxed);
+        if worker_token == 0 {
+            worker_token = self.next_stream_worker_id.fetch_add(1, Ordering::Relaxed);
+        }
         if self
             .active_stream_worker
-            .compare_exchange(0, worker_id, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, worker_token, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            warn!("start_stream lost a race with another stream worker");
-            return;
+            return Err(anyhow::anyhow!(
+                "another streaming transcription worker won admission"
+            ));
         }
+
         let rx = self.router.open();
         self.stream_active.store(false, Ordering::Release);
+        *self
+            .stream_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StreamRunState {
+            worker_token,
+            target: context.target,
+            barrier_revision: None,
+            lifecycle: StreamRunLifecycle::Admitted,
+            ended: false,
+        });
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        let panic_manager = self.clone();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("transcription-stream-{worker_token}"))
+            .spawn(move || {
+                if catch_unwind(AssertUnwindSafe(|| {
+                    manager.run_stream_worker(rx, worker_token);
+                }))
+                .is_err()
+                {
+                    panic_manager.router.clear();
+                    error!("Streaming transcription worker panicked");
+                }
+            })
+        {
+            self.router.clear();
+            let _ = self.active_stream_worker.compare_exchange(
+                worker_token,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            let mut run = self
+                .stream_run
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if run
+                .as_ref()
+                .is_some_and(|run| run.worker_token == worker_token)
+            {
+                *run = None;
+            }
+            return Err(anyhow::anyhow!(
+                "failed to spawn streaming transcription worker: {error}"
+            ));
+        }
+
+        Ok(StreamStartReceipt { worker_token })
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
-        let _worker = StreamWorkerGuard {
-            worker_id,
+    fn transition_runtime_stream_failure(&self, worker_token: u64) {
+        let target = self
+            .stream_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|run| run.worker_token == worker_token)
+            .map(|run| run.target);
+        let transition = if matches!(target, Some(StreamOutputTarget::Focused(_))) {
+            StreamLifecycleTransition::Failed(FocusedOutputReasonCode::StreamFailed)
+        } else {
+            StreamLifecycleTransition::Unavailable(FocusedOutputReasonCode::StreamFailed)
+        };
+        transition_stream_lifecycle(
+            &self.stream_run,
+            self.observer.as_ref(),
+            worker_token,
+            transition,
+        );
+    }
+
+    fn route_stream_text(
+        &self,
+        target: StreamOutputTarget,
+        revision: u64,
+        committed: &str,
+        tentative: &str,
+    ) {
+        route_stream_snapshot(
+            self.observer.as_ref(),
+            target,
+            revision,
+            committed,
+            tentative,
+            |committed, tentative| {
+                let _ = StreamTextEvent {
+                    committed,
+                    tentative,
+                }
+                .emit(&self.app_handle);
+            },
+        );
+    }
+
+    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_token: u64) {
+        let mut worker = StreamWorkerGuard {
+            worker_id: worker_token,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
             active_engine_lease: Arc::clone(&self.active_engine_lease),
             stream_active: Arc::clone(&self.stream_active),
+            stream_run: Arc::clone(&self.stream_run),
+            observer: Arc::clone(&self.observer),
+            clean_exit: false,
         };
 
-        // Wait for any in-progress model load to finish (start_stream races the
-        // background load kicked off when recording starts).
         {
             let mut is_loading = self.is_loading.lock().unwrap();
             while *is_loading {
@@ -840,44 +1209,46 @@ impl TranscriptionManager {
         }
 
         let model_id = self.get_current_model().unwrap_or_default();
-
-        // Take the engine out of the mutex so we own it during streaming,
-        // structurally excluding any concurrent batch transcription (which
-        // transcribe-cpp's compute_lock would refuse anyway). Returned when the
-        // worker exits, or dropped if the model was switched/unloaded mid-stream.
         if self
             .active_engine_lease
-            .compare_exchange(0, worker_id, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, worker_token, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            warn!("Live preview: another worker already holds the transcription engine");
+            warn!("Live preview could not lease the transcription engine");
+            self.transition_runtime_stream_failure(worker_token);
+            worker.mark_clean();
+            drop(worker);
             self.router.clear();
-            drain_until_finalize(rx);
             return;
         }
+
         let mut engine = match self.lock_engine().take() {
-            Some(e) => e,
+            Some(engine) => engine,
             None => {
                 info!(
-                    "Live preview: model '{}' was unloaded before streaming could begin; \
-                     falling back to batch transcription",
-                    model_id
+                    "Live preview model was unavailable before streaming began; using batch transcription"
                 );
                 let _ = self.active_engine_lease.compare_exchange(
-                    worker_id,
+                    worker_token,
                     0,
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+                transition_stream_lifecycle(
+                    &self.stream_run,
+                    self.observer.as_ref(),
+                    worker_token,
+                    StreamLifecycleTransition::Unavailable(
+                        FocusedOutputReasonCode::ModelDoesNotSupportStreaming,
+                    ),
+                );
+                worker.mark_clean();
+                drop(worker);
                 self.router.clear();
-                drain_until_finalize(rx);
                 return;
             }
         };
 
-        // Only transcribe-cpp models expose streaming; ONNX engines fall back to
-        // batch. The loaded session (not the ModelManager copy) is the source of
-        // truth for run-path capabilities.
         let (supports_streaming, supports_translate, languages) = match &engine {
             LoadedEngine::TranscribeCpp(session) => {
                 let model = session.model();
@@ -900,9 +1271,7 @@ impl TranscriptionManager {
             }
             _ => {
                 info!(
-                    "Live preview: model '{}' is not a transcribe-cpp model; \
-                     streaming is unavailable, using batch transcription",
-                    model_id
+                    "Live preview is unavailable for the loaded engine; using batch transcription"
                 );
                 (false, false, Vec::new())
             }
@@ -910,13 +1279,20 @@ impl TranscriptionManager {
 
         if !supports_streaming {
             self.return_engine(engine, &model_id);
+            transition_stream_lifecycle(
+                &self.stream_run,
+                self.observer.as_ref(),
+                worker_token,
+                StreamLifecycleTransition::Unavailable(
+                    FocusedOutputReasonCode::ModelDoesNotSupportStreaming,
+                ),
+            );
+            worker.mark_clean();
+            drop(worker);
             self.router.clear();
-            drain_until_finalize(rx);
             return;
         }
 
-        // Build run options mirroring the offline transcribe-cpp path: task +
-        // language gated against what the model actually advertises.
         let settings = get_settings(&self.app_handle);
         let effective_language =
             effective_language_for_model(&settings, self.model_manager.as_ref(), &model_id);
@@ -939,32 +1315,34 @@ impl TranscriptionManager {
             ..Default::default()
         };
 
-        // Run the stream on the held session. The Stream borrows the session
-        // (and thus the engine) for its lifetime, so the feed/finalize loop
-        // lives in a labeled block — when it exits, the borrow is released and
-        // the engine can be moved into return_engine().
         let mut finalize_reply: Option<mpsc::Sender<Option<FinalizedStreamText>>> = None;
         let mut finalize_result: Option<Option<FinalizedStreamText>> = None;
+        let mut clean_exit = false;
         let stream_started = 'stream: {
             let session = match &mut engine {
-                LoadedEngine::TranscribeCpp(s) => s,
+                LoadedEngine::TranscribeCpp(session) => session,
                 _ => break 'stream false,
             };
-
-            // Read the backend string before beginning the stream — the
-            // `Stream` borrows `session` mutably for its lifetime, so we can't
-            // call `session.model()` once it exists.
             let backend = session.model().backend();
-
-            // StreamOptions::default() uses CommitPolicy::Auto and lets the
-            // family pick its own streaming strategy (no family-specific ext).
             let mut stream = match session.stream(&run_options, &StreamOptions::default()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to begin stream: {}", e);
+                Ok(stream) => stream,
+                Err(_) => {
+                    error!("Failed to begin streaming transcription");
+                    self.transition_runtime_stream_failure(worker_token);
                     break 'stream false;
                 }
             };
+
+            if !transition_stream_lifecycle(
+                &self.stream_run,
+                self.observer.as_ref(),
+                worker_token,
+                StreamLifecycleTransition::Started,
+            ) {
+                stream.reset();
+                clean_exit = true;
+                break 'stream true;
+            }
 
             self.stream_active.store(true, Ordering::Release);
             self.touch_activity();
@@ -974,7 +1352,11 @@ impl TranscriptionManager {
             );
 
             let mut perf = StreamPerf::new();
-            while let Ok(cmd) = rx.recv() {
+            loop {
+                let cmd = match rx.recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                };
                 match cmd {
                     StreamCmd::Feed(pcm) => {
                         self.touch_activity();
@@ -983,41 +1365,99 @@ impl TranscriptionManager {
                         match stream.feed(&pcm) {
                             Ok(update) => {
                                 perf.record_compute(feed_start.elapsed());
+                                let revision = match u64::try_from(update.revision) {
+                                    Ok(revision) => revision,
+                                    Err(_) => {
+                                        error!(
+                                            "Streaming transcription produced an invalid revision"
+                                        );
+                                        transition_stream_lifecycle(
+                                            &self.stream_run,
+                                            self.observer.as_ref(),
+                                            worker_token,
+                                            StreamLifecycleTransition::Failed(
+                                                FocusedOutputReasonCode::StreamFailed,
+                                            ),
+                                        );
+                                        clean_exit = true;
+                                        break;
+                                    }
+                                };
                                 perf.record_update(
                                     update.revision,
                                     update.input_received_ms,
                                     update.audio_committed_ms,
                                     update.buffered_ms,
                                 );
+                                let target = record_stream_revision(
+                                    &self.stream_run,
+                                    worker_token,
+                                    revision,
+                                );
                                 if update.committed_changed || update.tentative_changed {
-                                    let text = stream.text();
-                                    perf.record_emit();
-                                    self.emit_stream_text(&text.committed, &text.tentative);
+                                    if let Some(target) = target
+                                        .filter(|target| *target != StreamOutputTarget::Headless)
+                                    {
+                                        let text = stream.text();
+                                        perf.record_emit();
+                                        self.route_stream_text(
+                                            target,
+                                            revision,
+                                            &text.committed,
+                                            &text.tentative,
+                                        );
+                                    }
                                 }
                                 perf.maybe_log();
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 perf.record_compute(feed_start.elapsed());
-                                warn!("stream feed failed: {}", e);
+                                warn!("Streaming transcription feed failed");
+                                let focused = self
+                                    .stream_run
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .as_ref()
+                                    .filter(|run| run.worker_token == worker_token)
+                                    .is_some_and(|run| {
+                                        matches!(run.target, StreamOutputTarget::Focused(_))
+                                    });
+                                if focused {
+                                    self.transition_runtime_stream_failure(worker_token);
+                                    clean_exit = true;
+                                    break;
+                                }
                             }
                         }
                     }
                     StreamCmd::Finalize(reply) => {
                         let finalize_start = Instant::now();
                         let result = match stream.finalize() {
-                            // After finalize the committed prefix holds the full
-                            // text; display() = committed + tentative is the safe read.
-                            Ok(update) => {
+                            Ok(update) => 'finalized: {
                                 perf.record_compute(finalize_start.elapsed());
+                                let revision = match u64::try_from(update.revision) {
+                                    Ok(revision) => revision,
+                                    Err(_) => {
+                                        error!(
+                                            "Streaming transcription produced an invalid revision"
+                                        );
+                                        transition_stream_lifecycle(
+                                            &self.stream_run,
+                                            self.observer.as_ref(),
+                                            worker_token,
+                                            StreamLifecycleTransition::Failed(
+                                                FocusedOutputReasonCode::StreamFailed,
+                                            ),
+                                        );
+                                        break 'finalized None;
+                                    }
+                                };
                                 perf.record_update(
                                     update.revision,
                                     update.input_received_ms,
                                     update.audio_committed_ms,
                                     update.buffered_ms,
                                 );
-                                // In auto mode the model's own LID is the best
-                                // remaining evidence; the snapshot is only
-                                // materialized when it can change the outcome.
                                 let output_language = match &output_language {
                                     OutputLanguageEvidence::Unknown => {
                                         with_model_detected_language(
@@ -1027,32 +1467,45 @@ impl TranscriptionManager {
                                     }
                                     resolved => resolved.clone(),
                                 };
+                                let text = stream.text();
+                                let target = record_stream_revision(
+                                    &self.stream_run,
+                                    worker_token,
+                                    revision,
+                                );
+                                if update.committed_changed || update.tentative_changed {
+                                    if let Some(target @ StreamOutputTarget::Focused(_)) = target {
+                                        self.route_stream_text(
+                                            target,
+                                            revision,
+                                            &text.committed,
+                                            &text.tentative,
+                                        );
+                                    }
+                                }
                                 Some(FinalizedStreamText {
-                                    text: stream.text().full,
+                                    text: text.full,
                                     output_language,
                                     supported_languages: languages.clone(),
                                 })
                             }
-                            Err(e) => {
+                            Err(_) => {
                                 perf.record_compute(finalize_start.elapsed());
-                                error!(
-                                    "stream finalize failed: {}; falling back to batch transcription",
-                                    e
-                                );
+                                error!("Streaming transcription finalization failed");
+                                self.transition_runtime_stream_failure(worker_token);
                                 None
                             }
                         };
-                        let chars = match &result {
-                            Some(finalized) => finalized.text.len(),
-                            _ => 0,
-                        };
+                        let chars = result.as_ref().map_or(0, |finalized| finalized.text.len());
                         perf.log_finalized(chars);
                         finalize_reply = Some(reply);
                         finalize_result = Some(result);
+                        clean_exit = true;
                         break;
                     }
                     StreamCmd::Cancel => {
                         stream.reset();
+                        clean_exit = true;
                         break;
                     }
                 }
@@ -1060,24 +1513,24 @@ impl TranscriptionManager {
 
             true
         };
-        // `stream` + the `&mut engine` borrow are released here.
 
         if !stream_started {
-            // Stream never began (model doesn't support streaming or begin
-            // failed); drain so the finalize handshake still completes and the
-            // caller falls back to batch transcription. Return the engine first
-            // so the fallback can immediately use it.
             self.return_engine(engine, &model_id);
-            drain_until_finalize(rx);
+            worker.mark_clean();
+            drop(worker);
+            self.router.clear();
             return;
         }
 
         self.return_engine(engine, &model_id);
+        if clean_exit {
+            worker.mark_clean();
+        }
+        drop(worker);
+        self.router.clear();
         if let (Some(reply), Some(result)) = (finalize_reply, finalize_result) {
             let _ = reply.send(result);
         }
-        // `_worker` drops here, clearing this worker's active/lease flags after
-        // the engine has been returned to the pool.
     }
 
     /// Return the leased engine to the mutex, unless the model was switched or
@@ -1096,46 +1549,120 @@ impl TranscriptionManager {
         }
     }
 
-    /// Flush the active stream and return its final, post-filtered text.
-    ///
-    /// `Ok(None)` means no usable stream was active and the caller may fall back
-    /// to batch transcription. `Err` means finalize itself failed or timed out.
-    /// A timeout may still leave the worker holding the engine, so callers
-    /// should surface it instead of immediately starting a batch fallback.
-    pub fn finalize_stream(&self) -> Result<Option<String>> {
-        let Some(tx) = self.router.take() else {
-            return Ok(None);
+    /// Flush the admitted stream and return its structural outcome together
+    /// with the exact revision of the last native update the worker processed.
+    pub fn finalize_stream(&self) -> Result<StreamFinalization> {
+        let Some(admitted) = self
+            .stream_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .copied()
+        else {
+            return Ok(StreamFinalization {
+                outcome: StreamFinalOutcome::NoWorker,
+                barrier_revision: None,
+            });
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx.send(StreamCmd::Finalize(reply_tx)).is_err() {
-            return Ok(None);
-        }
-        let finalized = match reply_rx.recv_timeout(STREAM_FINALIZE_REPLY_TIMEOUT) {
-            Ok(Some(finalized)) => finalized,
-            Ok(None) => return Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.stream_active.store(false, Ordering::Release);
-                return Err(anyhow::anyhow!(
-                    "Timed out waiting {:?} for live transcription to finalize",
-                    STREAM_FINALIZE_REPLY_TIMEOUT
-                ));
+        let worker_token = admitted.worker_token;
+
+        let finalized = if let Some(tx) = self.router.take() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if tx.send(StreamCmd::Finalize(reply_tx)).is_err() {
+                self.transition_runtime_stream_failure(worker_token);
+                transition_stream_lifecycle(
+                    &self.stream_run,
+                    self.observer.as_ref(),
+                    worker_token,
+                    StreamLifecycleTransition::Ended,
+                );
+                None
+            } else {
+                match reply_rx.recv_timeout(STREAM_FINALIZE_REPLY_TIMEOUT) {
+                    Ok(finalized) => finalized,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        self.transition_runtime_stream_failure(worker_token);
+                        transition_stream_lifecycle(
+                            &self.stream_run,
+                            self.observer.as_ref(),
+                            worker_token,
+                            StreamLifecycleTransition::Ended,
+                        );
+                        None
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        self.stream_active.store(false, Ordering::Release);
+                        self.transition_runtime_stream_failure(worker_token);
+                        return Err(anyhow::anyhow!(
+                            "timed out waiting for streaming transcription finalization"
+                        ));
+                    }
+                }
             }
+        } else {
+            if matches!(admitted.target, StreamOutputTarget::Focused(_))
+                && !matches!(
+                    admitted.lifecycle,
+                    StreamRunLifecycle::Unavailable | StreamRunLifecycle::Failed
+                )
+            {
+                self.transition_runtime_stream_failure(worker_token);
+                transition_stream_lifecycle(
+                    &self.stream_run,
+                    self.observer.as_ref(),
+                    worker_token,
+                    StreamLifecycleTransition::Ended,
+                );
+            }
+            None
         };
 
-        let settings = get_settings(&self.app_handle);
-        // Streaming models do not receive a decode prompt, so custom words
-        // always go through the shared fuzzy post-correction path.
-        let filtered = post_process_transcription_text(
-            finalized.text,
-            &settings,
-            false,
-            &finalized.output_language,
-            &finalized.supported_languages,
-        );
+        let run = {
+            let mut guard = self
+                .stream_run
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let run = guard
+                .as_ref()
+                .filter(|run| run.worker_token == worker_token)
+                .copied()
+                .unwrap_or(admitted);
+            if guard
+                .as_ref()
+                .is_some_and(|run| run.worker_token == worker_token)
+            {
+                *guard = None;
+            }
+            run
+        };
+        if matches!(run.target, StreamOutputTarget::Focused(_))
+            && run.lifecycle == StreamRunLifecycle::Failed
+        {
+            return Ok(StreamFinalization {
+                outcome: fallback_stream_outcome(run),
+                barrier_revision: run.barrier_revision,
+            });
+        }
 
-        self.maybe_unload_immediately("streaming transcription");
-        Ok(Some(filtered))
+        let outcome = match finalized {
+            Some(finalized) => {
+                let settings = get_settings(&self.app_handle);
+                let filtered = post_process_transcription_text(
+                    finalized.text,
+                    &settings,
+                    false,
+                    &finalized.output_language,
+                    &finalized.supported_languages,
+                );
+                stream_text_outcome(filtered)
+            }
+            None => fallback_stream_outcome(run),
+        };
+
+        Ok(StreamFinalization {
+            outcome,
+            barrier_revision: run.barrier_revision,
+        })
     }
 
     /// Abandon any active stream without producing text (e.g. on cancel).
@@ -1151,14 +1678,6 @@ impl TranscriptionManager {
         let _ = StreamPhaseEvent {
             phase: StreamPhase::Working,
             kind: Some(kind),
-        }
-        .emit(&self.app_handle);
-    }
-
-    fn emit_stream_text(&self, committed: &str, tentative: &str) {
-        let _ = StreamTextEvent {
-            committed: committed.to_string(),
-            tentative: tentative.to_string(),
         }
         .emit(&self.app_handle);
     }
@@ -1429,14 +1948,10 @@ impl TranscriptionManager {
                     self.return_engine(engine, &active_model);
                     inner_result?
                 }
-                Err(panic_payload) => {
+                Err(_panic_payload) => {
                     // Engine panicked — do NOT put it back (it's in an unknown state).
                     // The engine is dropped here, effectively unloading it.
-                    let panic_msg = panic_payload_message(panic_payload.as_ref());
-                    error!(
-                        "Transcription engine panicked: {}. Model has been unloaded.",
-                        panic_msg
-                    );
+                    error!("Transcription engine panicked. Model has been unloaded.");
 
                     // Clear the model ID so it will be reloaded on next attempt
                     {
@@ -1453,13 +1968,12 @@ impl TranscriptionManager {
                             event_type: "unloaded".to_string(),
                             model_id: None,
                             model_name: None,
-                            error: Some(format!("Engine panicked: {}", panic_msg)),
+                            error: Some("Engine panicked".to_string()),
                         },
                     );
 
                     return Err(anyhow::anyhow!(
-                        "Transcription engine panicked: {}. The model has been unloaded and will reload on next attempt.",
-                        panic_msg
+                        "Transcription engine panicked. The model has been unloaded and will reload on next attempt."
                     ));
                 }
             };
@@ -1808,10 +2322,9 @@ where
     let fallback = raw.clone();
     match catch_unwind(AssertUnwindSafe(|| transform(raw))) {
         Ok(processed) => processed,
-        Err(payload) => {
+        Err(_payload) => {
             error!(
-                "Optional transcription text post-processing panicked: {}; using the raw transcription",
-                panic_payload_message(payload.as_ref())
+                "Optional transcription text post-processing panicked; using the raw transcription"
             );
             fallback
         }
@@ -1840,23 +2353,6 @@ fn cpp_translation_task(
         (Task::Translate, Some("en".to_string()))
     } else {
         (Task::Transcribe, None)
-    }
-}
-
-/// Drain a stream command channel, ignoring fed audio, until the caller
-/// finalizes or cancels. Used when streaming can't actually run (model not
-/// loaded / not streaming-capable) so the finalize handshake still completes
-/// and the caller falls back to batch transcription.
-fn drain_until_finalize(rx: mpsc::Receiver<StreamCmd>) {
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            StreamCmd::Feed(_) => {}
-            StreamCmd::Finalize(reply) => {
-                let _ = reply.send(None);
-                break;
-            }
-            StreamCmd::Cancel => break,
-        }
     }
 }
 
@@ -2448,6 +2944,380 @@ mod tests {
         assert!(matches!(plan.task, Task::Transcribe));
         assert_eq!(plan.language.as_deref(), Some("es"));
         assert_eq!(plan.target_language, None);
+    }
+
+    #[derive(Default)]
+    struct RecordingStreamObserver {
+        snapshots: Mutex<Vec<TranscriptSnapshot>>,
+        lifecycle: Mutex<Vec<StreamLifecycleEvent>>,
+        reject_lifecycle: bool,
+    }
+
+    impl StreamTranscriptObserver for RecordingStreamObserver {
+        fn publish_snapshot(&self, snapshot: TranscriptSnapshot) {
+            self.snapshots.lock().unwrap().push(snapshot);
+        }
+
+        fn publish_lifecycle(
+            &self,
+            event: StreamLifecycleEvent,
+        ) -> std::result::Result<(), crate::focused_output::StreamObserverError> {
+            self.lifecycle.lock().unwrap().push(event);
+            if self.reject_lifecycle {
+                Err(crate::focused_output::StreamObserverError::QueueFull)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn stream_run(
+        worker_token: u64,
+        target: StreamOutputTarget,
+        lifecycle: StreamRunLifecycle,
+    ) -> StreamRunState {
+        StreamRunState {
+            worker_token,
+            target,
+            barrier_revision: None,
+            lifecycle,
+            ended: false,
+        }
+    }
+
+    #[test]
+    fn stream_start_context_constructors_select_exact_targets() {
+        assert_eq!(
+            StreamStartContext::overlay().target,
+            StreamOutputTarget::Overlay
+        );
+        assert_eq!(
+            StreamStartContext::focused(DictationSessionId(17)).target,
+            StreamOutputTarget::Focused(DictationSessionId(17))
+        );
+        assert_eq!(
+            StreamStartContext::headless().target,
+            StreamOutputTarget::Headless
+        );
+    }
+
+    #[test]
+    fn stream_snapshot_routing_is_exclusive() {
+        let observer = RecordingStreamObserver::default();
+        let overlay = Mutex::new(Vec::new());
+
+        route_stream_snapshot(
+            &observer,
+            StreamOutputTarget::Overlay,
+            3,
+            "overlay committed",
+            " overlay tentative",
+            |committed, tentative| overlay.lock().unwrap().push((committed, tentative)),
+        );
+        assert_eq!(overlay.lock().unwrap().len(), 1);
+        assert!(observer.snapshots.lock().unwrap().is_empty());
+
+        route_stream_snapshot(
+            &observer,
+            StreamOutputTarget::Focused(DictationSessionId(23)),
+            7,
+            "focused committed",
+            " focused tentative",
+            |committed, tentative| overlay.lock().unwrap().push((committed, tentative)),
+        );
+        assert_eq!(overlay.lock().unwrap().len(), 1);
+        {
+            let snapshots = observer.snapshots.lock().unwrap();
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0].session_id, DictationSessionId(23));
+            assert_eq!(snapshots[0].revision, 7);
+            assert_eq!(snapshots[0].committed, "focused committed");
+            assert_eq!(snapshots[0].tentative, " focused tentative");
+        }
+
+        route_stream_snapshot(
+            &observer,
+            StreamOutputTarget::Headless,
+            8,
+            "headless committed",
+            " headless tentative",
+            |committed, tentative| overlay.lock().unwrap().push((committed, tentative)),
+        );
+        assert_eq!(overlay.lock().unwrap().len(), 1);
+        assert_eq!(observer.snapshots.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stream_worker_tokens_isolate_revisions_and_lifecycle() {
+        let observer = RecordingStreamObserver::default();
+        let state = Mutex::new(Some(stream_run(
+            41,
+            StreamOutputTarget::Focused(DictationSessionId(29)),
+            StreamRunLifecycle::Admitted,
+        )));
+
+        assert!(!transition_stream_lifecycle(
+            &state,
+            &observer,
+            40,
+            StreamLifecycleTransition::Started,
+        ));
+        assert_eq!(
+            state.lock().unwrap().as_ref().unwrap().lifecycle,
+            StreamRunLifecycle::Admitted
+        );
+        assert!(record_stream_revision(&state, 40, 99).is_none());
+        assert_eq!(
+            state.lock().unwrap().as_ref().unwrap().barrier_revision,
+            None
+        );
+
+        assert!(transition_stream_lifecycle(
+            &state,
+            &observer,
+            41,
+            StreamLifecycleTransition::Started,
+        ));
+        assert_eq!(
+            record_stream_revision(&state, 41, 0),
+            Some(StreamOutputTarget::Focused(DictationSessionId(29)))
+        );
+        assert_eq!(
+            state.lock().unwrap().as_ref().unwrap().barrier_revision,
+            Some(0)
+        );
+
+        *state.lock().unwrap() = Some(stream_run(
+            42,
+            StreamOutputTarget::Focused(DictationSessionId(30)),
+            StreamRunLifecycle::Started,
+        ));
+        assert!(record_stream_revision(&state, 41, 100).is_none());
+        assert_eq!(
+            state.lock().unwrap().as_ref().unwrap().barrier_revision,
+            None
+        );
+    }
+
+    #[test]
+    fn final_barrier_tracks_the_exact_last_processed_revision() {
+        let state = Mutex::new(Some(stream_run(
+            51,
+            StreamOutputTarget::Focused(DictationSessionId(31)),
+            StreamRunLifecycle::Started,
+        )));
+
+        assert!(record_stream_revision(&state, 51, 0).is_some());
+        assert!(record_stream_revision(&state, 51, 12).is_some());
+        assert!(record_stream_revision(&state, 51, 37).is_some());
+
+        let run = state.lock().unwrap().as_ref().copied().unwrap();
+        let finalization = StreamFinalization {
+            outcome: StreamFinalOutcome::StreamText("final speech".to_owned()),
+            barrier_revision: run.barrier_revision,
+        };
+        assert_eq!(finalization.barrier_revision, Some(37));
+    }
+
+    #[test]
+    fn only_unavailable_focused_streams_allow_batch_fallback() {
+        let unavailable = stream_run(
+            61,
+            StreamOutputTarget::Focused(DictationSessionId(32)),
+            StreamRunLifecycle::Unavailable,
+        );
+        assert!(matches!(
+            fallback_stream_outcome(unavailable),
+            StreamFinalOutcome::BatchFallback
+        ));
+
+        let failed = stream_run(
+            62,
+            StreamOutputTarget::Focused(DictationSessionId(32)),
+            StreamRunLifecycle::Failed,
+        );
+        assert!(matches!(
+            fallback_stream_outcome(failed),
+            StreamFinalOutcome::NoWorker
+        ));
+
+        let legacy_failed = stream_run(63, StreamOutputTarget::Overlay, StreamRunLifecycle::Failed);
+        assert!(matches!(
+            fallback_stream_outcome(legacy_failed),
+            StreamFinalOutcome::BatchFallback
+        ));
+    }
+
+    #[test]
+    fn lifecycle_publication_failure_terminally_fails_the_tagged_stream() {
+        let observer = RecordingStreamObserver {
+            reject_lifecycle: true,
+            ..Default::default()
+        };
+        let state = Mutex::new(Some(stream_run(
+            71,
+            StreamOutputTarget::Focused(DictationSessionId(33)),
+            StreamRunLifecycle::Admitted,
+        )));
+
+        assert!(!transition_stream_lifecycle(
+            &state,
+            &observer,
+            71,
+            StreamLifecycleTransition::Started,
+        ));
+        {
+            let run = state.lock().unwrap();
+            let run = run.as_ref().unwrap();
+            assert_eq!(run.worker_token, 71);
+            assert_eq!(run.lifecycle, StreamRunLifecycle::Failed);
+        }
+
+        let lifecycle = observer.lifecycle.lock().unwrap();
+        assert_eq!(lifecycle.len(), 2);
+        assert!(matches!(
+            lifecycle[0],
+            StreamLifecycleEvent::Started {
+                session_id: DictationSessionId(33),
+                worker_token: 71,
+            }
+        ));
+        assert!(matches!(
+            lifecycle[1],
+            StreamLifecycleEvent::Failed {
+                session_id: DictationSessionId(33),
+                reason: FocusedOutputReasonCode::StreamFailed,
+            }
+        ));
+    }
+
+    #[test]
+    fn focused_lifecycle_is_content_free_and_preserves_tags() {
+        let observer = RecordingStreamObserver::default();
+        let state = Mutex::new(Some(stream_run(
+            81,
+            StreamOutputTarget::Focused(DictationSessionId(34)),
+            StreamRunLifecycle::Admitted,
+        )));
+
+        assert!(transition_stream_lifecycle(
+            &state,
+            &observer,
+            81,
+            StreamLifecycleTransition::Started,
+        ));
+        assert!(transition_stream_lifecycle(
+            &state,
+            &observer,
+            81,
+            StreamLifecycleTransition::Ended,
+        ));
+
+        let lifecycle = observer.lifecycle.lock().unwrap();
+        assert_eq!(lifecycle.len(), 2);
+        assert!(matches!(
+            lifecycle[0],
+            StreamLifecycleEvent::Started {
+                session_id: DictationSessionId(34),
+                worker_token: 81,
+            }
+        ));
+        assert!(matches!(
+            lifecycle[1],
+            StreamLifecycleEvent::Ended {
+                session_id: DictationSessionId(34),
+                worker_token: 81,
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_lifecycle_is_terminal_and_preserves_the_revision_barrier() {
+        let observer = RecordingStreamObserver::default();
+        let state = Mutex::new(Some(stream_run(
+            91,
+            StreamOutputTarget::Focused(DictationSessionId(35)),
+            StreamRunLifecycle::Started,
+        )));
+
+        assert!(record_stream_revision(&state, 91, 14).is_some());
+        assert!(transition_stream_lifecycle(
+            &state,
+            &observer,
+            91,
+            StreamLifecycleTransition::Failed(FocusedOutputReasonCode::StreamFailed),
+        ));
+        assert!(record_stream_revision(&state, 91, 15).is_none());
+        assert!(!transition_stream_lifecycle(
+            &state,
+            &observer,
+            91,
+            StreamLifecycleTransition::Started,
+        ));
+
+        let run = state.lock().unwrap().as_ref().copied().unwrap();
+        let finalization = StreamFinalization {
+            outcome: fallback_stream_outcome(run),
+            barrier_revision: run.barrier_revision,
+        };
+        assert_eq!(finalization.barrier_revision, Some(14));
+        assert!(matches!(finalization.outcome, StreamFinalOutcome::NoWorker));
+        assert!(matches!(
+            observer.lifecycle.lock().unwrap().as_slice(),
+            [StreamLifecycleEvent::Failed {
+                session_id: DictationSessionId(35),
+                reason: FocusedOutputReasonCode::StreamFailed,
+            }]
+        ));
+    }
+
+    #[test]
+    fn unavailable_lifecycle_allows_focused_batch_fallback() {
+        let observer = RecordingStreamObserver::default();
+        let state = Mutex::new(Some(stream_run(
+            101,
+            StreamOutputTarget::Focused(DictationSessionId(36)),
+            StreamRunLifecycle::Admitted,
+        )));
+
+        assert!(transition_stream_lifecycle(
+            &state,
+            &observer,
+            101,
+            StreamLifecycleTransition::Unavailable(
+                FocusedOutputReasonCode::ModelDoesNotSupportStreaming,
+            ),
+        ));
+        let run = state.lock().unwrap().as_ref().copied().unwrap();
+        assert!(matches!(
+            fallback_stream_outcome(run),
+            StreamFinalOutcome::BatchFallback
+        ));
+        assert!(matches!(
+            observer.lifecycle.lock().unwrap().as_slice(),
+            [StreamLifecycleEvent::Unavailable {
+                session_id: DictationSessionId(36),
+                reason: FocusedOutputReasonCode::ModelDoesNotSupportStreaming,
+            }]
+        ));
+    }
+
+    #[test]
+    fn empty_and_whitespace_stream_text_require_batch_fallback() {
+        assert!(matches!(
+            stream_text_outcome(String::new()),
+            StreamFinalOutcome::BatchFallback
+        ));
+        assert!(matches!(
+            stream_text_outcome(" \n\t".to_owned()),
+            StreamFinalOutcome::BatchFallback
+        ));
+        match stream_text_outcome("spoken words".to_owned()) {
+            StreamFinalOutcome::StreamText(text) => assert_eq!(text, "spoken words"),
+            StreamFinalOutcome::BatchFallback | StreamFinalOutcome::NoWorker => {
+                panic!("usable stream text must remain structural stream text")
+            }
+        }
     }
 }
 
