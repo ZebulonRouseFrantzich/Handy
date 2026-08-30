@@ -5,6 +5,35 @@ use super::types::{
 };
 use crate::settings::AutoSubmitKey;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxFocusedFieldBackend;
+#[cfg(target_os = "macos")]
+pub use macos::MacFocusedFieldBackend;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsFocusedFieldBackend;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub fn native_backend() -> Arc<dyn FocusedFieldBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(LinuxFocusedFieldBackend::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(MacFocusedFieldBackend::new())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(WindowsFocusedFieldBackend::new())
+    }
+}
 
 /// Content-free event destination used by platform monitors. Implementations
 /// must return promptly; native callback paths publish through bounded,
