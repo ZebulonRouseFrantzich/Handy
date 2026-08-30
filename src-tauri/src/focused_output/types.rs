@@ -28,12 +28,6 @@ impl InjectionId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationId(pub u64);
 
-impl ObservationId {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// An exact, bytewise snapshot from the native streaming recognizer.
 ///
 /// Deliberately does not implement `Debug`: both strings may contain a
@@ -54,6 +48,7 @@ pub enum FocusedOutputSafetyLevel {
     Unavailable,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum InsertionTransport {
@@ -78,6 +73,7 @@ pub struct ResolvedInsertionCapability {
     pub receipt_confidence: ReceiptConfidence,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum MixedInputSupport {
@@ -86,6 +82,7 @@ pub enum MixedInputSupport {
     Unavailable,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusedOutputBackend {
@@ -102,6 +99,7 @@ pub enum FocusedOutputPermission {
     MacInputMonitoring,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum FocusedOutputReasonCode {
@@ -259,10 +257,6 @@ impl FocusedOutputCapability {
         self.safety_level
     }
 
-    pub fn backend(&self) -> FocusedOutputBackend {
-        self.backend
-    }
-
     pub fn route(&self) -> Option<ResolvedInsertionCapability> {
         self.route
     }
@@ -324,10 +318,6 @@ impl BeginReceipt {
         &self.capability
     }
 
-    pub fn target_application(&self) -> Option<&str> {
-        self.target_application.as_deref()
-    }
-
     pub fn into_parts(self) -> (DictationSessionId, FocusedOutputCapability, Option<String>) {
         (self.session_id, self.capability, self.target_application)
     }
@@ -345,6 +335,7 @@ pub struct InsertionRequest {
     pub session_id: DictationSessionId,
     pub injection_id: InjectionId,
     pub text: String,
+    #[allow(dead_code)]
     pub kind: InsertionKind,
 }
 
@@ -373,6 +364,7 @@ pub enum SubmitOutcome {
     Rejected { reason: FocusedOutputReasonCode },
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsafeEditKind {
     Delete,
@@ -526,6 +518,7 @@ pub(super) struct PendingInjection {
     pub(super) immediate_receipt: Option<ReceiptConfidence>,
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const INPUT_EFFECT_DEADLINE: Duration = Duration::from_millis(500);
 pub const HANDY_RECEIPT_DEADLINE: Duration = Duration::from_millis(500);
 pub const TARGET_CALL_DEADLINE: Duration = Duration::from_secs(1);
@@ -534,6 +527,7 @@ pub const THREAD_READY_DEADLINE: Duration = Duration::from_secs(2);
 pub const THREAD_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 pub const BACKEND_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformDeadlines {
     pub input_effect: Duration,

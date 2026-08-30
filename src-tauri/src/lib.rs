@@ -414,33 +414,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod headless_guard_tests {
-    use super::{focused_output_construction, run_headless_guarded, FocusedOutputConstruction};
-
-    #[test]
-    fn preserves_normal_exit_codes() {
-        assert_eq!(run_headless_guarded(|| 2), 2);
-    }
-
-    #[test]
-    fn converts_worker_panics_to_runtime_failures() {
-        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
-    }
-
-    #[test]
-    fn headless_construction_selects_only_noop_observer_path() {
-        assert_eq!(
-            focused_output_construction(true),
-            FocusedOutputConstruction::HeadlessNoop
-        );
-        assert_eq!(
-            focused_output_construction(false),
-            FocusedOutputConstruction::GuiNative
-        );
-    }
-}
-
 /// Headless one-shot transcription for the `--transcribe-file` / `--list-devices`
 /// path. Drives the same `TranscriptionManager::transcribe` the app uses; no
 /// mic, no VAD, no download. Returns a process exit code (0 ok, 1 runtime
@@ -1103,4 +1076,30 @@ pub fn run(cli_args: CliArgs) {
             }
             _ => {}
         });
+}
+#[cfg(test)]
+mod headless_guard_tests {
+    use super::{focused_output_construction, run_headless_guarded, FocusedOutputConstruction};
+
+    #[test]
+    fn preserves_normal_exit_codes() {
+        assert_eq!(run_headless_guarded(|| 2), 2);
+    }
+
+    #[test]
+    fn converts_worker_panics_to_runtime_failures() {
+        assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
+    }
+
+    #[test]
+    fn headless_construction_selects_only_noop_observer_path() {
+        assert_eq!(
+            focused_output_construction(true),
+            FocusedOutputConstruction::HeadlessNoop
+        );
+        assert_eq!(
+            focused_output_construction(false),
+            FocusedOutputConstruction::GuiNative
+        );
+    }
 }

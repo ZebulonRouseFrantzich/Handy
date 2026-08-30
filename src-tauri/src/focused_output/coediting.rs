@@ -41,6 +41,7 @@ impl InteractionEvidence {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn handy(
         scope: AttributionScope,
         observation_id: ObservationId,
@@ -78,6 +79,7 @@ pub(crate) enum CoeditDecision {
     Terminal(TerminalReason),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArmPendingResult {
     Armed,
@@ -120,16 +122,19 @@ impl CoeditingState {
         self.external_edit_epoch
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal(&self) -> Option<TerminalReason> {
         self.terminal
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_injection_id(&self) -> Option<InjectionId> {
         self.pending_injection
             .as_ref()
             .map(|pending| pending.injection_id)
     }
 
+    #[cfg(test)]
     /// A second insertion cannot overtake an unacknowledged target effect.
     pub(super) fn arm_pending(&mut self, pending: PendingInjection) -> ArmPendingResult {
         if let Some(reason) = self.terminal {
@@ -144,6 +149,7 @@ impl CoeditingState {
         ArmPendingResult::Armed
     }
 
+    #[cfg(test)]
     /// A synchronous transport receipt does not replace its asynchronous,
     /// exactly-attributed target acknowledgement.
     pub(crate) fn record_immediate_receipt(

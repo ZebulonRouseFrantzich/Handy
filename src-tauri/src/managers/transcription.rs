@@ -85,6 +85,7 @@ impl StreamStartContext {
         Self::new(StreamOutputTarget::Focused(session_id))
     }
 
+    #[cfg(test)]
     pub const fn headless() -> Self {
         Self::new(StreamOutputTarget::Headless)
     }
@@ -1748,7 +1749,7 @@ impl TranscriptionManager {
         // run extension and the fuzzy-correction skip are gated on
         // `model_is_whisper` instead, since non-whisper archs can advertise
         // the feature while rejecting the whisper-kind extension.
-        let mut model_takes_initial_prompt = false;
+
         // Whether the loaded model is actually whisper-family (arch string).
         // Non-whisper archs (e.g. Voxtral Small) can advertise
         // Feature::InitialPrompt yet reject the whisper-kind run extension
@@ -1794,7 +1795,7 @@ impl TranscriptionManager {
             if let LoadedEngine::TranscribeCpp(session) = &engine {
                 let model = session.model();
                 let caps = model.capabilities();
-                model_takes_initial_prompt = model.supports(Feature::InitialPrompt);
+                let model_takes_initial_prompt = model.supports(Feature::InitialPrompt);
                 model_is_whisper = model.arch() == "whisper";
                 model_supports_translate = caps.supports_translate;
                 model_languages = caps.languages;
@@ -2627,6 +2628,40 @@ pub fn get_available_accelerators() -> AvailableAccelerators {
     }
 }
 
+impl Drop for TranscriptionManager {
+    fn drop(&mut self) {
+        // Skip shutdown unless this is the very last clone. TranscriptionManager
+        // is cloned by initiate_model_load() and the watcher thread — those
+        // clones dropping must not kill the watcher. The watcher thread holds
+        // its own clone, so engine's strong_count is always >= 2 while the
+        // watcher is alive. When it reaches 1, only this instance remains
+        // and we can safely shut down.
+        if Arc::strong_count(&self.engine) > 1 {
+            return;
+        }
+
+        // Signal the watcher thread to shutdown
+        self.shutdown_signal.store(true, Ordering::Relaxed);
+
+        // Wait for the thread to finish gracefully.
+        // Use match instead of unwrap to avoid panicking if the mutex is
+        // poisoned — a panic inside Drop calls abort().
+        let mut guard = match self.watcher_handle.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
+                e.into_inner()
+            }
+        };
+        if let Some(handle) = guard.take() {
+            if let Err(e) = handle.join() {
+                warn!("Failed to join idle watcher thread: {:?}", e);
+            } else {
+                debug!("Idle watcher thread joined successfully");
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3316,41 +3351,6 @@ mod tests {
             StreamFinalOutcome::StreamText(text) => assert_eq!(text, "spoken words"),
             StreamFinalOutcome::BatchFallback | StreamFinalOutcome::NoWorker => {
                 panic!("usable stream text must remain structural stream text")
-            }
-        }
-    }
-}
-
-impl Drop for TranscriptionManager {
-    fn drop(&mut self) {
-        // Skip shutdown unless this is the very last clone. TranscriptionManager
-        // is cloned by initiate_model_load() and the watcher thread — those
-        // clones dropping must not kill the watcher. The watcher thread holds
-        // its own clone, so engine's strong_count is always >= 2 while the
-        // watcher is alive. When it reaches 1, only this instance remains
-        // and we can safely shut down.
-        if Arc::strong_count(&self.engine) > 1 {
-            return;
-        }
-
-        // Signal the watcher thread to shutdown
-        self.shutdown_signal.store(true, Ordering::Relaxed);
-
-        // Wait for the thread to finish gracefully.
-        // Use match instead of unwrap to avoid panicking if the mutex is
-        // poisoned — a panic inside Drop calls abort().
-        let mut guard = match self.watcher_handle.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("Recovered poisoned watcher_handle mutex during TranscriptionManager drop — a panic occurred earlier this session");
-                e.into_inner()
-            }
-        };
-        if let Some(handle) = guard.take() {
-            if let Err(e) = handle.join() {
-                warn!("Failed to join idle watcher thread: {:?}", e);
-            } else {
-                debug!("Idle watcher thread joined successfully");
             }
         }
     }

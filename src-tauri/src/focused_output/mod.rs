@@ -9,9 +9,10 @@ pub mod types;
 
 pub use commands::TauriFocusedOutputStatusSink;
 pub use manager::{FocusedOutputManager, FocusedOutputStatusSink};
+#[cfg(test)]
+pub use observer::StreamObserverError;
 pub use observer::{
     FocusedOutputPublisher, NoopStreamTranscriptObserver, StreamLifecycleEvent,
-    StreamObserverError, StreamTranscriptObserver,
+    StreamTranscriptObserver,
 };
-pub use platform::{BeginSession, FocusedFieldBackend, FocusedTargetSession, SessionEventSink};
 pub use types::*;

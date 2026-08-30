@@ -4,7 +4,7 @@ use super::observer::{StreamLifecycleEvent, StreamObserverError};
 use super::platform::{BeginSession, FocusedFieldBackend, FocusedTargetSession, SessionEventSink};
 use super::speech_ledger::{ApplyDecision, FinalDecision, SnapshotDecision, SpeechLedger};
 use super::types::*;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -22,9 +22,11 @@ pub trait FocusedOutputStatusSink: Send + Sync {
     fn publish(&self, event: &FocusedOutputStatusEvent);
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub struct NoopFocusedOutputStatusSink;
 
+#[cfg(test)]
 impl FocusedOutputStatusSink for NoopFocusedOutputStatusSink {
     fn publish(&self, _event: &FocusedOutputStatusEvent) {}
 }
@@ -97,6 +99,9 @@ impl SessionEventSink for ManagerEventSink {
     }
 }
 
+// One output plan exists at a time. Boxing the armed variant would add an
+// allocation to every focused session without reducing retained manager state.
+#[allow(clippy::large_enum_variant)]
 enum OutputPlan {
     Fallback {
         session_id: DictationSessionId,
@@ -264,6 +269,7 @@ pub struct FocusedOutputManager {
 }
 
 impl FocusedOutputManager {
+    #[cfg(test)]
     pub fn new(backend: Arc<dyn FocusedFieldBackend>) -> Arc<Self> {
         Self::new_with_status_sink(backend, Arc::new(NoopFocusedOutputStatusSink))
     }
@@ -884,26 +890,21 @@ fn drain_events(
             TerminalReason::MonitorUnavailable,
         );
     }
-    loop {
-        match receiver.try_recv() {
-            Ok(envelope) => {
-                let mut state = lock_recover(state);
-                let Some(OutputPlan::Armed(armed)) = state.plan.as_mut() else {
-                    continue;
-                };
-                if armed.session_id != envelope.session_id {
-                    continue;
-                }
-                apply_interaction(armed, envelope.event);
-                let latest = armed.terminal_reason.map(|reason| {
-                    let status = status_for_terminal(reason);
-                    armed.status(status, false)
-                });
-                if let Some(event) = latest {
-                    state.set_status(event);
-                }
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+    while let Ok(envelope) = receiver.try_recv() {
+        let mut state = lock_recover(state);
+        let Some(OutputPlan::Armed(armed)) = state.plan.as_mut() else {
+            continue;
+        };
+        if armed.session_id != envelope.session_id {
+            continue;
+        }
+        apply_interaction(armed, envelope.event);
+        let latest = armed.terminal_reason.map(|reason| {
+            let status = status_for_terminal(reason);
+            armed.status(status, false)
+        });
+        if let Some(event) = latest {
+            state.set_status(event);
         }
     }
 }
@@ -1510,6 +1511,12 @@ fn should_replace_snapshot(
     }
 }
 
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1859,10 +1866,4 @@ mod tests {
         manager.finish_no_text(session_id);
         manager.shutdown();
     }
-}
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

@@ -43,7 +43,10 @@ pub enum SnapshotDecision {
     /// Insert exactly this compatible speech suffix.
     Append(String),
     /// The volatile candidate did not extend delivered speech. No text is sent.
-    HoldConflict { revision: u64 },
+    HoldConflict {
+        #[cfg_attr(not(test), allow(dead_code))]
+        revision: u64,
+    },
     /// Successful finalization already made the ledger immutable.
     RejectedFinalized,
     /// A permanent terminal condition rejects this and all later snapshots.
@@ -102,10 +105,7 @@ impl SpeechLedger {
         }
     }
 
-    pub fn session_id(&self) -> DictationSessionId {
-        self.session_id
-    }
-
+    #[cfg(test)]
     pub fn speech_delivered(&self) -> &str {
         &self.speech_delivered
     }
@@ -114,18 +114,22 @@ impl SpeechLedger {
         self.speech_delivered_chars
     }
 
+    #[cfg(test)]
     pub fn last_revision(&self) -> Option<u64> {
         self.last_revision
     }
 
+    #[cfg(test)]
     pub fn conflict_revision(&self) -> Option<u64> {
         self.conflict_revision
     }
 
+    #[cfg(test)]
     pub fn terminal_reason(&self) -> Option<TerminalReason> {
         self.terminal_reason
     }
 
+    #[cfg(test)]
     pub fn is_finalized(&self) -> bool {
         self.finalized
     }
