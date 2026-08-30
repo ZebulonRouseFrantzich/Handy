@@ -613,6 +613,20 @@
           "details": "Handy's lokale spraak-naar-tekst is gebouwd op transcribe.cpp en ggml. Met dank aan het geweldige werk van Georgi Gerganov en alle bijdragers."
         }
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Bestemming voor live-uitvoer",
+      "description": "Kies waar de gedeeltelijke transcriptie verschijnt terwijl u spreekt. Deze instelling geldt alleen voor modellen die streaming ondersteunen.",
+      "options": {
+        "overlay": {
+          "label": "Overlay",
+          "description": "Toon de live-transcriptie in de overlay van Handy zonder in een andere toepassing te typen."
+        },
+        "focusedField": {
+          "label": "Actief veld",
+          "description": "Typ de live-transcriptie na veiligheidscontroles in het actieve bewerkbare veld. Voor niet-ondersteunde of onveilige doelen wordt de normale definitieve uitvoer gebruikt."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Hoe je dit oplost",
     "recorderBlocked": "Sneltoetsen kunnen nu niet worden opgenomen — Secure Input van macOS blokkeert toetsgebeurtenissen. Los eerst de Secure Input-waarschuwing op.",
     "dismiss": "Sluiten"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Beschikbaarheid",
+        "values": {
+          "available": "Beschikbaar",
+          "unavailable": "Niet beschikbaar",
+          "targetCheckedAtStart": "Doel gecontroleerd bij start van opname"
+        }
+      },
+      "backend": {
+        "label": "Backend",
+        "values": {
+          "windows": "Windows-toegankelijkheid en -invoer",
+          "macOs": "macOS Accessibility en Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Testbackend"
+        }
+      },
+      "safety": {
+        "label": "Veiligheid",
+        "values": {
+          "verifiedControl": "Geverifieerd bedieningselement",
+          "guardedFocusedControl": "Beveiligd bedieningselement met focus",
+          "unavailable": "Niet beschikbaar"
+        }
+      },
+      "insertionRoute": {
+        "label": "Invoegmethode",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode-invoer",
+          "macAxSelectedText": "Geselecteerde tekst via macOS Accessibility",
+          "macCgEventUnicode": "Unicode-invoer via macOS Core Graphics",
+          "atSpiEditableText": "Bewerkbare tekst via AT-SPI",
+          "linuxFocusedKeyboard": "Linux-toetsenbord met focus",
+          "test": "Testroute",
+          "none": "Geselecteerd zodra de opname start"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Afleveringsbevestiging",
+        "values": {
+          "verified": "Geverifieerd",
+          "posted": "Naar het besturingssysteem verzonden"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Typen tijdens het spreken",
+        "values": {
+          "observedInsertionsOnly": "Alleen waargenomen invoegingen",
+          "guardedKeyboardInsertionsOnly": "Alleen beveiligde toetsenbordinvoegingen",
+          "unavailable": "Niet beschikbaar"
+        }
+      },
+      "submitSupport": {
+        "label": "Automatisch verzenden",
+        "values": {
+          "supported": "Ondersteund voor dit doel",
+          "unsupported": "Niet ondersteund voor dit doel"
+        }
+      },
+      "applicationTarget": {
+        "label": "Doeltoepassing",
+        "values": {
+          "none": "Geen doel vastgelegd"
+        }
+      },
+      "status": {
+        "label": "Meest recente status"
+      },
+      "reason": {
+        "label": "Reden",
+        "values": {
+          "none": "Geen probleem gemeld"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Toestemming voor toegankelijkheid",
+        "description": "Vereist op macOS om het actieve bewerkbare veld te herkennen en veilig invoegen te verifiëren.",
+        "action": "Toegang tot toegankelijkheid aanvragen",
+        "help": "Geef Handy toegang in Systeeminstellingen en kom daarna hier terug om opnieuw te controleren."
+      },
+      "macInputMonitoring": {
+        "title": "Toestemming voor invoercontrole",
+        "description": "Vereist op macOS om typen en onveilige bewerkingen te detecteren terwijl live-uitvoer actief is.",
+        "action": "Toegang tot invoercontrole aanvragen",
+        "help": "Geef Handy toegang in Systeeminstellingen en kom daarna hier terug om opnieuw te controleren."
+      }
+    },
+    "statuses": {
+      "armed": "Klaar voor live-uitvoer",
+      "streaming": "Live-uitvoer wordt verzonden",
+      "fallback": "Normale definitieve uitvoer wordt gebruikt",
+      "invalidated": "Live-uitvoer gestopt voor de veiligheid",
+      "conflict": "Conflict met definitieve transcriptie",
+      "completed": "Live-uitvoer voltooid",
+      "cancelled": "Live-uitvoer geannuleerd",
+      "faulted": "Live-uitvoer mislukt"
+    },
+    "reasons": {
+      "disabled": "Uitvoer naar het actieve veld is uitgeschakeld.",
+      "experimentalFeaturesDisabled": "Experimentele functies zijn uitgeschakeld.",
+      "modelDoesNotSupportStreaming": "Het geselecteerde model ondersteunt geen livestreaming.",
+      "postProcessingIncompatible": "Nabewerking vereist normale definitieve uitvoer.",
+      "pasteMethodDisabled": "Tekstinvoer is uitgeschakeld in de plakinstellingen.",
+      "externalScriptIncompatible": "Externe plakscripts kunnen niet worden gebruikt met live-uitvoer.",
+      "accessibilityPermissionMissing": "Toestemming voor toegankelijkheid in macOS is vereist.",
+      "inputMonitoringPermissionMissing": "Toestemming voor invoercontrole in macOS is vereist.",
+      "atSpiUnavailable": "De toegankelijkheidsservice AT-SPI is niet beschikbaar.",
+      "typingToolUnavailable": "Er is geen ondersteund typprogramma voor het toetsenbord met focus beschikbaar.",
+      "controlShortcutUnsupported": "De opnamesneltoets kan niet veilig worden verwerkt voor live-uitvoer.",
+      "autoSubmitUnsupported": "Automatisch verzenden wordt niet ondersteund voor dit doel.",
+      "secureInputActive": "Secure Input is actief, waardoor live-uitvoer niet kan worden gestart.",
+      "secureField": "Live-uitvoer is niet toegestaan in beveiligde velden of wachtwoordvelden.",
+      "handyOwnedTarget": "Live-uitvoer kan niet naar een Handy-venster worden gestuurd.",
+      "noFocusedTarget": "Er is geen actief bewerkbaar veld gevonden.",
+      "targetNotEditable": "Het actieve doel kan niet worden bewerkt.",
+      "initialSelectionNotCollapsed": "Hef de selectie op en plaats de cursor voordat u live-uitvoer start.",
+      "targetUnsupported": "Het actieve veld biedt niet de veiligheidscontroles die vereist zijn voor live-uitvoer.",
+      "targetChanged": "Het actieve doel is tijdens de live-uitvoer gewijzigd.",
+      "physicalPointerActivity": "Aanwijzeractiviteit heeft de live-uitvoer gestopt om het doel te beschermen.",
+      "destructiveUserEdit": "Een verwijdering, vervanging, plakactie of andere destructieve bewerking heeft de live-uitvoer gestopt.",
+      "caretMoved": "Het verplaatsen van de cursor heeft de live-uitvoer gestopt.",
+      "selectionChanged": "Het wijzigen van de selectie heeft de live-uitvoer gestopt.",
+      "unsafeKeyboardCommand": "Een toetsenbordopdracht die het doel kon wijzigen, heeft de live-uitvoer gestopt.",
+      "imeCompositionUnsupported": "IME-compositie kan tijdens live-uitvoer niet veilig worden gecontroleerd.",
+      "mixedInputUnavailable": "Typen in dit veld kan tijdens live-uitvoer niet veilig worden gecontroleerd.",
+      "targetClosed": "Het doelveld of de toepassing is gesloten.",
+      "monitorUnavailable": "Doelbewaking is niet meer beschikbaar.",
+      "backendDisconnected": "De toegankelijkheidsbackend van het systeem is niet meer verbonden.",
+      "injectionDenied": "Het systeem heeft het live invoegen van tekst geweigerd.",
+      "injectionPartial": "Slechts een deel van een live-tekstinvoeging kon worden geverifieerd, dus de uitvoer is gestopt.",
+      "injectionAmbiguous": "Het resultaat van een live-tekstinvoeging kon niet worden bevestigd, dus de uitvoer is gestopt.",
+      "injectionFailed": "Een live-tekstinvoeging is mislukt, dus de uitvoer is gestopt.",
+      "receiptTimeout": "De bevestiging van een live-tekstinvoeging duurde te lang.",
+      "finalConflict": "De definitieve transcriptie kwam niet overeen met de al afgeleverde tekst.",
+      "historyUnavailable": "De definitieve transcriptie kon niet in Geschiedenis worden opgeslagen.",
+      "streamFailed": "De live-transcriptie is tijdens de opname mislukt.",
+      "cancelled": "De opname of live-uitvoer is geannuleerd.",
+      "platformUnsupported": "Uitvoer naar het actieve veld wordt niet ondersteund op dit platform.",
+      "alreadyActive": "Er is al een andere live-uitvoersessie actief."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Normale definitieve uitvoer wordt gebruikt",
+        "body": "Uitvoer naar het actieve veld is niet beschikbaar voor deze opname. De tekst wordt ingevoegd nadat de transcriptie is voltooid."
+      },
+      "invalidated": {
+        "title": "Live-uitvoer gestopt voor de veiligheid",
+        "body": "Het doel kon niet meer worden geverifieerd. Al afgeleverde tekst is ongewijzigd gebleven."
+      },
+      "faulted": {
+        "title": "Live-uitvoer gestopt",
+        "body": "De meest recente invoeging kon niet worden bevestigd. Al afgeleverde tekst is ongewijzigd gebleven."
+      },
+      "conflict": {
+        "title": "Conflict met definitieve transcriptie",
+        "body": "De definitieve transcriptie week af van de al afgeleverde tekst, die ongewijzigd is gebleven."
+      },
+      "history": {
+        "action": "Geschiedenis openen",
+        "unavailable": "Deze transcriptie kon niet in Geschiedenis worden opgeslagen."
+      }
+    },
+    "help": {
+      "runtimeChecks": "De beschikbaarheid wordt opnieuw gecontroleerd wanneer de opname start. Op een ondersteund platform kan voor het geselecteerde veld alsnog de normale definitieve uitvoer worden gebruikt.",
+      "coediting": "U kunt in hetzelfde veld blijven typen. Verwijderen, selecteren, navigeren, opdrachten, IME-compositie, aanwijzeractiviteit of een wijziging van het doel stopt de live-uitvoer.",
+      "guardedInputRace": "Bij beveiligde toetsenbordinvoer wordt het veld vóór elke kleine invoeging geverifieerd, maar de focus kan nog veranderen voordat het besturingssysteem de invoer verwerkt.",
+      "guardedSubmitRace": "Automatisch verzenden wordt gecontroleerd vlak voordat de sneltoets wordt verstuurd, maar de focus kan nog veranderen voordat het besturingssysteem deze verwerkt.",
+      "deliveredTextSafety": "Wanneer live-uitvoer stopt, verwijdert of herschrijft Handy nooit tekst die al is afgeleverd."
+    }
   }
 }

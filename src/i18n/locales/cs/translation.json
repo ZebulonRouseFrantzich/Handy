@@ -613,6 +613,20 @@
         "label": "Zobrazovat novinky",
         "description": "Zobrazovat poznámky k vydání po aktualizacích Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Cíl průběžného výstupu",
+      "description": "Zvolte, kde se bude během mluvení zobrazovat průběžný přepis. Toto nastavení platí pouze pro modely podporující streamování.",
+      "options": {
+        "overlay": {
+          "label": "Překryvná vrstva",
+          "description": "Zobrazovat živý přepis v překryvné vrstvě Handy bez psaní do jiné aplikace."
+        },
+        "focusedField": {
+          "label": "Aktivní pole",
+          "description": "Po bezpečnostních kontrolách zapisovat živý přepis do aktivního upravitelného pole. U nepodporovaných nebo nebezpečných cílů se použije běžný konečný výstup."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Jak to vyřešit",
     "recorderBlocked": "Zkratky teď nelze nahrát — Secure Input v macOS blokuje události kláves. Nejprve vyřešte upozornění na Secure Input.",
     "dismiss": "Zavřít"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Dostupnost",
+        "values": {
+          "available": "K dispozici",
+          "unavailable": "Není k dispozici",
+          "targetCheckedAtStart": "Cíl se kontroluje při zahájení nahrávání"
+        }
+      },
+      "backend": {
+        "label": "Backend",
+        "values": {
+          "windows": "Zpřístupnění a vstup ve Windows",
+          "macOs": "Zpřístupnění macOS a Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Testovací backend"
+        }
+      },
+      "safety": {
+        "label": "Bezpečnost",
+        "values": {
+          "verifiedControl": "Ověřený ovládací prvek",
+          "guardedFocusedControl": "Chráněný aktivní ovládací prvek",
+          "unavailable": "Není k dispozici"
+        }
+      },
+      "insertionRoute": {
+        "label": "Způsob vkládání",
+        "values": {
+          "windowsUnicodeSendInput": "Vstup Unicode ve Windows",
+          "macAxSelectedText": "Vybraný text přes Zpřístupnění macOS",
+          "macCgEventUnicode": "Vstup Unicode přes Core Graphics v macOS",
+          "atSpiEditableText": "Upravitelný text AT-SPI",
+          "linuxFocusedKeyboard": "Aktivní klávesnice v Linuxu",
+          "test": "Testovací způsob",
+          "none": "Vybráno při zahájení nahrávání"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Potvrzení doručení",
+        "values": {
+          "verified": "Ověřeno",
+          "posted": "Odesláno operačnímu systému"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Psaní během mluvení",
+        "values": {
+          "observedInsertionsOnly": "Pouze sledovaná vložení",
+          "guardedKeyboardInsertionsOnly": "Pouze chráněná vložení z klávesnice",
+          "unavailable": "Není k dispozici"
+        }
+      },
+      "submitSupport": {
+        "label": "Automatické odeslání",
+        "values": {
+          "supported": "Pro tento cíl je podporováno",
+          "unsupported": "Pro tento cíl není podporováno"
+        }
+      },
+      "applicationTarget": {
+        "label": "Cílová aplikace",
+        "values": {
+          "none": "Nebyl zachycen žádný cíl"
+        }
+      },
+      "status": {
+        "label": "Nejnovější stav"
+      },
+      "reason": {
+        "label": "Důvod",
+        "values": {
+          "none": "Nebyl nahlášen žádný problém"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Oprávnění ke zpřístupnění",
+        "description": "V macOS je vyžadováno k rozpoznání aktivního upravitelného pole a ověření bezpečného vložení.",
+        "action": "Požádat o přístup ke zpřístupnění",
+        "help": "Povolte Handy přístup v Nastavení systému a pak se sem vraťte a proveďte novou kontrolu."
+      },
+      "macInputMonitoring": {
+        "title": "Oprávnění ke sledování vstupu",
+        "description": "V macOS je vyžadováno k rozpoznání psaní a nebezpečných úprav během aktivního živého výstupu.",
+        "action": "Požádat o přístup ke sledování vstupu",
+        "help": "Povolte Handy přístup v Nastavení systému a pak se sem vraťte a proveďte novou kontrolu."
+      }
+    },
+    "statuses": {
+      "armed": "Připraveno na živý výstup",
+      "streaming": "Odesílání živého výstupu",
+      "fallback": "Používá se běžný konečný výstup",
+      "invalidated": "Živý výstup byl z bezpečnostních důvodů zastaven",
+      "conflict": "Konflikt konečného přepisu",
+      "completed": "Živý výstup byl dokončen",
+      "cancelled": "Živý výstup byl zrušen",
+      "faulted": "Živý výstup selhal"
+    },
+    "reasons": {
+      "disabled": "Výstup do aktivního pole je vypnutý.",
+      "experimentalFeaturesDisabled": "Experimentální funkce jsou vypnuté.",
+      "modelDoesNotSupportStreaming": "Vybraný model nepodporuje živé streamování.",
+      "postProcessingIncompatible": "Následné zpracování vyžaduje běžný konečný výstup.",
+      "pasteMethodDisabled": "Vkládání textu je v nastavení vkládání vypnuté.",
+      "externalScriptIncompatible": "Externí skripty pro vkládání nelze použít s živým výstupem.",
+      "accessibilityPermissionMissing": "Je vyžadováno oprávnění ke zpřístupnění v macOS.",
+      "inputMonitoringPermissionMissing": "Je vyžadováno oprávnění ke sledování vstupu v macOS.",
+      "atSpiUnavailable": "Služba zpřístupnění AT-SPI není k dispozici.",
+      "typingToolUnavailable": "Není k dispozici žádný podporovaný nástroj pro psaní do aktivního pole pomocí klávesnice.",
+      "controlShortcutUnsupported": "Klávesovou zkratku pro nahrávání nelze bezpečně zpracovat pro živý výstup.",
+      "autoSubmitUnsupported": "Automatické odeslání není pro tento cíl podporováno.",
+      "secureInputActive": "Je aktivní zabezpečený vstup, takže živý výstup nelze spustit.",
+      "secureField": "Živý výstup není povolen v zabezpečených polích ani v polích pro heslo.",
+      "handyOwnedTarget": "Živý výstup nelze směrovat do okna Handy.",
+      "noFocusedTarget": "Nebylo nalezeno žádné aktivní upravitelné pole.",
+      "targetNotEditable": "Aktivní cíl nelze upravovat.",
+      "initialSelectionNotCollapsed": "Před spuštěním živého výstupu zrušte výběr a umístěte textový kurzor.",
+      "targetUnsupported": "Aktivní pole neposkytuje bezpečnostní kontroly vyžadované pro živý výstup.",
+      "targetChanged": "Během živého výstupu se aktivní cíl změnil.",
+      "physicalPointerActivity": "Aktivita ukazatele zastavila živý výstup, aby byl cíl chráněn.",
+      "destructiveUserEdit": "Odstranění, nahrazení, vložení nebo jiná destruktivní úprava zastavila živý výstup.",
+      "caretMoved": "Přesunutí textového kurzoru zastavilo živý výstup.",
+      "selectionChanged": "Změna výběru zastavila živý výstup.",
+      "unsafeKeyboardCommand": "Klávesový příkaz, který mohl změnit cíl, zastavil živý výstup.",
+      "imeCompositionUnsupported": "Během živého výstupu nelze bezpečně sledovat skládání znaků pomocí IME.",
+      "mixedInputUnavailable": "Během živého výstupu nelze bezpečně sledovat psaní v tomto poli.",
+      "targetClosed": "Cílové pole nebo aplikace byly zavřeny.",
+      "monitorUnavailable": "Sledování cíle již není k dispozici.",
+      "backendDisconnected": "Backend systémového zpřístupnění se odpojil.",
+      "injectionDenied": "Systém zamítl vložení živého textu.",
+      "injectionPartial": "Bylo možné ověřit pouze část vložení živého textu, proto byl výstup zastaven.",
+      "injectionAmbiguous": "Výsledek vložení živého textu se nepodařilo potvrdit, proto byl výstup zastaven.",
+      "injectionFailed": "Vložení živého textu selhalo, proto byl výstup zastaven.",
+      "receiptTimeout": "Vypršel časový limit pro potvrzení vložení živého textu.",
+      "finalConflict": "Konečný přepis se neshodoval s již doručeným textem.",
+      "historyUnavailable": "Konečný přepis se nepodařilo uložit do Historie.",
+      "streamFailed": "Živý přepis během nahrávání selhal.",
+      "cancelled": "Nahrávání nebo živý výstup byly zrušeny.",
+      "platformUnsupported": "Výstup do aktivního pole není na této platformě podporován.",
+      "alreadyActive": "Jiná relace živého výstupu je již aktivní."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Používá se běžný konečný výstup",
+        "body": "Výstup do aktivního pole není pro toto nahrávání k dispozici. Text bude vložen po dokončení přepisu."
+      },
+      "invalidated": {
+        "title": "Živý výstup byl z bezpečnostních důvodů zastaven",
+        "body": "Cíl již nebylo možné ověřit. Již doručený text zůstal beze změny."
+      },
+      "faulted": {
+        "title": "Živý výstup byl zastaven",
+        "body": "Poslední vložení se nepodařilo potvrdit. Již doručený text zůstal beze změny."
+      },
+      "conflict": {
+        "title": "Konflikt konečného přepisu",
+        "body": "Konečný přepis se lišil od již doručeného textu, který zůstal beze změny."
+      },
+      "history": {
+        "action": "Otevřít Historii",
+        "unavailable": "Tento přepis se nepodařilo uložit do Historie."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Dostupnost se znovu kontroluje při zahájení nahrávání. Na podporované platformě se přesto může pro vybrané pole použít běžný konečný výstup.",
+      "coediting": "Ve stejném poli můžete dál psát. Odstranění, výběr, navigace, příkazy, skládání znaků pomocí IME, aktivita ukazatele nebo změna cíle živý výstup zastaví.",
+      "guardedInputRace": "Chráněný výstup z klávesnice ověřuje pole před každým malým vložením, zaměření se však může změnit dříve, než je operační systém zpracuje.",
+      "guardedSubmitRace": "Automatické odeslání se kontroluje bezprostředně před odesláním klávesové zkratky, zaměření se však může změnit dříve, než ji operační systém zpracuje.",
+      "deliveredTextSafety": "Když se živý výstup zastaví, Handy nikdy neodstraní ani nepřepíše text, který již doručil."
+    }
   }
 }

@@ -613,6 +613,20 @@
           "details": "Handy's local speech-to-text is built on transcribe.cpp and ggml. Thanks to the amazing work by Georgi Gerganov and contributors."
         }
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Progressive output destination",
+      "description": "Choose where partial transcription appears while you speak. This setting applies only to streaming-capable models.",
+      "options": {
+        "overlay": {
+          "label": "Overlay",
+          "description": "Show live transcription in Handy’s overlay without typing into another application."
+        },
+        "focusedField": {
+          "label": "Focused field",
+          "description": "Type live transcription into the focused editable field after safety checks. Unsupported or unsafe targets use normal final output."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "How to fix",
     "recorderBlocked": "Can't record shortcuts right now — macOS Secure Input is blocking key events. Resolve the Secure Input warning first.",
     "dismiss": "Dismiss"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Availability",
+        "values": {
+          "available": "Available",
+          "unavailable": "Unavailable",
+          "targetCheckedAtStart": "Target checked when recording starts"
+        }
+      },
+      "backend": {
+        "label": "Backend",
+        "values": {
+          "windows": "Windows accessibility and input",
+          "macOs": "macOS Accessibility and Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Test backend"
+        }
+      },
+      "safety": {
+        "label": "Safety",
+        "values": {
+          "verifiedControl": "Verified control",
+          "guardedFocusedControl": "Guarded focused control",
+          "unavailable": "Unavailable"
+        }
+      },
+      "insertionRoute": {
+        "label": "Insertion route",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode input",
+          "macAxSelectedText": "macOS Accessibility selected text",
+          "macCgEventUnicode": "macOS Core Graphics Unicode input",
+          "atSpiEditableText": "AT-SPI editable text",
+          "linuxFocusedKeyboard": "Linux focused keyboard",
+          "test": "Test route",
+          "none": "Selected when recording starts"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Delivery confirmation",
+        "values": {
+          "verified": "Verified",
+          "posted": "Posted to the operating system"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Typing while speaking",
+        "values": {
+          "observedInsertionsOnly": "Observed insertions only",
+          "guardedKeyboardInsertionsOnly": "Guarded keyboard insertions only",
+          "unavailable": "Unavailable"
+        }
+      },
+      "submitSupport": {
+        "label": "Auto-submit",
+        "values": {
+          "supported": "Supported for this target",
+          "unsupported": "Not supported for this target"
+        }
+      },
+      "applicationTarget": {
+        "label": "Application target",
+        "values": {
+          "none": "No target captured"
+        }
+      },
+      "status": {
+        "label": "Latest status"
+      },
+      "reason": {
+        "label": "Reason",
+        "values": {
+          "none": "No issue reported"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Accessibility permission",
+        "description": "Required on macOS to identify the focused editable field and verify safe insertion.",
+        "action": "Request Accessibility access",
+        "help": "Grant Handy access in System Settings, then return here to check again."
+      },
+      "macInputMonitoring": {
+        "title": "Input Monitoring permission",
+        "description": "Required on macOS to detect typing and unsafe edits while live output is active.",
+        "action": "Request Input Monitoring access",
+        "help": "Grant Handy access in System Settings, then return here to check again."
+      }
+    },
+    "statuses": {
+      "armed": "Ready for live output",
+      "streaming": "Sending live output",
+      "fallback": "Using normal final output",
+      "invalidated": "Live output stopped for safety",
+      "conflict": "Final transcription conflict",
+      "completed": "Live output completed",
+      "cancelled": "Live output cancelled",
+      "faulted": "Live output failed"
+    },
+    "reasons": {
+      "disabled": "Focused Field output is turned off.",
+      "experimentalFeaturesDisabled": "Experimental features are turned off.",
+      "modelDoesNotSupportStreaming": "The selected model does not support live streaming.",
+      "postProcessingIncompatible": "Post-processing requires normal final output.",
+      "pasteMethodDisabled": "Text insertion is disabled in the paste settings.",
+      "externalScriptIncompatible": "External paste scripts cannot be used with live output.",
+      "accessibilityPermissionMissing": "macOS Accessibility permission is required.",
+      "inputMonitoringPermissionMissing": "macOS Input Monitoring permission is required.",
+      "atSpiUnavailable": "The AT-SPI accessibility service is unavailable.",
+      "typingToolUnavailable": "No supported focused-keyboard typing tool is available.",
+      "controlShortcutUnsupported": "The recording shortcut cannot be handled safely for live output.",
+      "autoSubmitUnsupported": "Auto-submit is not supported for this target.",
+      "secureInputActive": "Secure Input is active, so live output cannot start.",
+      "secureField": "Live output is not allowed in secure or password fields.",
+      "handyOwnedTarget": "Live output cannot target a Handy window.",
+      "noFocusedTarget": "No focused editable field was found.",
+      "targetNotEditable": "The focused target is not editable.",
+      "initialSelectionNotCollapsed": "Clear the selection and place the caret before starting live output.",
+      "targetUnsupported": "The focused field does not provide the safety checks required for live output.",
+      "targetChanged": "The focused target changed during live output.",
+      "physicalPointerActivity": "Pointer activity stopped live output to protect the target.",
+      "destructiveUserEdit": "A deletion, replacement, paste, or other destructive edit stopped live output.",
+      "caretMoved": "Moving the caret stopped live output.",
+      "selectionChanged": "Changing the selection stopped live output.",
+      "unsafeKeyboardCommand": "A keyboard command that could change the target stopped live output.",
+      "imeCompositionUnsupported": "IME composition cannot be monitored safely during live output.",
+      "mixedInputUnavailable": "Typing in this field cannot be monitored safely during live output.",
+      "targetClosed": "The target field or application was closed.",
+      "monitorUnavailable": "Target monitoring is no longer available.",
+      "backendDisconnected": "The system accessibility backend disconnected.",
+      "injectionDenied": "The system denied the live text insertion.",
+      "injectionPartial": "Only part of a live text insertion could be verified, so output stopped.",
+      "injectionAmbiguous": "The result of a live text insertion could not be confirmed, so output stopped.",
+      "injectionFailed": "A live text insertion failed, so output stopped.",
+      "receiptTimeout": "Confirmation of a live text insertion timed out.",
+      "finalConflict": "The final transcription did not match the text already delivered.",
+      "historyUnavailable": "The final transcription could not be saved to History.",
+      "streamFailed": "Live transcription failed during recording.",
+      "cancelled": "The recording or live output was cancelled.",
+      "platformUnsupported": "Focused Field output is not supported on this platform.",
+      "alreadyActive": "Another live output session is already active."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Using normal final output",
+        "body": "Focused Field output is unavailable for this recording. Text will be inserted after transcription finishes."
+      },
+      "invalidated": {
+        "title": "Live output stopped for safety",
+        "body": "The target could no longer be verified. Text already delivered was left unchanged."
+      },
+      "faulted": {
+        "title": "Live output stopped",
+        "body": "The latest insertion could not be confirmed. Text already delivered was left unchanged."
+      },
+      "conflict": {
+        "title": "Final transcription conflict",
+        "body": "The final transcription differed from the text already delivered, which was left unchanged."
+      },
+      "history": {
+        "action": "Open History",
+        "unavailable": "This transcription could not be saved to History."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Availability is checked again when recording starts. A supported platform may still use normal final output for the selected field.",
+      "coediting": "You can keep typing in the same field. Deletion, selection, navigation, commands, IME composition, pointer activity, or a target change stops live output.",
+      "guardedInputRace": "Guarded keyboard output verifies the field before each small insertion, but focus can still change before the operating system consumes it.",
+      "guardedSubmitRace": "Auto-submit is checked immediately before the shortcut is posted, but focus can still change before the operating system consumes it.",
+      "deliveredTextSafety": "When live output stops, Handy never deletes or rewrites text it already delivered."
+    }
   }
 }

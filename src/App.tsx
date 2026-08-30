@@ -18,10 +18,12 @@ import { Sidebar, SidebarSection, SECTIONS_CONFIG } from "./components/Sidebar";
 import { WhatsNewGate } from "./components/whats-new";
 import { useSettings } from "./hooks/useSettings";
 import { useSettingsStore } from "./stores/settingsStore";
-import { commands } from "@/bindings";
+import { commands, events } from "@/bindings";
 import { getLanguageDirection, initializeRTL } from "@/lib/utils/rtl";
 
 type OnboardingStep = "accessibility" | "model" | "done";
+
+const MAX_NOTIFIED_FOCUSED_OUTPUT_SESSIONS = 256;
 
 const renderSettingsContent = (section: SidebarSection) => {
   const ActiveComponent =
@@ -48,6 +50,12 @@ function App() {
     (state) => state.refreshOutputDevices,
   );
   const hasCompletedPostOnboardingInit = useRef(false);
+  const notifiedFocusedOutputSessionsRef = useRef<Set<number> | null>(null);
+  if (notifiedFocusedOutputSessionsRef.current === null) {
+    notifiedFocusedOutputSessionsRef.current = new Set<number>();
+  }
+  const notifiedFocusedOutputSessions =
+    notifiedFocusedOutputSessionsRef.current;
 
   useEffect(() => {
     checkOnboardingStatus();
@@ -139,6 +147,85 @@ function App() {
       unlisten.then((fn) => fn());
     };
   }, [t]);
+
+  useEffect(() => {
+    const markSessionNotified = (sessionId: number) => {
+      if (notifiedFocusedOutputSessions.has(sessionId)) return false;
+
+      notifiedFocusedOutputSessions.add(sessionId);
+      if (
+        notifiedFocusedOutputSessions.size >
+        MAX_NOTIFIED_FOCUSED_OUTPUT_SESSIONS
+      ) {
+        const oldestSessionId = notifiedFocusedOutputSessions
+          .values()
+          .next().value;
+        if (oldestSessionId !== undefined) {
+          notifiedFocusedOutputSessions.delete(oldestSessionId);
+        }
+      }
+
+      return true;
+    };
+    const unlisten = events.focusedOutputStatusEvent.listen((event) => {
+      const status = event.payload;
+      if (status.status === "fallback" && status.reason === null) {
+        return;
+      }
+
+      switch (status.status) {
+        case "armed":
+        case "streaming":
+        case "completed":
+        case "cancelled":
+          return;
+        case "fallback":
+          if (!markSessionNotified(status.session_id)) return;
+          toast.warning(t("focusedOutput.notifications.fallback.title"), {
+            description: t("focusedOutput.notifications.fallback.body"),
+          });
+          return;
+        case "invalidated":
+          if (!markSessionNotified(status.session_id)) return;
+          toast.warning(t("focusedOutput.notifications.invalidated.title"), {
+            description: t("focusedOutput.notifications.invalidated.body"),
+          });
+          return;
+        case "faulted":
+          if (!markSessionNotified(status.session_id)) return;
+          toast.error(t("focusedOutput.notifications.faulted.title"), {
+            description: t("focusedOutput.notifications.faulted.body"),
+          });
+          return;
+        case "conflict":
+          if (!markSessionNotified(status.session_id)) return;
+          if (status.history_available) {
+            toast.warning(t("focusedOutput.notifications.conflict.title"), {
+              description: t("focusedOutput.notifications.conflict.body"),
+              action: {
+                label: t("focusedOutput.notifications.history.action"),
+                onClick: () => setCurrentSection("history"),
+              },
+            });
+          } else {
+            toast.warning(t("focusedOutput.notifications.conflict.title"), {
+              description: `${t(
+                "focusedOutput.notifications.conflict.body",
+              )} ${t("focusedOutput.notifications.history.unavailable")}`,
+            });
+          }
+          return;
+        default: {
+          const exhaustive: never = status.status;
+          return exhaustive;
+        }
+      }
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [notifiedFocusedOutputSessions, t]);
 
   // Listen for transcription failures and show a toast.
   // The payload is the backend error message (also logged to handy.log).

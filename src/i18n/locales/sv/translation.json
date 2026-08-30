@@ -613,6 +613,20 @@
         "label": "Visa nyheter",
         "description": "Visa versionsinformation efter Handy-uppdateringar"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Mål för progressiv utmatning",
+      "description": "Välj var den partiella transkriberingen visas medan du talar. Inställningen gäller endast modeller som stöder strömning.",
+      "options": {
+        "overlay": {
+          "label": "Överlagring",
+          "description": "Visa livetranskriberingen i Handys överlagring utan att skriva i ett annat program."
+        },
+        "focusedField": {
+          "label": "Fokuserat fält",
+          "description": "Skriv livetranskriberingen i det fokuserade redigerbara fältet efter säkerhetskontroller. För mål som inte stöds eller är osäkra används vanlig slutlig utmatning."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Så här löser du det",
     "recorderBlocked": "Det går inte att spela in kortkommandon just nu — macOS Secure Input blockerar tangenthändelser. Lös varningen om Secure Input först.",
     "dismiss": "Avfärda"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Tillgänglighet",
+        "values": {
+          "available": "Tillgänglig",
+          "unavailable": "Inte tillgänglig",
+          "targetCheckedAtStart": "Målet kontrolleras när inspelningen startar"
+        }
+      },
+      "backend": {
+        "label": "Bakände",
+        "values": {
+          "windows": "Windows hjälpmedel och inmatning",
+          "macOs": "macOS Hjälpmedel och Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Testbakände"
+        }
+      },
+      "safety": {
+        "label": "Säkerhet",
+        "values": {
+          "verifiedControl": "Verifierad kontroll",
+          "guardedFocusedControl": "Skyddad fokuserad kontroll",
+          "unavailable": "Inte tillgänglig"
+        }
+      },
+      "insertionRoute": {
+        "label": "Infogningsväg",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode-inmatning",
+          "macAxSelectedText": "Markerad text via macOS Hjälpmedel",
+          "macCgEventUnicode": "Unicode-inmatning via macOS Core Graphics",
+          "atSpiEditableText": "Redigerbar text via AT-SPI",
+          "linuxFocusedKeyboard": "Fokuserat tangentbord i Linux",
+          "test": "Testväg",
+          "none": "Väljs när inspelningen startar"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Leveransbekräftelse",
+        "values": {
+          "verified": "Verifierad",
+          "posted": "Skickad till operativsystemet"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Skriva medan du talar",
+        "values": {
+          "observedInsertionsOnly": "Endast övervakade infogningar",
+          "guardedKeyboardInsertionsOnly": "Endast skyddade tangentbordsinfogningar",
+          "unavailable": "Inte tillgängligt"
+        }
+      },
+      "submitSupport": {
+        "label": "Skicka automatiskt",
+        "values": {
+          "supported": "Stöds för det här målet",
+          "unsupported": "Stöds inte för det här målet"
+        }
+      },
+      "applicationTarget": {
+        "label": "Målprogram",
+        "values": {
+          "none": "Inget mål registrerat"
+        }
+      },
+      "status": {
+        "label": "Senaste status"
+      },
+      "reason": {
+        "label": "Orsak",
+        "values": {
+          "none": "Inga problem rapporterade"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Behörighet för Hjälpmedel",
+        "description": "Krävs i macOS för att identifiera det fokuserade redigerbara fältet och verifiera säker infogning.",
+        "action": "Begär åtkomst till Hjälpmedel",
+        "help": "Ge Handy åtkomst i Systeminställningar och gå sedan tillbaka hit för att kontrollera igen."
+      },
+      "macInputMonitoring": {
+        "title": "Behörighet för Inmatningsövervakning",
+        "description": "Krävs i macOS för att upptäcka skrivning och osäkra redigeringar medan liveutmatning är aktiv.",
+        "action": "Begär åtkomst till Inmatningsövervakning",
+        "help": "Ge Handy åtkomst i Systeminställningar och gå sedan tillbaka hit för att kontrollera igen."
+      }
+    },
+    "statuses": {
+      "armed": "Redo för liveutmatning",
+      "streaming": "Skickar liveutmatning",
+      "fallback": "Använder vanlig slutlig utmatning",
+      "invalidated": "Liveutmatningen stoppades av säkerhetsskäl",
+      "conflict": "Konflikt i den slutliga transkriberingen",
+      "completed": "Liveutmatningen har slutförts",
+      "cancelled": "Liveutmatningen avbröts",
+      "faulted": "Liveutmatningen misslyckades"
+    },
+    "reasons": {
+      "disabled": "Utmatning till Fokuserat fält är avstängd.",
+      "experimentalFeaturesDisabled": "Experimentella funktioner är avstängda.",
+      "modelDoesNotSupportStreaming": "Den valda modellen stöder inte liveströmning.",
+      "postProcessingIncompatible": "Efterbearbetning kräver vanlig slutlig utmatning.",
+      "pasteMethodDisabled": "Textinfogning är inaktiverad i inklistringsinställningarna.",
+      "externalScriptIncompatible": "Externa inklistringsskript kan inte användas med liveutmatning.",
+      "accessibilityPermissionMissing": "Behörighet för Hjälpmedel i macOS krävs.",
+      "inputMonitoringPermissionMissing": "Behörighet för Inmatningsövervakning i macOS krävs.",
+      "atSpiUnavailable": "Hjälpmedelstjänsten AT-SPI är inte tillgänglig.",
+      "typingToolUnavailable": "Inget kompatibelt skrivverktyg för det fokuserade tangentbordet är tillgängligt.",
+      "controlShortcutUnsupported": "Inspelningsgenvägen kan inte hanteras säkert för liveutmatning.",
+      "autoSubmitUnsupported": "Automatisk sändning stöds inte för det här målet.",
+      "secureInputActive": "Säker inmatning är aktiv, så liveutmatningen kan inte starta.",
+      "secureField": "Liveutmatning tillåts inte i säkra fält eller lösenordsfält.",
+      "handyOwnedTarget": "Liveutmatning kan inte riktas till ett Handy-fönster.",
+      "noFocusedTarget": "Inget fokuserat redigerbart fält hittades.",
+      "targetNotEditable": "Det fokuserade målet är inte redigerbart.",
+      "initialSelectionNotCollapsed": "Avmarkera texten och placera markören innan du startar liveutmatningen.",
+      "targetUnsupported": "Det fokuserade fältet tillhandahåller inte de säkerhetskontroller som krävs för liveutmatning.",
+      "targetChanged": "Det fokuserade målet ändrades under liveutmatningen.",
+      "physicalPointerActivity": "Pekaraktivitet stoppade liveutmatningen för att skydda målet.",
+      "destructiveUserEdit": "En borttagning, ersättning, inklistring eller annan destruktiv redigering stoppade liveutmatningen.",
+      "caretMoved": "Liveutmatningen stoppades när markören flyttades.",
+      "selectionChanged": "Liveutmatningen stoppades när markeringen ändrades.",
+      "unsafeKeyboardCommand": "Ett tangentbordskommando som kunde ändra målet stoppade liveutmatningen.",
+      "imeCompositionUnsupported": "IME-sammansättning kan inte övervakas säkert under liveutmatning.",
+      "mixedInputUnavailable": "Skrivning i det här fältet kan inte övervakas säkert under liveutmatning.",
+      "targetClosed": "Målfältet eller programmet stängdes.",
+      "monitorUnavailable": "Målövervakning är inte längre tillgänglig.",
+      "backendDisconnected": "Systemets hjälpmedelsbakände kopplades från.",
+      "injectionDenied": "Systemet nekade infogningen av livetext.",
+      "injectionPartial": "Endast en del av livetextinfogningen kunde verifieras, så utmatningen stoppades.",
+      "injectionAmbiguous": "Resultatet av livetextinfogningen kunde inte bekräftas, så utmatningen stoppades.",
+      "injectionFailed": "En livetextinfogning misslyckades, så utmatningen stoppades.",
+      "receiptTimeout": "Tidsgränsen för bekräftelse av en livetextinfogning överskreds.",
+      "finalConflict": "Den slutliga transkriberingen stämde inte överens med texten som redan hade levererats.",
+      "historyUnavailable": "Den slutliga transkriberingen kunde inte sparas i Historik.",
+      "streamFailed": "Livetranskriberingen misslyckades under inspelningen.",
+      "cancelled": "Inspelningen eller liveutmatningen avbröts.",
+      "platformUnsupported": "Utmatning till Fokuserat fält stöds inte på den här plattformen.",
+      "alreadyActive": "En annan session med liveutmatning är redan aktiv."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Använder vanlig slutlig utmatning",
+        "body": "Utmatning till Fokuserat fält är inte tillgänglig för den här inspelningen. Texten infogas när transkriberingen är klar."
+      },
+      "invalidated": {
+        "title": "Liveutmatningen stoppades av säkerhetsskäl",
+        "body": "Målet kunde inte längre verifieras. Redan levererad text lämnades oförändrad."
+      },
+      "faulted": {
+        "title": "Liveutmatningen stoppades",
+        "body": "Den senaste infogningen kunde inte bekräftas. Redan levererad text lämnades oförändrad."
+      },
+      "conflict": {
+        "title": "Konflikt i den slutliga transkriberingen",
+        "body": "Den slutliga transkriberingen skilde sig från den redan levererade texten, som lämnades oförändrad."
+      },
+      "history": {
+        "action": "Öppna Historik",
+        "unavailable": "Den här transkriberingen kunde inte sparas i Historik."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Tillgängligheten kontrolleras igen när inspelningen startar. På en plattform som stöds kan vanlig slutlig utmatning ändå användas för det valda fältet.",
+      "coediting": "Du kan fortsätta skriva i samma fält. Borttagning, markering, navigering, kommandon, IME-sammansättning, pekaraktivitet eller ett målbyte stoppar liveutmatningen.",
+      "guardedInputRace": "Skyddad tangentbordsutmatning verifierar fältet före varje liten infogning, men fokus kan ändå ändras innan operativsystemet behandlar den.",
+      "guardedSubmitRace": "Automatisk sändning kontrolleras omedelbart innan genvägen skickas, men fokus kan ändå ändras innan operativsystemet behandlar den.",
+      "deliveredTextSafety": "När liveutmatningen stoppas tar Handy aldrig bort eller skriver om text som redan har levererats."
+    }
   }
 }

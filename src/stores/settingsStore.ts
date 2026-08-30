@@ -7,6 +7,7 @@ import type {
   TranscribeAcceleratorSetting,
   OrtAcceleratorSetting,
   VadBackend,
+  ProgressiveOutputDestination,
 } from "@/bindings";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
@@ -160,6 +161,27 @@ const settingUpdaters: {
   theme: (value) => commands.changeThemeSetting(value as string),
   experimental_enabled: (value) =>
     commands.changeExperimentalEnabledSetting(value as boolean),
+  progressive_output_destination: async (value) => {
+    const result = await commands
+      .changeProgressiveOutputDestinationSetting(
+        value as ProgressiveOutputDestination,
+      )
+      .catch(() => {
+        throw new Error("Unable to update progressive output destination");
+      });
+    switch (result.status) {
+      case "ok":
+        return;
+      case "error":
+        throw new Error("Unable to update progressive output destination");
+      default: {
+        const exhaustive: never = result;
+        throw new Error(
+          `Unexpected progressive output update result: ${String(exhaustive)}`,
+        );
+      }
+    }
+  },
   lazy_stream_close: (value) =>
     commands.changeLazyStreamCloseSetting(value as boolean),
   overlay_style: (value) => commands.changeOverlayStyleSetting(value as string),

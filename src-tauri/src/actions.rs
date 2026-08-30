@@ -720,13 +720,6 @@ impl ShortcutAction for TranscribeAction {
                     focused_manager.finish_no_text(session_id);
                     tm.cancel_stream();
                     set_tray_state(app, TrayIconState::Idle);
-                    let _ = app.emit(
-                        "recording-error",
-                        RecordingErrorEvent {
-                            error_type: "focused_stream_admission_failed".to_owned(),
-                            detail: None,
-                        },
-                    );
                     return;
                 }
                 warn!(

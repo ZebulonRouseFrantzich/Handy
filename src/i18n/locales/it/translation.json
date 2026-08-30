@@ -613,6 +613,20 @@
         "label": "Mostra novità",
         "description": "Mostra le note di rilascio dopo gli aggiornamenti di Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Destinazione dell’output progressivo",
+      "description": "Scegli dove visualizzare la trascrizione parziale mentre parli. Questa impostazione si applica solo ai modelli che supportano lo streaming.",
+      "options": {
+        "overlay": {
+          "label": "Sovrimpressione",
+          "description": "Mostra la trascrizione in tempo reale nella sovrimpressione di Handy senza digitare in un’altra applicazione."
+        },
+        "focusedField": {
+          "label": "Campo attivo",
+          "description": "Digita la trascrizione in tempo reale nel campo modificabile attivo dopo i controlli di sicurezza. Per le destinazioni non supportate o non sicure viene usato il normale output finale."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Come risolvere",
     "recorderBlocked": "Non è possibile registrare scorciatoie in questo momento: Secure Input di macOS sta bloccando gli eventi dei tasti. Risolvi prima l'avviso di Secure Input.",
     "dismiss": "Ignora"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Disponibilità",
+        "values": {
+          "available": "Disponibile",
+          "unavailable": "Non disponibile",
+          "targetCheckedAtStart": "Destinazione verificata all’avvio della registrazione"
+        }
+      },
+      "backend": {
+        "label": "Backend",
+        "values": {
+          "windows": "Accessibilità e input di Windows",
+          "macOs": "Accessibilità di macOS e Core Graphics",
+          "linuxAtSpi": "AT-SPI di Linux",
+          "test": "Backend di test"
+        }
+      },
+      "safety": {
+        "label": "Sicurezza",
+        "values": {
+          "verifiedControl": "Controllo verificato",
+          "guardedFocusedControl": "Controllo attivo protetto",
+          "unavailable": "Non disponibile"
+        }
+      },
+      "insertionRoute": {
+        "label": "Metodo di inserimento",
+        "values": {
+          "windowsUnicodeSendInput": "Input Unicode di Windows",
+          "macAxSelectedText": "Testo selezionato tramite Accessibilità di macOS",
+          "macCgEventUnicode": "Input Unicode tramite Core Graphics di macOS",
+          "atSpiEditableText": "Testo modificabile tramite AT-SPI",
+          "linuxFocusedKeyboard": "Tastiera attiva di Linux",
+          "test": "Metodo di test",
+          "none": "Selezionato all'avvio della registrazione"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Conferma di consegna",
+        "values": {
+          "verified": "Verificata",
+          "posted": "Inviata al sistema operativo"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Digitazione durante la dettatura",
+        "values": {
+          "observedInsertionsOnly": "Solo inserimenti rilevati",
+          "guardedKeyboardInsertionsOnly": "Solo inserimenti da tastiera protetti",
+          "unavailable": "Non disponibile"
+        }
+      },
+      "submitSupport": {
+        "label": "Invio automatico",
+        "values": {
+          "supported": "Supportato per questa destinazione",
+          "unsupported": "Non supportato per questa destinazione"
+        }
+      },
+      "applicationTarget": {
+        "label": "Applicazione di destinazione",
+        "values": {
+          "none": "Nessuna destinazione acquisita"
+        }
+      },
+      "status": {
+        "label": "Stato più recente"
+      },
+      "reason": {
+        "label": "Motivo",
+        "values": {
+          "none": "Nessun problema segnalato"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Autorizzazione Accessibilità",
+        "description": "Necessaria su macOS per identificare il campo modificabile attivo e verificare che l’inserimento sia sicuro.",
+        "action": "Richiedi accesso ad Accessibilità",
+        "help": "Concedi l’accesso a Handy nelle Impostazioni di Sistema, poi torna qui per verificare di nuovo."
+      },
+      "macInputMonitoring": {
+        "title": "Autorizzazione Monitoraggio input",
+        "description": "Necessaria su macOS per rilevare la digitazione e le modifiche non sicure mentre l’output in tempo reale è attivo.",
+        "action": "Richiedi accesso a Monitoraggio input",
+        "help": "Concedi l’accesso a Handy nelle Impostazioni di Sistema, poi torna qui per verificare di nuovo."
+      }
+    },
+    "statuses": {
+      "armed": "Pronto per l’output in tempo reale",
+      "streaming": "Invio dell’output in tempo reale",
+      "fallback": "Uso del normale output finale",
+      "invalidated": "Output in tempo reale interrotto per sicurezza",
+      "conflict": "Conflitto nella trascrizione finale",
+      "completed": "Output in tempo reale completato",
+      "cancelled": "Output in tempo reale annullato",
+      "faulted": "Output in tempo reale non riuscito"
+    },
+    "reasons": {
+      "disabled": "L’output nel campo attivo è disattivato.",
+      "experimentalFeaturesDisabled": "Le funzionalità sperimentali sono disattivate.",
+      "modelDoesNotSupportStreaming": "Il modello selezionato non supporta lo streaming in tempo reale.",
+      "postProcessingIncompatible": "La post-elaborazione richiede il normale output finale.",
+      "pasteMethodDisabled": "L’inserimento del testo è disattivato nelle impostazioni di incollaggio.",
+      "externalScriptIncompatible": "Gli script di incollaggio esterni non possono essere usati con l’output in tempo reale.",
+      "accessibilityPermissionMissing": "È necessaria l’autorizzazione Accessibilità di macOS.",
+      "inputMonitoringPermissionMissing": "È necessaria l’autorizzazione Monitoraggio input di macOS.",
+      "atSpiUnavailable": "Il servizio di accessibilità AT-SPI non è disponibile.",
+      "typingToolUnavailable": "Non è disponibile alcuno strumento supportato per digitare tramite la tastiera attiva.",
+      "controlShortcutUnsupported": "La scorciatoia di registrazione non può essere gestita in modo sicuro per l’output in tempo reale.",
+      "autoSubmitUnsupported": "L’invio automatico non è supportato per questa destinazione.",
+      "secureInputActive": "Input sicuro è attivo, quindi non è possibile avviare l’output in tempo reale.",
+      "secureField": "L’output in tempo reale non è consentito nei campi protetti o delle password.",
+      "handyOwnedTarget": "L’output in tempo reale non può essere indirizzato a una finestra di Handy.",
+      "noFocusedTarget": "Non è stato trovato alcun campo modificabile attivo.",
+      "targetNotEditable": "La destinazione attiva non è modificabile.",
+      "initialSelectionNotCollapsed": "Deseleziona il testo e posiziona il cursore prima di avviare l’output in tempo reale.",
+      "targetUnsupported": "Il campo attivo non offre i controlli di sicurezza necessari per l’output in tempo reale.",
+      "targetChanged": "La destinazione attiva è cambiata durante l’output in tempo reale.",
+      "physicalPointerActivity": "L’attività del puntatore ha interrotto l’output in tempo reale per proteggere la destinazione.",
+      "destructiveUserEdit": "Un’eliminazione, una sostituzione, un incollaggio o un’altra modifica distruttiva ha interrotto l’output in tempo reale.",
+      "caretMoved": "Lo spostamento del cursore ha interrotto l’output in tempo reale.",
+      "selectionChanged": "La modifica della selezione ha interrotto l’output in tempo reale.",
+      "unsafeKeyboardCommand": "Un comando da tastiera che poteva modificare la destinazione ha interrotto l’output in tempo reale.",
+      "imeCompositionUnsupported": "La composizione IME non può essere monitorata in modo sicuro durante l’output in tempo reale.",
+      "mixedInputUnavailable": "La digitazione in questo campo non può essere monitorata in modo sicuro durante l’output in tempo reale.",
+      "targetClosed": "Il campo o l’applicazione di destinazione è stato chiuso.",
+      "monitorUnavailable": "Il monitoraggio della destinazione non è più disponibile.",
+      "backendDisconnected": "Il backend di accessibilità del sistema si è disconnesso.",
+      "injectionDenied": "Il sistema ha negato l’inserimento del testo in tempo reale.",
+      "injectionPartial": "È stato possibile verificare solo una parte dell’inserimento di testo in tempo reale, quindi l’output è stato interrotto.",
+      "injectionAmbiguous": "Non è stato possibile confermare il risultato dell’inserimento di testo in tempo reale, quindi l’output è stato interrotto.",
+      "injectionFailed": "Un inserimento di testo in tempo reale non è riuscito, quindi l’output è stato interrotto.",
+      "receiptTimeout": "La conferma di un inserimento di testo in tempo reale è scaduta.",
+      "finalConflict": "La trascrizione finale non corrispondeva al testo già inserito.",
+      "historyUnavailable": "Non è stato possibile salvare la trascrizione nella Cronologia.",
+      "streamFailed": "La trascrizione in tempo reale non è riuscita durante la registrazione.",
+      "cancelled": "La registrazione o l’output in tempo reale è stato annullato.",
+      "platformUnsupported": "L’output nel campo attivo non è supportato su questa piattaforma.",
+      "alreadyActive": "È già attiva un’altra sessione di output in tempo reale."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Uso del normale output finale",
+        "body": "L’output nel campo attivo non è disponibile per questa registrazione. Il testo verrà inserito al termine della trascrizione."
+      },
+      "invalidated": {
+        "title": "Output in tempo reale interrotto per sicurezza",
+        "body": "Non è stato più possibile verificare la destinazione. Il testo già inserito è rimasto invariato."
+      },
+      "faulted": {
+        "title": "Output in tempo reale interrotto",
+        "body": "Non è stato possibile confermare l’ultimo inserimento. Il testo già inserito è rimasto invariato."
+      },
+      "conflict": {
+        "title": "Conflitto nella trascrizione finale",
+        "body": "La trascrizione finale differiva dal testo già inserito, che è rimasto invariato."
+      },
+      "history": {
+        "action": "Apri Cronologia",
+        "unavailable": "Non è stato possibile salvare questa trascrizione nella Cronologia."
+      }
+    },
+    "help": {
+      "runtimeChecks": "La disponibilità viene verificata di nuovo all’avvio della registrazione. Anche su una piattaforma supportata potrebbe essere usato il normale output finale per il campo selezionato.",
+      "coediting": "Puoi continuare a digitare nello stesso campo. Un’eliminazione, una selezione, la navigazione, un comando, la composizione IME, l’attività del puntatore o un cambio di destinazione interrompono l’output in tempo reale.",
+      "guardedInputRace": "L’output da tastiera protetto verifica il campo prima di ogni piccolo inserimento, ma lo stato attivo può comunque cambiare prima che il sistema operativo lo elabori.",
+      "guardedSubmitRace": "L’invio automatico viene verificato immediatamente prima di inviare la scorciatoia, ma lo stato attivo può comunque cambiare prima che il sistema operativo la elabori.",
+      "deliveredTextSafety": "Quando l’output in tempo reale si interrompe, Handy non elimina né riscrive mai il testo già inserito."
+    }
   }
 }

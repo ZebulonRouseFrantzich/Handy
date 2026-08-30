@@ -613,6 +613,20 @@
           "details": "Handys lokale tale-til-tekst funktionalitet er bygget på transcribe.cpp og ggml. Tak for det fantastiske arbejde af Georgi Gerganov og bidragyderne."
         }
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Destination for løbende output",
+      "description": "Vælg, hvor den foreløbige transskription vises, mens du taler. Denne indstilling gælder kun for modeller, der understøtter streaming.",
+      "options": {
+        "overlay": {
+          "label": "Overlejring",
+          "description": "Vis løbende transskription i Handys overlejring uden at skrive i et andet program."
+        },
+        "focusedField": {
+          "label": "Fokuseret felt",
+          "description": "Skriv den løbende transskription i det fokuserede redigerbare felt efter sikkerhedskontrol. Ikke-understøttede eller usikre mål bruger normalt slutoutput."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Sådan løser du det",
     "recorderBlocked": "Genveje kan ikke optages lige nu — macOS Secure Input blokerer tastehændelser. Løs advarslen om Secure Input først.",
     "dismiss": "Afvis"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Tilgængelighed",
+        "values": {
+          "available": "Tilgængelig",
+          "unavailable": "Ikke tilgængelig",
+          "targetCheckedAtStart": "Målet kontrolleres, når optagelsen starter"
+        }
+      },
+      "backend": {
+        "label": "Underliggende system",
+        "values": {
+          "windows": "Windows-tilgængelighed og -input",
+          "macOs": "macOS Accessibility og Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Testsystem"
+        }
+      },
+      "safety": {
+        "label": "Sikkerhed",
+        "values": {
+          "verifiedControl": "Verificeret kontrolelement",
+          "guardedFocusedControl": "Beskyttet fokuseret kontrolelement",
+          "unavailable": "Ikke tilgængelig"
+        }
+      },
+      "insertionRoute": {
+        "label": "Indsættelsesmetode",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode-input",
+          "macAxSelectedText": "Markeret tekst via macOS Accessibility",
+          "macCgEventUnicode": "Unicode-input via macOS Core Graphics",
+          "atSpiEditableText": "Redigerbar tekst via AT-SPI",
+          "linuxFocusedKeyboard": "Fokuseret Linux-tastatur",
+          "test": "Testmetode",
+          "none": "Vælges, når optagelsen starter"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Leveringsbekræftelse",
+        "values": {
+          "verified": "Verificeret",
+          "posted": "Sendt til operativsystemet"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Skrivning under tale",
+        "values": {
+          "observedInsertionsOnly": "Kun overvågede indsættelser",
+          "guardedKeyboardInsertionsOnly": "Kun beskyttede tastaturindsættelser",
+          "unavailable": "Ikke tilgængelig"
+        }
+      },
+      "submitSupport": {
+        "label": "Automatisk afsendelse",
+        "values": {
+          "supported": "Understøttes for dette mål",
+          "unsupported": "Understøttes ikke for dette mål"
+        }
+      },
+      "applicationTarget": {
+        "label": "Målprogram",
+        "values": {
+          "none": "Intet mål registreret"
+        }
+      },
+      "status": {
+        "label": "Seneste status"
+      },
+      "reason": {
+        "label": "Årsag",
+        "values": {
+          "none": "Ingen problemer rapporteret"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Tilladelse til Accessibility",
+        "description": "Kræves i macOS for at identificere det fokuserede redigerbare felt og verificere sikker indsættelse.",
+        "action": "Anmod om adgang til Accessibility",
+        "help": "Giv Handy adgang i Systemindstillinger, og vend derefter tilbage hertil for at kontrollere igen."
+      },
+      "macInputMonitoring": {
+        "title": "Tilladelse til Input Monitoring",
+        "description": "Kræves i macOS for at registrere indtastning og usikre redigeringer, mens løbende output er aktivt.",
+        "action": "Anmod om adgang til Input Monitoring",
+        "help": "Giv Handy adgang i Systemindstillinger, og vend derefter tilbage hertil for at kontrollere igen."
+      }
+    },
+    "statuses": {
+      "armed": "Klar til løbende output",
+      "streaming": "Sender løbende output",
+      "fallback": "Bruger normalt slutoutput",
+      "invalidated": "Løbende output stoppet af sikkerhedshensyn",
+      "conflict": "Konflikt i endelig transskription",
+      "completed": "Løbende output fuldført",
+      "cancelled": "Løbende output annulleret",
+      "faulted": "Løbende output mislykkedes"
+    },
+    "reasons": {
+      "disabled": "Output til Fokuseret felt er slået fra.",
+      "experimentalFeaturesDisabled": "Eksperimentelle funktioner er slået fra.",
+      "modelDoesNotSupportStreaming": "Den valgte model understøtter ikke løbende streaming.",
+      "postProcessingIncompatible": "Efterbehandling kræver normalt slutoutput.",
+      "pasteMethodDisabled": "Tekstindsættelse er deaktiveret i indstillingerne for indsættelse.",
+      "externalScriptIncompatible": "Eksterne indsættelsesscripts kan ikke bruges med løbende output.",
+      "accessibilityPermissionMissing": "Tilladelse til macOS Accessibility er påkrævet.",
+      "inputMonitoringPermissionMissing": "Tilladelse til macOS Input Monitoring er påkrævet.",
+      "atSpiUnavailable": "Tilgængelighedstjenesten AT-SPI er ikke tilgængelig.",
+      "typingToolUnavailable": "Der findes intet understøttet skriveværktøj til det fokuserede tastatur.",
+      "controlShortcutUnsupported": "Optagelsesgenvejen kan ikke håndteres sikkert ved løbende output.",
+      "autoSubmitUnsupported": "Automatisk afsendelse understøttes ikke for dette mål.",
+      "secureInputActive": "Sikkert input er aktivt, så løbende output kan ikke startes.",
+      "secureField": "Løbende output er ikke tilladt i sikre felter eller adgangskodefelter.",
+      "handyOwnedTarget": "Løbende output kan ikke bruge et Handy-vindue som mål.",
+      "noFocusedTarget": "Der blev ikke fundet noget fokuseret redigerbart felt.",
+      "targetNotEditable": "Det fokuserede mål kan ikke redigeres.",
+      "initialSelectionNotCollapsed": "Fjern markeringen, og placer markøren, før du starter løbende output.",
+      "targetUnsupported": "Det fokuserede felt understøtter ikke de sikkerhedskontroller, der kræves til løbende output.",
+      "targetChanged": "Det fokuserede mål blev ændret under løbende output.",
+      "physicalPointerActivity": "Markøraktivitet stoppede løbende output for at beskytte målet.",
+      "destructiveUserEdit": "En sletning, erstatning, indsættelse eller anden destruktiv redigering stoppede løbende output.",
+      "caretMoved": "Flytning af tekstmarkøren stoppede løbende output.",
+      "selectionChanged": "Ændring af markeringen stoppede løbende output.",
+      "unsafeKeyboardCommand": "En tastaturkommando, der kunne ændre målet, stoppede løbende output.",
+      "imeCompositionUnsupported": "IME-komposition kan ikke overvåges sikkert under løbende output.",
+      "mixedInputUnavailable": "Indtastning i dette felt kan ikke overvåges sikkert under løbende output.",
+      "targetClosed": "Målfeltet eller programmet blev lukket.",
+      "monitorUnavailable": "Overvågning af målet er ikke længere tilgængelig.",
+      "backendDisconnected": "Forbindelsen til systemets tilgængelighedskomponent blev afbrudt.",
+      "injectionDenied": "Systemet afviste indsættelsen af løbende tekst.",
+      "injectionPartial": "Kun en del af indsættelsen af løbende tekst kunne verificeres, så outputtet blev stoppet.",
+      "injectionAmbiguous": "Resultatet af indsættelsen af løbende tekst kunne ikke bekræftes, så outputtet blev stoppet.",
+      "injectionFailed": "Indsættelsen af løbende tekst mislykkedes, så outputtet blev stoppet.",
+      "receiptTimeout": "Bekræftelsen af en indsættelse af løbende tekst fik timeout.",
+      "finalConflict": "Den endelige transskription svarede ikke til den tekst, der allerede var leveret.",
+      "historyUnavailable": "Den endelige transskription kunne ikke gemmes i Historik.",
+      "streamFailed": "Den løbende transskription mislykkedes under optagelsen.",
+      "cancelled": "Optagelsen eller det løbende output blev annulleret.",
+      "platformUnsupported": "Output til Fokuseret felt understøttes ikke på denne platform.",
+      "alreadyActive": "En anden session med løbende output er allerede aktiv."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Bruger normalt slutoutput",
+        "body": "Output til Fokuseret felt er ikke tilgængeligt for denne optagelse. Teksten indsættes, når transskriptionen er færdig."
+      },
+      "invalidated": {
+        "title": "Løbende output stoppet af sikkerhedshensyn",
+        "body": "Målet kunne ikke længere verificeres. Allerede leveret tekst blev ikke ændret."
+      },
+      "faulted": {
+        "title": "Løbende output stoppet",
+        "body": "Den seneste indsættelse kunne ikke bekræftes. Allerede leveret tekst blev ikke ændret."
+      },
+      "conflict": {
+        "title": "Konflikt i endelig transskription",
+        "body": "Den endelige transskription afveg fra den tekst, der allerede var leveret, og teksten blev ikke ændret."
+      },
+      "history": {
+        "action": "Åbn Historik",
+        "unavailable": "Denne transskription kunne ikke gemmes i Historik."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Tilgængeligheden kontrolleres igen, når optagelsen starter. En understøttet platform kan stadig bruge normalt slutoutput for det valgte felt.",
+      "coediting": "Du kan fortsætte med at skrive i det samme felt. Sletning, markering, navigation, kommandoer, IME-komposition, markøraktivitet eller ændring af målet stopper løbende output.",
+      "guardedInputRace": "Beskyttet tastaturoutput verificerer feltet før hver lille indsættelse, men fokus kan stadig nå at skifte, før operativsystemet behandler den.",
+      "guardedSubmitRace": "Automatisk afsendelse kontrolleres umiddelbart før genvejen sendes, men fokus kan stadig nå at skifte, før operativsystemet behandler den.",
+      "deliveredTextSafety": "Når løbende output stopper, sletter eller omskriver Handy aldrig tekst, som allerede er leveret."
+    }
   }
 }

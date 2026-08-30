@@ -613,6 +613,20 @@
         "label": "顯示新功能",
         "description": "Handy 更新後顯示版本資訊"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "漸進式輸出目的地",
+      "description": "選擇說話時要在哪裡顯示部分轉錄。此設定僅適用於支援串流的模型。",
+      "options": {
+        "overlay": {
+          "label": "浮動視窗",
+          "description": "在 Handy 的浮動視窗中顯示即時轉錄，不輸入至其他應用程式。"
+        },
+        "focusedField": {
+          "label": "焦點欄位",
+          "description": "通過安全檢查後，將即時轉錄輸入至目前取得焦點的可編輯欄位。不支援或不安全的目標會改用一般最終輸出。"
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "如何解決",
     "recorderBlocked": "目前無法錄製快捷鍵——macOS 的 Secure Input 正在阻擋按鍵事件。請先解決 Secure Input 警告。",
     "dismiss": "關閉"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "可用性",
+        "values": {
+          "available": "可用",
+          "unavailable": "無法使用",
+          "targetCheckedAtStart": "開始錄音時檢查目標"
+        }
+      },
+      "backend": {
+        "label": "後端",
+        "values": {
+          "windows": "Windows 輔助功能與輸入",
+          "macOs": "macOS 輔助使用與 Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "測試後端"
+        }
+      },
+      "safety": {
+        "label": "安全性",
+        "values": {
+          "verifiedControl": "已驗證控制項",
+          "guardedFocusedControl": "受防護的焦點控制項",
+          "unavailable": "無法使用"
+        }
+      },
+      "insertionRoute": {
+        "label": "插入途徑",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode 輸入",
+          "macAxSelectedText": "macOS 輔助使用所選文字",
+          "macCgEventUnicode": "macOS Core Graphics Unicode 輸入",
+          "atSpiEditableText": "AT-SPI 可編輯文字",
+          "linuxFocusedKeyboard": "Linux 焦點鍵盤",
+          "test": "測試途徑",
+          "none": "開始錄音時選取"
+        }
+      },
+      "receiptConfidence": {
+        "label": "傳送確認",
+        "values": {
+          "verified": "已驗證",
+          "posted": "已傳送至作業系統"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "邊說邊輸入",
+        "values": {
+          "observedInsertionsOnly": "僅限可觀察的插入",
+          "guardedKeyboardInsertionsOnly": "僅限受防護的鍵盤插入",
+          "unavailable": "無法使用"
+        }
+      },
+      "submitSupport": {
+        "label": "自動送出",
+        "values": {
+          "supported": "此目標支援",
+          "unsupported": "此目標不支援"
+        }
+      },
+      "applicationTarget": {
+        "label": "應用程式目標",
+        "values": {
+          "none": "未擷取到目標"
+        }
+      },
+      "status": {
+        "label": "最新狀態"
+      },
+      "reason": {
+        "label": "原因",
+        "values": {
+          "none": "未回報任何問題"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "輔助使用權限",
+        "description": "macOS 需要此權限，才能識別目前取得焦點的可編輯欄位並驗證插入是否安全。",
+        "action": "要求輔助使用權限",
+        "help": "請在「系統設定」中授予 Handy 權限，然後返回此處再次檢查。"
+      },
+      "macInputMonitoring": {
+        "title": "輸入監控權限",
+        "description": "macOS 需要此權限，才能在即時輸出期間偵測輸入及不安全的編輯。",
+        "action": "要求輸入監控權限",
+        "help": "請在「系統設定」中授予 Handy 權限，然後返回此處再次檢查。"
+      }
+    },
+    "statuses": {
+      "armed": "即時輸出已就緒",
+      "streaming": "正在傳送即時輸出",
+      "fallback": "正在使用一般最終輸出",
+      "invalidated": "已為安全起見停止即時輸出",
+      "conflict": "最終轉錄衝突",
+      "completed": "即時輸出已完成",
+      "cancelled": "即時輸出已取消",
+      "faulted": "即時輸出失敗"
+    },
+    "reasons": {
+      "disabled": "焦點欄位輸出已關閉。",
+      "experimentalFeaturesDisabled": "實驗性功能已關閉。",
+      "modelDoesNotSupportStreaming": "所選模型不支援即時串流。",
+      "postProcessingIncompatible": "後續處理需要使用一般最終輸出。",
+      "pasteMethodDisabled": "貼上設定已停用文字插入。",
+      "externalScriptIncompatible": "外部貼上指令碼無法搭配即時輸出使用。",
+      "accessibilityPermissionMissing": "需要 macOS 輔助使用權限。",
+      "inputMonitoringPermissionMissing": "需要 macOS 輸入監控權限。",
+      "atSpiUnavailable": "AT-SPI 輔助功能服務無法使用。",
+      "typingToolUnavailable": "沒有可用且受支援的焦點鍵盤輸入工具。",
+      "controlShortcutUnsupported": "無法安全處理錄音快速鍵以進行即時輸出。",
+      "autoSubmitUnsupported": "此目標不支援自動送出。",
+      "secureInputActive": "安全輸入模式已啟用，因此無法開始即時輸出。",
+      "secureField": "安全欄位或密碼欄位不允許即時輸出。",
+      "handyOwnedTarget": "即時輸出無法以 Handy 視窗為目標。",
+      "noFocusedTarget": "找不到目前取得焦點的可編輯欄位。",
+      "targetNotEditable": "目前取得焦點的目標無法編輯。",
+      "initialSelectionNotCollapsed": "請先取消選取並放置游標，再開始即時輸出。",
+      "targetUnsupported": "目前取得焦點的欄位無法提供即時輸出所需的安全檢查。",
+      "targetChanged": "即時輸出期間，焦點目標已變更。",
+      "physicalPointerActivity": "為保護目標，指標活動已停止即時輸出。",
+      "destructiveUserEdit": "刪除、取代、貼上或其他破壞性編輯已停止即時輸出。",
+      "caretMoved": "移動游標已停止即時輸出。",
+      "selectionChanged": "變更選取範圍已停止即時輸出。",
+      "unsafeKeyboardCommand": "可能變更目標的鍵盤指令已停止即時輸出。",
+      "imeCompositionUnsupported": "即時輸出期間無法安全監控 IME 組字。",
+      "mixedInputUnavailable": "即時輸出期間無法安全監控此欄位中的輸入。",
+      "targetClosed": "目標欄位或應用程式已關閉。",
+      "monitorUnavailable": "目標監控已無法使用。",
+      "backendDisconnected": "系統輔助功能後端已中斷連線。",
+      "injectionDenied": "系統拒絕插入即時文字。",
+      "injectionPartial": "只能驗證部分即時文字插入，因此已停止輸出。",
+      "injectionAmbiguous": "無法確認即時文字插入的結果，因此已停止輸出。",
+      "injectionFailed": "即時文字插入失敗，因此已停止輸出。",
+      "receiptTimeout": "等待即時文字插入確認逾時。",
+      "finalConflict": "最終轉錄與已傳送的文字不符。",
+      "historyUnavailable": "無法將最終轉錄儲存至記錄。",
+      "streamFailed": "錄音期間的即時轉錄失敗。",
+      "cancelled": "錄音或即時輸出已取消。",
+      "platformUnsupported": "此平台不支援焦點欄位輸出。",
+      "alreadyActive": "已有另一個即時輸出工作階段正在進行。"
+    },
+    "notifications": {
+      "fallback": {
+        "title": "正在使用一般最終輸出",
+        "body": "此錄音無法使用焦點欄位輸出。文字將在轉錄完成後插入。"
+      },
+      "invalidated": {
+        "title": "已為安全起見停止即時輸出",
+        "body": "已無法驗證目標。已傳送的文字保持不變。"
+      },
+      "faulted": {
+        "title": "即時輸出已停止",
+        "body": "無法確認最新的插入。已傳送的文字保持不變。"
+      },
+      "conflict": {
+        "title": "最終轉錄衝突",
+        "body": "最終轉錄與已傳送的文字不同；已傳送的文字保持不變。"
+      },
+      "history": {
+        "action": "開啟記錄",
+        "unavailable": "無法將此轉錄儲存至記錄。"
+      }
+    },
+    "help": {
+      "runtimeChecks": "開始錄音時會再次檢查可用性。即使平台受支援，所選欄位仍可能改用一般最終輸出。",
+      "coediting": "您可以繼續在同一欄位中輸入。刪除、選取、導覽、指令、IME 組字、指標活動或目標變更都會停止即時輸出。",
+      "guardedInputRace": "受防護的鍵盤輸出會在每次插入少量文字前驗證欄位，但在作業系統接收輸入前，焦點仍可能改變。",
+      "guardedSubmitRace": "系統會在傳送快速鍵前一刻檢查自動送出，但在作業系統接收快速鍵前，焦點仍可能改變。",
+      "deliveredTextSafety": "即時輸出停止時，Handy 絕不會刪除或改寫已傳送的文字。"
+    }
   }
 }

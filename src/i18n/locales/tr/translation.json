@@ -613,6 +613,20 @@
         "label": "Yenilikleri Göster",
         "description": "Handy güncellemelerinden sonra sürüm notlarını göster"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Aşamalı çıkış hedefi",
+      "description": "Siz konuşurken kısmi dökümün nerede görüneceğini seçin. Bu ayar yalnızca akışı destekleyen modeller için geçerlidir.",
+      "options": {
+        "overlay": {
+          "label": "Ekran katmanı",
+          "description": "Başka bir uygulamaya yazmadan canlı dökümü Handy’nin ekran katmanında gösterin."
+        },
+        "focusedField": {
+          "label": "Odaklanmış alan",
+          "description": "Güvenlik kontrollerinden sonra canlı dökümü odaklanmış düzenlenebilir alana yazın. Desteklenmeyen veya güvenli olmayan hedeflerde normal nihai çıkış kullanılır."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Bu nasıl düzeltilir",
     "recorderBlocked": "Şu anda kısayol kaydedilemiyor — macOS Secure Input tuş olaylarını engelliyor. Önce Secure Input uyarısını giderin.",
     "dismiss": "Kapat"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Kullanılabilirlik",
+        "values": {
+          "available": "Kullanılabilir",
+          "unavailable": "Kullanılamıyor",
+          "targetCheckedAtStart": "Hedef, kayıt başladığında kontrol edilir"
+        }
+      },
+      "backend": {
+        "label": "Arka uç",
+        "values": {
+          "windows": "Windows erişilebilirlik ve giriş",
+          "macOs": "macOS Erişilebilirlik ve Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Test arka ucu"
+        }
+      },
+      "safety": {
+        "label": "Güvenlik",
+        "values": {
+          "verifiedControl": "Doğrulanmış denetim",
+          "guardedFocusedControl": "Korumalı odaklanmış denetim",
+          "unavailable": "Kullanılamıyor"
+        }
+      },
+      "insertionRoute": {
+        "label": "Ekleme yolu",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode girişi",
+          "macAxSelectedText": "macOS Erişilebilirlik seçili metni",
+          "macCgEventUnicode": "macOS Core Graphics Unicode girişi",
+          "atSpiEditableText": "AT-SPI düzenlenebilir metni",
+          "linuxFocusedKeyboard": "Linux odaklanmış klavyesi",
+          "test": "Test yolu",
+          "none": "Kayıt başladığında seçilir"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Teslim onayı",
+        "values": {
+          "verified": "Doğrulandı",
+          "posted": "İşletim sistemine gönderildi"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Konuşurken yazma",
+        "values": {
+          "observedInsertionsOnly": "Yalnızca gözlemlenen eklemeler",
+          "guardedKeyboardInsertionsOnly": "Yalnızca korumalı klavye eklemeleri",
+          "unavailable": "Kullanılamıyor"
+        }
+      },
+      "submitSupport": {
+        "label": "Otomatik gönderim",
+        "values": {
+          "supported": "Bu hedef için destekleniyor",
+          "unsupported": "Bu hedef için desteklenmiyor"
+        }
+      },
+      "applicationTarget": {
+        "label": "Hedef uygulama",
+        "values": {
+          "none": "Hedef alınmadı"
+        }
+      },
+      "status": {
+        "label": "Son durum"
+      },
+      "reason": {
+        "label": "Neden",
+        "values": {
+          "none": "Bildirilen bir sorun yok"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Erişilebilirlik izni",
+        "description": "Odaklanmış düzenlenebilir alanı belirlemek ve güvenli eklemeyi doğrulamak için macOS’te gereklidir.",
+        "action": "Erişilebilirlik izni iste",
+        "help": "Sistem Ayarları’nda Handy’ye erişim izni verin, ardından tekrar kontrol etmek için buraya dönün."
+      },
+      "macInputMonitoring": {
+        "title": "Giriş İzleme izni",
+        "description": "Canlı çıkış etkinken yazmayı ve güvenli olmayan düzenlemeleri algılamak için macOS’te gereklidir.",
+        "action": "Giriş İzleme izni iste",
+        "help": "Sistem Ayarları’nda Handy’ye erişim izni verin, ardından tekrar kontrol etmek için buraya dönün."
+      }
+    },
+    "statuses": {
+      "armed": "Canlı çıkışa hazır",
+      "streaming": "Canlı çıkış gönderiliyor",
+      "fallback": "Normal nihai çıkış kullanılıyor",
+      "invalidated": "Canlı çıkış güvenlik amacıyla durduruldu",
+      "conflict": "Nihai döküm çakışması",
+      "completed": "Canlı çıkış tamamlandı",
+      "cancelled": "Canlı çıkış iptal edildi",
+      "faulted": "Canlı çıkış başarısız oldu"
+    },
+    "reasons": {
+      "disabled": "Odaklanmış Alan çıkışı kapalı.",
+      "experimentalFeaturesDisabled": "Deneysel özellikler kapalı.",
+      "modelDoesNotSupportStreaming": "Seçilen model canlı akışı desteklemiyor.",
+      "postProcessingIncompatible": "Son işleme için normal nihai çıkış gerekir.",
+      "pasteMethodDisabled": "Yapıştırma ayarlarında metin ekleme devre dışı.",
+      "externalScriptIncompatible": "Harici yapıştırma betikleri canlı çıkışla kullanılamaz.",
+      "accessibilityPermissionMissing": "macOS Erişilebilirlik izni gerekli.",
+      "inputMonitoringPermissionMissing": "macOS Giriş İzleme izni gerekli.",
+      "atSpiUnavailable": "AT-SPI erişilebilirlik hizmeti kullanılamıyor.",
+      "typingToolUnavailable": "Desteklenen bir odaklanmış klavye yazma aracı yok.",
+      "controlShortcutUnsupported": "Kayıt kısayolu canlı çıkış için güvenli biçimde işlenemiyor.",
+      "autoSubmitUnsupported": "Otomatik gönderim bu hedef için desteklenmiyor.",
+      "secureInputActive": "Güvenli Giriş etkin olduğundan canlı çıkış başlatılamıyor.",
+      "secureField": "Güvenli alanlarda veya parola alanlarında canlı çıkışa izin verilmez.",
+      "handyOwnedTarget": "Canlı çıkış bir Handy penceresini hedefleyemez.",
+      "noFocusedTarget": "Odaklanmış düzenlenebilir alan bulunamadı.",
+      "targetNotEditable": "Odaklanmış hedef düzenlenebilir değil.",
+      "initialSelectionNotCollapsed": "Canlı çıkışı başlatmadan önce seçimi kaldırıp imleci yerleştirin.",
+      "targetUnsupported": "Odaklanmış alan, canlı çıkış için gereken güvenlik kontrollerini sağlamıyor.",
+      "targetChanged": "Canlı çıkış sırasında odaklanmış hedef değişti.",
+      "physicalPointerActivity": "Hedefi korumak için işaretçi etkinliği canlı çıkışı durdurdu.",
+      "destructiveUserEdit": "Silme, değiştirme, yapıştırma veya başka bir yıkıcı düzenleme canlı çıkışı durdurdu.",
+      "caretMoved": "İmlecin taşınması canlı çıkışı durdurdu.",
+      "selectionChanged": "Seçimin değiştirilmesi canlı çıkışı durdurdu.",
+      "unsafeKeyboardCommand": "Hedefi değiştirebilecek bir klavye komutu canlı çıkışı durdurdu.",
+      "imeCompositionUnsupported": "Canlı çıkış sırasında IME oluşturma güvenli biçimde izlenemiyor.",
+      "mixedInputUnavailable": "Canlı çıkış sırasında bu alana yazma güvenli biçimde izlenemiyor.",
+      "targetClosed": "Hedef alan veya uygulama kapatıldı.",
+      "monitorUnavailable": "Hedef izleme artık kullanılamıyor.",
+      "backendDisconnected": "Sistem erişilebilirlik arka ucunun bağlantısı kesildi.",
+      "injectionDenied": "Sistem canlı metin eklemeyi reddetti.",
+      "injectionPartial": "Canlı metin eklemenin yalnızca bir kısmı doğrulanabildiği için çıkış durduruldu.",
+      "injectionAmbiguous": "Canlı metin eklemenin sonucu doğrulanamadığı için çıkış durduruldu.",
+      "injectionFailed": "Canlı metin ekleme başarısız olduğu için çıkış durduruldu.",
+      "receiptTimeout": "Canlı metin ekleme onayı zaman aşımına uğradı.",
+      "finalConflict": "Nihai döküm, daha önce teslim edilen metinle eşleşmedi.",
+      "historyUnavailable": "Nihai döküm Geçmiş’e kaydedilemedi.",
+      "streamFailed": "Kayıt sırasında canlı döküm başarısız oldu.",
+      "cancelled": "Kayıt veya canlı çıkış iptal edildi.",
+      "platformUnsupported": "Odaklanmış Alan çıkışı bu platformda desteklenmiyor.",
+      "alreadyActive": "Başka bir canlı çıkış oturumu zaten etkin."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Normal nihai çıkış kullanılıyor",
+        "body": "Odaklanmış Alan çıkışı bu kayıt için kullanılamıyor. Metin, döküm tamamlandıktan sonra eklenecek."
+      },
+      "invalidated": {
+        "title": "Canlı çıkış güvenlik amacıyla durduruldu",
+        "body": "Hedef artık doğrulanamadı. Daha önce teslim edilen metin değiştirilmedi."
+      },
+      "faulted": {
+        "title": "Canlı çıkış durduruldu",
+        "body": "Son ekleme doğrulanamadı. Daha önce teslim edilen metin değiştirilmedi."
+      },
+      "conflict": {
+        "title": "Nihai döküm çakışması",
+        "body": "Nihai döküm, daha önce teslim edilen metinden farklıydı; mevcut metin değiştirilmedi."
+      },
+      "history": {
+        "action": "Geçmiş’i aç",
+        "unavailable": "Bu döküm Geçmiş’e kaydedilemedi."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Kayıt başladığında kullanılabilirlik yeniden kontrol edilir. Desteklenen bir platformda bile seçilen alan için normal nihai çıkış kullanılabilir.",
+      "coediting": "Aynı alana yazmaya devam edebilirsiniz. Silme, seçim, gezinme, komutlar, IME oluşturma, işaretçi etkinliği veya hedef değişikliği canlı çıkışı durdurur.",
+      "guardedInputRace": "Korumalı klavye çıkışı her küçük eklemeden önce alanı doğrular, ancak işletim sistemi girdiyi işlemeden önce odak yine de değişebilir.",
+      "guardedSubmitRace": "Otomatik gönderim, kısayol gönderilmeden hemen önce kontrol edilir; ancak işletim sistemi kısayolu işlemeden önce odak yine de değişebilir.",
+      "deliveredTextSafety": "Canlı çıkış durduğunda Handy, daha önce teslim ettiği metni hiçbir zaman silmez veya yeniden yazmaz."
+    }
   }
 }

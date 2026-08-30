@@ -613,6 +613,20 @@
         "label": "Afficher les nouveautés",
         "description": "Afficher les notes de version après les mises à jour de Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Destination de la sortie progressive",
+      "description": "Choisissez où afficher la transcription partielle pendant que vous parlez. Ce réglage s’applique uniquement aux modèles compatibles avec la diffusion en continu.",
+      "options": {
+        "overlay": {
+          "label": "Superposition",
+          "description": "Affichez la transcription en direct dans la superposition de Handy sans saisir de texte dans une autre application."
+        },
+        "focusedField": {
+          "label": "Champ actif",
+          "description": "Saisissez la transcription en direct dans le champ modifiable actif après les contrôles de sécurité. Les cibles non prises en charge ou non sûres utilisent la sortie finale normale."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Comment résoudre ce problème",
     "recorderBlocked": "Impossible d'enregistrer un raccourci pour le moment : Secure Input de macOS bloque les événements clavier. Résolvez d'abord l'avertissement Secure Input.",
     "dismiss": "Ignorer"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Disponibilité",
+        "values": {
+          "available": "Disponible",
+          "unavailable": "Indisponible",
+          "targetCheckedAtStart": "Cible vérifiée au démarrage de l’enregistrement"
+        }
+      },
+      "backend": {
+        "label": "Moteur",
+        "values": {
+          "windows": "Accessibilité et saisie Windows",
+          "macOs": "Accessibilité macOS et Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Moteur de test"
+        }
+      },
+      "safety": {
+        "label": "Sécurité",
+        "values": {
+          "verifiedControl": "Contrôle vérifié",
+          "guardedFocusedControl": "Contrôle actif protégé",
+          "unavailable": "Indisponible"
+        }
+      },
+      "insertionRoute": {
+        "label": "Méthode d’insertion",
+        "values": {
+          "windowsUnicodeSendInput": "Saisie Unicode Windows",
+          "macAxSelectedText": "Texte sélectionné via l’accessibilité macOS",
+          "macCgEventUnicode": "Saisie Unicode macOS Core Graphics",
+          "atSpiEditableText": "Texte modifiable AT-SPI",
+          "linuxFocusedKeyboard": "Clavier actif Linux",
+          "test": "Méthode de test",
+          "none": "Sélectionné au démarrage de l’enregistrement"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Confirmation de réception",
+        "values": {
+          "verified": "Vérifiée",
+          "posted": "Envoyée au système d’exploitation"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Saisie pendant la dictée",
+        "values": {
+          "observedInsertionsOnly": "Insertions observées uniquement",
+          "guardedKeyboardInsertionsOnly": "Insertions clavier protégées uniquement",
+          "unavailable": "Indisponible"
+        }
+      },
+      "submitSupport": {
+        "label": "Envoi automatique",
+        "values": {
+          "supported": "Pris en charge pour cette cible",
+          "unsupported": "Non pris en charge pour cette cible"
+        }
+      },
+      "applicationTarget": {
+        "label": "Application cible",
+        "values": {
+          "none": "Aucune cible détectée"
+        }
+      },
+      "status": {
+        "label": "Dernier état"
+      },
+      "reason": {
+        "label": "Raison",
+        "values": {
+          "none": "Aucun problème signalé"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Autorisation d’accessibilité",
+        "description": "Requise sur macOS pour identifier le champ modifiable actif et vérifier que l’insertion est sûre.",
+        "action": "Demander l’accès à l’accessibilité",
+        "help": "Accordez l’accès à Handy dans Réglages Système, puis revenez ici pour vérifier à nouveau."
+      },
+      "macInputMonitoring": {
+        "title": "Autorisation de surveillance de la saisie",
+        "description": "Requise sur macOS pour détecter la saisie et les modifications non sûres lorsque la sortie en direct est active.",
+        "action": "Demander l’accès à la surveillance de la saisie",
+        "help": "Accordez l’accès à Handy dans Réglages Système, puis revenez ici pour vérifier à nouveau."
+      }
+    },
+    "statuses": {
+      "armed": "Prêt pour la sortie en direct",
+      "streaming": "Envoi de la sortie en direct",
+      "fallback": "Utilisation de la sortie finale normale",
+      "invalidated": "Sortie en direct arrêtée par sécurité",
+      "conflict": "Conflit avec la transcription finale",
+      "completed": "Sortie en direct terminée",
+      "cancelled": "Sortie en direct annulée",
+      "faulted": "Échec de la sortie en direct"
+    },
+    "reasons": {
+      "disabled": "La sortie vers le champ actif est désactivée.",
+      "experimentalFeaturesDisabled": "Les fonctionnalités expérimentales sont désactivées.",
+      "modelDoesNotSupportStreaming": "Le modèle sélectionné ne prend pas en charge la diffusion en direct.",
+      "postProcessingIncompatible": "Le post-traitement nécessite la sortie finale normale.",
+      "pasteMethodDisabled": "L’insertion de texte est désactivée dans les réglages de collage.",
+      "externalScriptIncompatible": "Les scripts de collage externes ne peuvent pas être utilisés avec la sortie en direct.",
+      "accessibilityPermissionMissing": "L’autorisation d’accessibilité macOS est requise.",
+      "inputMonitoringPermissionMissing": "L’autorisation de surveillance de la saisie macOS est requise.",
+      "atSpiUnavailable": "Le service d’accessibilité AT-SPI est indisponible.",
+      "typingToolUnavailable": "Aucun outil de saisie au clavier actif pris en charge n’est disponible.",
+      "controlShortcutUnsupported": "Le raccourci d’enregistrement ne peut pas être géré de manière sûre pour la sortie en direct.",
+      "autoSubmitUnsupported": "L’envoi automatique n’est pas pris en charge pour cette cible.",
+      "secureInputActive": "La saisie sécurisée est active : la sortie en direct ne peut pas démarrer.",
+      "secureField": "La sortie en direct n’est pas autorisée dans les champs sécurisés ou de mot de passe.",
+      "handyOwnedTarget": "La sortie en direct ne peut pas cibler une fenêtre de Handy.",
+      "noFocusedTarget": "Aucun champ modifiable actif n’a été trouvé.",
+      "targetNotEditable": "La cible active n’est pas modifiable.",
+      "initialSelectionNotCollapsed": "Effacez la sélection et placez le curseur avant de démarrer la sortie en direct.",
+      "targetUnsupported": "Le champ actif ne permet pas les contrôles de sécurité requis pour la sortie en direct.",
+      "targetChanged": "La cible active a changé pendant la sortie en direct.",
+      "physicalPointerActivity": "L’activité du pointeur a arrêté la sortie en direct afin de protéger la cible.",
+      "destructiveUserEdit": "Une suppression, un remplacement, un collage ou une autre modification destructive a arrêté la sortie en direct.",
+      "caretMoved": "Le déplacement du curseur a arrêté la sortie en direct.",
+      "selectionChanged": "La modification de la sélection a arrêté la sortie en direct.",
+      "unsafeKeyboardCommand": "Une commande clavier susceptible de modifier la cible a arrêté la sortie en direct.",
+      "imeCompositionUnsupported": "La composition IME ne peut pas être surveillée de manière sûre pendant la sortie en direct.",
+      "mixedInputUnavailable": "La saisie dans ce champ ne peut pas être surveillée de manière sûre pendant la sortie en direct.",
+      "targetClosed": "Le champ cible ou l’application cible a été fermé.",
+      "monitorUnavailable": "La surveillance de la cible n’est plus disponible.",
+      "backendDisconnected": "Le moteur d’accessibilité du système s’est déconnecté.",
+      "injectionDenied": "Le système a refusé l’insertion de texte en direct.",
+      "injectionPartial": "Seule une partie d’une insertion de texte en direct a pu être vérifiée, la sortie a donc été arrêtée.",
+      "injectionAmbiguous": "Le résultat d’une insertion de texte en direct n’a pas pu être confirmé, la sortie a donc été arrêtée.",
+      "injectionFailed": "Une insertion de texte en direct a échoué, la sortie a donc été arrêtée.",
+      "receiptTimeout": "Le délai de confirmation d’une insertion de texte en direct a expiré.",
+      "finalConflict": "La transcription finale ne correspondait pas au texte déjà inséré.",
+      "historyUnavailable": "La transcription finale n’a pas pu être enregistrée dans l’Historique.",
+      "streamFailed": "La transcription en direct a échoué pendant l’enregistrement.",
+      "cancelled": "L’enregistrement ou la sortie en direct a été annulé.",
+      "platformUnsupported": "La sortie vers le champ actif n’est pas prise en charge sur cette plateforme.",
+      "alreadyActive": "Une autre session de sortie en direct est déjà active."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Utilisation de la sortie finale normale",
+        "body": "La sortie vers le champ actif est indisponible pour cet enregistrement. Le texte sera inséré une fois la transcription terminée."
+      },
+      "invalidated": {
+        "title": "Sortie en direct arrêtée par sécurité",
+        "body": "La cible ne pouvait plus être vérifiée. Le texte déjà inséré est resté inchangé."
+      },
+      "faulted": {
+        "title": "Sortie en direct arrêtée",
+        "body": "La dernière insertion n’a pas pu être confirmée. Le texte déjà inséré est resté inchangé."
+      },
+      "conflict": {
+        "title": "Conflit avec la transcription finale",
+        "body": "La transcription finale différait du texte déjà inséré, qui est resté inchangé."
+      },
+      "history": {
+        "action": "Ouvrir l’Historique",
+        "unavailable": "Cette transcription n’a pas pu être enregistrée dans l’Historique."
+      }
+    },
+    "help": {
+      "runtimeChecks": "La disponibilité est vérifiée à nouveau au démarrage de l’enregistrement. Même sur une plateforme prise en charge, le champ sélectionné peut utiliser la sortie finale normale.",
+      "coediting": "Vous pouvez continuer à saisir du texte dans le même champ. Une suppression, une sélection, une navigation, une commande, une composition IME, une activité du pointeur ou un changement de cible arrête la sortie en direct.",
+      "guardedInputRace": "La sortie clavier protégée vérifie le champ avant chaque petite insertion, mais le focus peut encore changer avant que le système d’exploitation ne la traite.",
+      "guardedSubmitRace": "L’envoi automatique est vérifié juste avant l’envoi du raccourci, mais le focus peut encore changer avant que le système d’exploitation ne le traite.",
+      "deliveredTextSafety": "Lorsque la sortie en direct s’arrête, Handy ne supprime ni ne réécrit jamais le texte déjà inséré."
+    }
   }
 }

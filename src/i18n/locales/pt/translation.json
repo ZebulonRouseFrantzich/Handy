@@ -613,6 +613,20 @@
         "label": "Mostrar novidades",
         "description": "Mostrar notas de versão após atualizações do Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Destino da saída progressiva",
+      "description": "Escolha onde aparece a transcrição parcial enquanto fala. Esta definição aplica-se apenas a modelos compatíveis com transmissão em direto.",
+      "options": {
+        "overlay": {
+          "label": "Sobreposição",
+          "description": "Mostra a transcrição em direto na sobreposição do Handy sem escrever noutra aplicação."
+        },
+        "focusedField": {
+          "label": "Campo em foco",
+          "description": "Escreve a transcrição em direto no campo editável em foco após as verificações de segurança. Alvos não suportados ou inseguros usam a saída final normal."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Como resolver isso",
     "recorderBlocked": "Não é possível gravar atalhos agora — o Secure Input do macOS está bloqueando os eventos de tecla. Resolva primeiro o aviso do Secure Input.",
     "dismiss": "Dispensar"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Disponibilidade",
+        "values": {
+          "available": "Disponível",
+          "unavailable": "Indisponível",
+          "targetCheckedAtStart": "Alvo verificado ao iniciar a gravação"
+        }
+      },
+      "backend": {
+        "label": "Sistema de base",
+        "values": {
+          "windows": "Acessibilidade e entrada do Windows",
+          "macOs": "Acessibilidade do macOS e Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Sistema de base de teste"
+        }
+      },
+      "safety": {
+        "label": "Segurança",
+        "values": {
+          "verifiedControl": "Controlo verificado",
+          "guardedFocusedControl": "Controlo em foco protegido",
+          "unavailable": "Indisponível"
+        }
+      },
+      "insertionRoute": {
+        "label": "Método de inserção",
+        "values": {
+          "windowsUnicodeSendInput": "Entrada Unicode do Windows",
+          "macAxSelectedText": "Texto selecionado da Acessibilidade do macOS",
+          "macCgEventUnicode": "Entrada Unicode do Core Graphics do macOS",
+          "atSpiEditableText": "Texto editável AT-SPI",
+          "linuxFocusedKeyboard": "Teclado em foco do Linux",
+          "test": "Método de teste",
+          "none": "Selecionado ao iniciar a gravação"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Confirmação da entrega",
+        "values": {
+          "verified": "Verificada",
+          "posted": "Enviada ao sistema operativo"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Escrever enquanto fala",
+        "values": {
+          "observedInsertionsOnly": "Apenas inserções monitorizadas",
+          "guardedKeyboardInsertionsOnly": "Apenas inserções protegidas pelo teclado",
+          "unavailable": "Indisponível"
+        }
+      },
+      "submitSupport": {
+        "label": "Envio automático",
+        "values": {
+          "supported": "Suportado para este alvo",
+          "unsupported": "Não suportado para este alvo"
+        }
+      },
+      "applicationTarget": {
+        "label": "Aplicação de destino",
+        "values": {
+          "none": "Nenhum alvo capturado"
+        }
+      },
+      "status": {
+        "label": "Estado mais recente"
+      },
+      "reason": {
+        "label": "Motivo",
+        "values": {
+          "none": "Nenhum problema relatado"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Permissão de Acessibilidade",
+        "description": "Necessária no macOS para identificar o campo editável em foco e verificar a inserção segura.",
+        "action": "Pedir acesso à Acessibilidade",
+        "help": "Conceda acesso ao Handy nas Definições do Sistema e volte aqui para verificar novamente."
+      },
+      "macInputMonitoring": {
+        "title": "Permissão de Monitorização da Entrada",
+        "description": "Necessária no macOS para detetar escrita e edições inseguras enquanto a saída em direto está ativa.",
+        "action": "Pedir acesso à Monitorização da Entrada",
+        "help": "Conceda acesso ao Handy nas Definições do Sistema e volte aqui para verificar novamente."
+      }
+    },
+    "statuses": {
+      "armed": "Pronto para saída em direto",
+      "streaming": "A enviar saída em direto",
+      "fallback": "A usar a saída final normal",
+      "invalidated": "Saída em direto interrompida por segurança",
+      "conflict": "Conflito na transcrição final",
+      "completed": "Saída em direto concluída",
+      "cancelled": "Saída em direto cancelada",
+      "faulted": "Falha na saída em direto"
+    },
+    "reasons": {
+      "disabled": "A saída para o Campo em foco está desativada.",
+      "experimentalFeaturesDisabled": "As funcionalidades experimentais estão desativadas.",
+      "modelDoesNotSupportStreaming": "O modelo selecionado não suporta transmissão em direto.",
+      "postProcessingIncompatible": "O pós-processamento requer a saída final normal.",
+      "pasteMethodDisabled": "A inserção de texto está desativada nas definições de colagem.",
+      "externalScriptIncompatible": "Não é possível usar scripts de colagem externos com a saída em direto.",
+      "accessibilityPermissionMissing": "É necessária a permissão de Acessibilidade do macOS.",
+      "inputMonitoringPermissionMissing": "É necessária a permissão de Monitorização da Entrada do macOS.",
+      "atSpiUnavailable": "O serviço de acessibilidade AT-SPI está indisponível.",
+      "typingToolUnavailable": "Não está disponível nenhuma ferramenta suportada para escrever com o teclado em foco.",
+      "controlShortcutUnsupported": "O atalho de gravação não pode ser processado em segurança para a saída em direto.",
+      "autoSubmitUnsupported": "O envio automático não é suportado para este alvo.",
+      "secureInputActive": "A Entrada Segura está ativa, pelo que não é possível iniciar a saída em direto.",
+      "secureField": "A saída em direto não é permitida em campos seguros ou de palavra-passe.",
+      "handyOwnedTarget": "A saída em direto não pode ter como alvo uma janela do Handy.",
+      "noFocusedTarget": "Não foi encontrado nenhum campo editável em foco.",
+      "targetNotEditable": "O alvo em foco não é editável.",
+      "initialSelectionNotCollapsed": "Limpe a seleção e posicione o cursor antes de iniciar a saída em direto.",
+      "targetUnsupported": "O campo em foco não permite as verificações de segurança necessárias para a saída em direto.",
+      "targetChanged": "O alvo em foco mudou durante a saída em direto.",
+      "physicalPointerActivity": "A atividade do ponteiro interrompeu a saída em direto para proteger o alvo.",
+      "destructiveUserEdit": "Uma eliminação, substituição, colagem ou outra edição destrutiva interrompeu a saída em direto.",
+      "caretMoved": "Mover o cursor interrompeu a saída em direto.",
+      "selectionChanged": "Alterar a seleção interrompeu a saída em direto.",
+      "unsafeKeyboardCommand": "Um comando de teclado que poderia alterar o alvo interrompeu a saída em direto.",
+      "imeCompositionUnsupported": "A composição IME não pode ser monitorizada em segurança durante a saída em direto.",
+      "mixedInputUnavailable": "A escrita neste campo não pode ser monitorizada em segurança durante a saída em direto.",
+      "targetClosed": "O campo ou a aplicação de destino foi fechado.",
+      "monitorUnavailable": "A monitorização do alvo deixou de estar disponível.",
+      "backendDisconnected": "O sistema de acessibilidade de base foi desligado.",
+      "injectionDenied": "O sistema recusou a inserção de texto em direto.",
+      "injectionPartial": "Só foi possível verificar parte de uma inserção de texto em direto, pelo que a saída foi interrompida.",
+      "injectionAmbiguous": "Não foi possível confirmar o resultado de uma inserção de texto em direto, pelo que a saída foi interrompida.",
+      "injectionFailed": "Falhou uma inserção de texto em direto, pelo que a saída foi interrompida.",
+      "receiptTimeout": "A confirmação de uma inserção de texto em direto excedeu o tempo limite.",
+      "finalConflict": "A transcrição final não correspondia ao texto já entregue.",
+      "historyUnavailable": "Não foi possível guardar a transcrição no Histórico.",
+      "streamFailed": "A transcrição em direto falhou durante a gravação.",
+      "cancelled": "A gravação ou a saída em direto foi cancelada.",
+      "platformUnsupported": "A saída para o Campo em foco não é suportada nesta plataforma.",
+      "alreadyActive": "Já está ativa outra sessão de saída em direto."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "A usar a saída final normal",
+        "body": "A saída para o Campo em foco não está disponível para esta gravação. O texto será inserido após a conclusão da transcrição."
+      },
+      "invalidated": {
+        "title": "Saída em direto interrompida por segurança",
+        "body": "Já não foi possível verificar o alvo. O texto já entregue não foi alterado."
+      },
+      "faulted": {
+        "title": "Saída em direto interrompida",
+        "body": "Não foi possível confirmar a inserção mais recente. O texto já entregue não foi alterado."
+      },
+      "conflict": {
+        "title": "Conflito na transcrição final",
+        "body": "A transcrição final era diferente do texto já entregue, que não foi alterado."
+      },
+      "history": {
+        "action": "Abrir Histórico",
+        "unavailable": "Não foi possível guardar esta transcrição no Histórico."
+      }
+    },
+    "help": {
+      "runtimeChecks": "A disponibilidade é verificada novamente ao iniciar a gravação. Uma plataforma suportada poderá ainda usar a saída final normal para o campo selecionado.",
+      "coediting": "Pode continuar a escrever no mesmo campo. Uma eliminação, seleção, navegação, comando, composição IME, atividade do ponteiro ou mudança de alvo interrompe a saída em direto.",
+      "guardedInputRace": "A saída protegida pelo teclado verifica o campo antes de cada pequena inserção, mas o foco ainda pode mudar antes de o sistema operativo a processar.",
+      "guardedSubmitRace": "O envio automático é verificado imediatamente antes de o atalho ser enviado, mas o foco ainda pode mudar antes de o sistema operativo o processar.",
+      "deliveredTextSafety": "Quando a saída em direto é interrompida, o Handy nunca elimina nem reescreve texto que já tenha entregue."
+    }
   }
 }

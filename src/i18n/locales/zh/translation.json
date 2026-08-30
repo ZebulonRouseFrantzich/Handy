@@ -613,6 +613,20 @@
         "label": "显示新功能",
         "description": "Handy 更新后显示发行说明"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "渐进式输出位置",
+      "description": "选择说话时部分转写内容的显示位置。此设置仅适用于支持流式转写的模型。",
+      "options": {
+        "overlay": {
+          "label": "悬浮层",
+          "description": "在 Handy 的悬浮层中显示实时转写，不输入到其他应用中。"
+        },
+        "focusedField": {
+          "label": "聚焦字段",
+          "description": "安全检查通过后，将实时转写输入当前聚焦的可编辑字段。不支持或不安全的目标将使用常规最终输出。"
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "如何解决",
     "recorderBlocked": "当前无法录制快捷键——macOS 的 Secure Input 正在阻止按键事件。请先解决 Secure Input 警告。",
     "dismiss": "关闭"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "可用性",
+        "values": {
+          "available": "可用",
+          "unavailable": "不可用",
+          "targetCheckedAtStart": "录音开始时检查目标"
+        }
+      },
+      "backend": {
+        "label": "后端",
+        "values": {
+          "windows": "Windows 辅助功能和输入",
+          "macOs": "macOS 辅助功能和 Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "测试后端"
+        }
+      },
+      "safety": {
+        "label": "安全性",
+        "values": {
+          "verifiedControl": "已验证控件",
+          "guardedFocusedControl": "受保护的聚焦控件",
+          "unavailable": "不可用"
+        }
+      },
+      "insertionRoute": {
+        "label": "插入方式",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode 输入",
+          "macAxSelectedText": "macOS 辅助功能选中文本",
+          "macCgEventUnicode": "macOS Core Graphics Unicode 输入",
+          "atSpiEditableText": "AT-SPI 可编辑文本",
+          "linuxFocusedKeyboard": "Linux 聚焦键盘",
+          "test": "测试方式",
+          "none": "录音开始时选择"
+        }
+      },
+      "receiptConfidence": {
+        "label": "送达确认",
+        "values": {
+          "verified": "已验证",
+          "posted": "已发送至操作系统"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "边说边输入",
+        "values": {
+          "observedInsertionsOnly": "仅限可监测的插入",
+          "guardedKeyboardInsertionsOnly": "仅限受保护的键盘插入",
+          "unavailable": "不可用"
+        }
+      },
+      "submitSupport": {
+        "label": "自动提交",
+        "values": {
+          "supported": "此目标支持",
+          "unsupported": "此目标不支持"
+        }
+      },
+      "applicationTarget": {
+        "label": "目标应用",
+        "values": {
+          "none": "未捕获目标"
+        }
+      },
+      "status": {
+        "label": "最新状态"
+      },
+      "reason": {
+        "label": "原因",
+        "values": {
+          "none": "未报告任何问题"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "辅助功能权限",
+        "description": "macOS 需要此权限来识别聚焦的可编辑字段并验证插入是否安全。",
+        "action": "请求辅助功能权限",
+        "help": "请在“系统设置”中授予 Handy 权限，然后返回此处重新检查。"
+      },
+      "macInputMonitoring": {
+        "title": "输入监控权限",
+        "description": "macOS 需要此权限，以便在实时输出期间检测键盘输入和不安全的编辑操作。",
+        "action": "请求输入监控权限",
+        "help": "请在“系统设置”中授予 Handy 权限，然后返回此处重新检查。"
+      }
+    },
+    "statuses": {
+      "armed": "已准备好实时输出",
+      "streaming": "正在发送实时输出",
+      "fallback": "正在使用常规最终输出",
+      "invalidated": "为确保安全，实时输出已停止",
+      "conflict": "最终转写冲突",
+      "completed": "实时输出已完成",
+      "cancelled": "实时输出已取消",
+      "faulted": "实时输出失败"
+    },
+    "reasons": {
+      "disabled": "聚焦字段输出已关闭。",
+      "experimentalFeaturesDisabled": "实验性功能已关闭。",
+      "modelDoesNotSupportStreaming": "所选模型不支持实时流式转写。",
+      "postProcessingIncompatible": "后处理需要使用常规最终输出。",
+      "pasteMethodDisabled": "粘贴设置中已禁用文本插入。",
+      "externalScriptIncompatible": "实时输出不能使用外部粘贴脚本。",
+      "accessibilityPermissionMissing": "需要 macOS 辅助功能权限。",
+      "inputMonitoringPermissionMissing": "需要 macOS 输入监控权限。",
+      "atSpiUnavailable": "AT-SPI 辅助功能服务不可用。",
+      "typingToolUnavailable": "没有可用的受支持聚焦键盘输入工具。",
+      "controlShortcutUnsupported": "无法以安全方式处理录音快捷键来进行实时输出。",
+      "autoSubmitUnsupported": "此目标不支持自动提交。",
+      "secureInputActive": "安全输入已启用，无法开始实时输出。",
+      "secureField": "安全字段或密码字段不允许实时输出。",
+      "handyOwnedTarget": "实时输出不能以 Handy 窗口为目标。",
+      "noFocusedTarget": "未找到已聚焦的可编辑字段。",
+      "targetNotEditable": "聚焦目标不可编辑。",
+      "initialSelectionNotCollapsed": "开始实时输出前，请取消选择并放置光标。",
+      "targetUnsupported": "聚焦字段无法提供实时输出所需的安全检查。",
+      "targetChanged": "实时输出期间聚焦目标发生了变化。",
+      "physicalPointerActivity": "为保护目标，指针操作已停止实时输出。",
+      "destructiveUserEdit": "删除、替换、粘贴或其他破坏性编辑操作已停止实时输出。",
+      "caretMoved": "移动光标已停止实时输出。",
+      "selectionChanged": "更改选区已停止实时输出。",
+      "unsafeKeyboardCommand": "可能更改目标的键盘命令已停止实时输出。",
+      "imeCompositionUnsupported": "实时输出期间无法安全监控 IME 组合输入。",
+      "mixedInputUnavailable": "实时输出期间无法安全监控此字段中的键盘输入。",
+      "targetClosed": "目标字段或应用已关闭。",
+      "monitorUnavailable": "目标监控已不可用。",
+      "backendDisconnected": "系统辅助功能后端已断开连接。",
+      "injectionDenied": "系统拒绝插入实时文本。",
+      "injectionPartial": "只能验证部分实时文本插入，因此输出已停止。",
+      "injectionAmbiguous": "无法确认实时文本插入结果，因此输出已停止。",
+      "injectionFailed": "实时文本插入失败，因此输出已停止。",
+      "receiptTimeout": "实时文本插入确认超时。",
+      "finalConflict": "最终转写与已送达的文本不一致。",
+      "historyUnavailable": "无法将最终转写保存到历史记录。",
+      "streamFailed": "录音期间实时转写失败。",
+      "cancelled": "录音或实时输出已取消。",
+      "platformUnsupported": "此平台不支持聚焦字段输出。",
+      "alreadyActive": "已有另一个实时输出会话正在进行。"
+    },
+    "notifications": {
+      "fallback": {
+        "title": "正在使用常规最终输出",
+        "body": "本次录音无法使用聚焦字段输出。转写完成后将插入文本。"
+      },
+      "invalidated": {
+        "title": "为确保安全，实时输出已停止",
+        "body": "无法继续验证目标。已送达的文本保持不变。"
+      },
+      "faulted": {
+        "title": "实时输出已停止",
+        "body": "无法确认最近一次插入。已送达的文本保持不变。"
+      },
+      "conflict": {
+        "title": "最终转写冲突",
+        "body": "最终转写与已送达的文本不同，已送达的文本保持不变。"
+      },
+      "history": {
+        "action": "打开历史记录",
+        "unavailable": "无法将此次转写保存到历史记录。"
+      }
+    },
+    "help": {
+      "runtimeChecks": "录音开始时会再次检查可用性。即使平台受支持，所选字段仍可能使用常规最终输出。",
+      "coediting": "你可以继续在同一字段中输入。删除、选择、导航、命令、IME 组合输入、指针操作或目标变化都会停止实时输出。",
+      "guardedInputRace": "受保护的键盘输出会在每次小段插入前验证字段，但在操作系统处理插入前，焦点仍可能发生变化。",
+      "guardedSubmitRace": "发送快捷键前会立即检查自动提交，但在操作系统处理快捷键前，焦点仍可能发生变化。",
+      "deliveredTextSafety": "实时输出停止时，Handy 绝不会删除或改写已送达的文本。"
+    }
   }
 }

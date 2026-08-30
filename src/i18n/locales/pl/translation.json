@@ -613,6 +613,20 @@
         "label": "Pokaż nowości",
         "description": "Pokazuj informacje o wydaniu po aktualizacjach Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Miejsce docelowe wyświetlania na bieżąco",
+      "description": "Wybierz, gdzie podczas mówienia ma się pojawiać częściowa transkrypcja. To ustawienie dotyczy tylko modeli obsługujących strumieniowanie.",
+      "options": {
+        "overlay": {
+          "label": "Nakładka",
+          "description": "Pokazuj transkrypcję na żywo w nakładce Handy bez wpisywania tekstu w innej aplikacji."
+        },
+        "focusedField": {
+          "label": "Aktywne pole",
+          "description": "Po sprawdzeniu bezpieczeństwa wpisuj transkrypcję na żywo w aktywnym polu edytowalnym. W przypadku nieobsługiwanych lub niebezpiecznych miejsc docelowych używane jest zwykłe wyjście końcowe."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Jak to naprawić",
     "recorderBlocked": "Nie można teraz nagrać skrótu — Secure Input w macOS blokuje zdarzenia klawiszy. Najpierw rozwiąż ostrzeżenie o Secure Input.",
     "dismiss": "Odrzuć"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Dostępność",
+        "values": {
+          "available": "Dostępne",
+          "unavailable": "Niedostępne",
+          "targetCheckedAtStart": "Miejsce docelowe sprawdzane przy rozpoczęciu nagrywania"
+        }
+      },
+      "backend": {
+        "label": "Mechanizm",
+        "values": {
+          "windows": "Ułatwienia dostępu i wprowadzanie tekstu w Windows",
+          "macOs": "Ułatwienia dostępu macOS i Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Mechanizm testowy"
+        }
+      },
+      "safety": {
+        "label": "Bezpieczeństwo",
+        "values": {
+          "verifiedControl": "Zweryfikowana kontrolka",
+          "guardedFocusedControl": "Chroniona aktywna kontrolka",
+          "unavailable": "Niedostępne"
+        }
+      },
+      "insertionRoute": {
+        "label": "Sposób wstawiania",
+        "values": {
+          "windowsUnicodeSendInput": "Wprowadzanie Unicode w Windows",
+          "macAxSelectedText": "Zaznaczony tekst przez ułatwienia dostępu macOS",
+          "macCgEventUnicode": "Wprowadzanie Unicode przez Core Graphics w macOS",
+          "atSpiEditableText": "Tekst edytowalny AT-SPI",
+          "linuxFocusedKeyboard": "Klawiatura aktywnego pola w Linux",
+          "test": "Sposób testowy",
+          "none": "Wybierane przy rozpoczęciu nagrywania"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Potwierdzenie dostarczenia",
+        "values": {
+          "verified": "Zweryfikowano",
+          "posted": "Przekazano systemowi operacyjnemu"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Pisanie podczas mówienia",
+        "values": {
+          "observedInsertionsOnly": "Tylko monitorowane wstawienia",
+          "guardedKeyboardInsertionsOnly": "Tylko chronione wstawienia z klawiatury",
+          "unavailable": "Niedostępne"
+        }
+      },
+      "submitSupport": {
+        "label": "Automatyczne wysyłanie",
+        "values": {
+          "supported": "Obsługiwane dla tego miejsca docelowego",
+          "unsupported": "Nieobsługiwane dla tego miejsca docelowego"
+        }
+      },
+      "applicationTarget": {
+        "label": "Aplikacja docelowa",
+        "values": {
+          "none": "Nie przechwycono miejsca docelowego"
+        }
+      },
+      "status": {
+        "label": "Ostatni stan"
+      },
+      "reason": {
+        "label": "Powód",
+        "values": {
+          "none": "Nie zgłoszono żadnego problemu"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Uprawnienie do ułatwień dostępu",
+        "description": "Wymagane w macOS do rozpoznawania aktywnego pola edytowalnego i weryfikowania bezpiecznego wstawiania.",
+        "action": "Poproś o dostęp do ułatwień dostępu",
+        "help": "Przyznaj Handy dostęp w Ustawieniach systemowych, a następnie wróć tutaj i sprawdź ponownie."
+      },
+      "macInputMonitoring": {
+        "title": "Uprawnienie do monitorowania wprowadzania",
+        "description": "Wymagane w macOS do wykrywania pisania i niebezpiecznych zmian, gdy aktywne jest wyjście na żywo.",
+        "action": "Poproś o dostęp do monitorowania wprowadzania",
+        "help": "Przyznaj Handy dostęp w Ustawieniach systemowych, a następnie wróć tutaj i sprawdź ponownie."
+      }
+    },
+    "statuses": {
+      "armed": "Gotowe do wyjścia na żywo",
+      "streaming": "Wysyłanie tekstu na żywo",
+      "fallback": "Używane jest zwykłe wyjście końcowe",
+      "invalidated": "Wyjście na żywo zatrzymane ze względów bezpieczeństwa",
+      "conflict": "Konflikt transkrypcji końcowej",
+      "completed": "Wyjście na żywo zakończone",
+      "cancelled": "Wyjście na żywo anulowane",
+      "faulted": "Wyjście na żywo nie powiodło się"
+    },
+    "reasons": {
+      "disabled": "Wyjście do aktywnego pola jest wyłączone.",
+      "experimentalFeaturesDisabled": "Funkcje eksperymentalne są wyłączone.",
+      "modelDoesNotSupportStreaming": "Wybrany model nie obsługuje strumieniowania na żywo.",
+      "postProcessingIncompatible": "Przetwarzanie końcowe wymaga zwykłego wyjścia końcowego.",
+      "pasteMethodDisabled": "Wstawianie tekstu jest wyłączone w ustawieniach wklejania.",
+      "externalScriptIncompatible": "Zewnętrznych skryptów wklejania nie można używać z wyjściem na żywo.",
+      "accessibilityPermissionMissing": "Wymagane jest uprawnienie do ułatwień dostępu w macOS.",
+      "inputMonitoringPermissionMissing": "Wymagane jest uprawnienie do monitorowania wprowadzania w macOS.",
+      "atSpiUnavailable": "Usługa ułatwień dostępu AT-SPI jest niedostępna.",
+      "typingToolUnavailable": "Nie jest dostępne żadne obsługiwane narzędzie do pisania za pomocą klawiatury aktywnego pola.",
+      "controlShortcutUnsupported": "Skrótu nagrywania nie można bezpiecznie obsłużyć podczas wyjścia na żywo.",
+      "autoSubmitUnsupported": "Automatyczne wysyłanie nie jest obsługiwane dla tego miejsca docelowego.",
+      "secureInputActive": "Funkcja Secure Input jest aktywna, więc nie można uruchomić wyjścia na żywo.",
+      "secureField": "Wyjście na żywo jest niedozwolone w polach bezpiecznych ani polach hasła.",
+      "handyOwnedTarget": "Okno Handy nie może być miejscem docelowym wyjścia na żywo.",
+      "noFocusedTarget": "Nie znaleziono aktywnego pola edytowalnego.",
+      "targetNotEditable": "Aktywne miejsce docelowe nie jest edytowalne.",
+      "initialSelectionNotCollapsed": "Przed uruchomieniem wyjścia na żywo usuń zaznaczenie i umieść kursor.",
+      "targetUnsupported": "Aktywne pole nie zapewnia kontroli bezpieczeństwa wymaganych do wyjścia na żywo.",
+      "targetChanged": "Miejsce docelowe zmieniło się podczas wyjścia na żywo.",
+      "physicalPointerActivity": "Aktywność wskaźnika zatrzymała wyjście na żywo, aby chronić miejsce docelowe.",
+      "destructiveUserEdit": "Usunięcie, zastąpienie, wklejenie lub inna destrukcyjna zmiana zatrzymała wyjście na żywo.",
+      "caretMoved": "Przesunięcie kursora zatrzymało wyjście na żywo.",
+      "selectionChanged": "Zmiana zaznaczenia zatrzymała wyjście na żywo.",
+      "unsafeKeyboardCommand": "Polecenie klawiaturowe, które mogło zmienić miejsce docelowe, zatrzymało wyjście na żywo.",
+      "imeCompositionUnsupported": "Podczas wyjścia na żywo nie można bezpiecznie monitorować kompozycji IME.",
+      "mixedInputUnavailable": "Podczas wyjścia na żywo nie można bezpiecznie monitorować pisania w tym polu.",
+      "targetClosed": "Pole lub aplikacja docelowa zostały zamknięte.",
+      "monitorUnavailable": "Monitorowanie miejsca docelowego nie jest już dostępne.",
+      "backendDisconnected": "Systemowy mechanizm ułatwień dostępu został rozłączony.",
+      "injectionDenied": "System odmówił wstawienia tekstu na żywo.",
+      "injectionPartial": "Udało się zweryfikować tylko część tekstu wstawionego na żywo, więc wyjście zostało zatrzymane.",
+      "injectionAmbiguous": "Nie udało się potwierdzić wyniku wstawienia tekstu na żywo, więc wyjście zostało zatrzymane.",
+      "injectionFailed": "Wstawienie tekstu na żywo nie powiodło się, więc wyjście zostało zatrzymane.",
+      "receiptTimeout": "Upłynął limit czasu potwierdzenia wstawienia tekstu na żywo.",
+      "finalConflict": "Transkrypcja końcowa nie była zgodna z już dostarczonym tekstem.",
+      "historyUnavailable": "Nie udało się zapisać transkrypcji w Historii.",
+      "streamFailed": "Transkrypcja na żywo nie powiodła się podczas nagrywania.",
+      "cancelled": "Nagrywanie lub wyjście na żywo zostało anulowane.",
+      "platformUnsupported": "Wyjście do aktywnego pola nie jest obsługiwane na tej platformie.",
+      "alreadyActive": "Inna sesja wyjścia na żywo jest już aktywna."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Używane jest zwykłe wyjście końcowe",
+        "body": "Wyjście do aktywnego pola jest niedostępne dla tego nagrania. Tekst zostanie wstawiony po zakończeniu transkrypcji."
+      },
+      "invalidated": {
+        "title": "Wyjście na żywo zatrzymane ze względów bezpieczeństwa",
+        "body": "Nie można było dalej weryfikować miejsca docelowego. Dostarczony już tekst pozostał bez zmian."
+      },
+      "faulted": {
+        "title": "Wyjście na żywo zatrzymane",
+        "body": "Nie udało się potwierdzić ostatniego wstawienia. Dostarczony już tekst pozostał bez zmian."
+      },
+      "conflict": {
+        "title": "Konflikt transkrypcji końcowej",
+        "body": "Transkrypcja końcowa różniła się od dostarczonego już tekstu, który pozostał bez zmian."
+      },
+      "history": {
+        "action": "Otwórz Historię",
+        "unavailable": "Nie udało się zapisać tej transkrypcji w Historii."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Dostępność jest sprawdzana ponownie przy rozpoczęciu nagrywania. Nawet na obsługiwanej platformie dla wybranego pola może zostać użyte zwykłe wyjście końcowe.",
+      "coediting": "Możesz nadal pisać w tym samym polu. Usuwanie, zaznaczanie, nawigacja, polecenia, kompozycja IME, aktywność wskaźnika lub zmiana miejsca docelowego zatrzymują wyjście na żywo.",
+      "guardedInputRace": "Chronione wprowadzanie z klawiatury weryfikuje pole przed każdym małym wstawieniem, ale aktywne pole może się zmienić, zanim system operacyjny je przetworzy.",
+      "guardedSubmitRace": "Automatyczne wysyłanie jest sprawdzane bezpośrednio przed przekazaniem skrótu, ale aktywne pole może się zmienić, zanim system operacyjny go przetworzy.",
+      "deliveredTextSafety": "Po zatrzymaniu wyjścia na żywo Handy nigdy nie usuwa ani nie zmienia dostarczonego już tekstu."
+    }
   }
 }

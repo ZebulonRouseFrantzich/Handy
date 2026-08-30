@@ -613,6 +613,20 @@
         "label": "Neuerungen anzeigen",
         "description": "Versionshinweise nach Handy-Updates anzeigen"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Ziel der fortlaufenden Ausgabe",
+      "description": "Wähle aus, wo die vorläufige Transkription während des Sprechens angezeigt wird. Diese Einstellung gilt nur für Streaming-fähige Modelle.",
+      "options": {
+        "overlay": {
+          "label": "Overlay",
+          "description": "Zeigt die Live-Transkription im Overlay von Handy an, ohne Text in eine andere Anwendung einzugeben."
+        },
+        "focusedField": {
+          "label": "Fokussiertes Feld",
+          "description": "Gibt die Live-Transkription nach Sicherheitsprüfungen in das fokussierte bearbeitbare Feld ein. Bei nicht unterstützten oder unsicheren Zielen wird die normale endgültige Ausgabe verwendet."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "So behebst du das",
     "recorderBlocked": "Tastenkürzel können gerade nicht aufgezeichnet werden — macOS Secure Input blockiert Tastenereignisse. Behebe zuerst die Secure-Input-Warnung.",
     "dismiss": "Ausblenden"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Verfügbarkeit",
+        "values": {
+          "available": "Verfügbar",
+          "unavailable": "Nicht verfügbar",
+          "targetCheckedAtStart": "Ziel wird beim Aufnahmestart geprüft"
+        }
+      },
+      "backend": {
+        "label": "Backend",
+        "values": {
+          "windows": "Windows-Bedienungshilfen und -Eingabe",
+          "macOs": "macOS-Bedienungshilfen und Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Test-Backend"
+        }
+      },
+      "safety": {
+        "label": "Sicherheit",
+        "values": {
+          "verifiedControl": "Verifiziertes Steuerelement",
+          "guardedFocusedControl": "Abgesichertes fokussiertes Steuerelement",
+          "unavailable": "Nicht verfügbar"
+        }
+      },
+      "insertionRoute": {
+        "label": "Einfügeweg",
+        "values": {
+          "windowsUnicodeSendInput": "Windows-Unicode-Eingabe",
+          "macAxSelectedText": "Ausgewählter Text über macOS-Bedienungshilfen",
+          "macCgEventUnicode": "macOS Core Graphics-Unicode-Eingabe",
+          "atSpiEditableText": "Bearbeitbarer Text über AT-SPI",
+          "linuxFocusedKeyboard": "Fokussierte Linux-Tastatur",
+          "test": "Testweg",
+          "none": "Wird beim Start der Aufzeichnung ausgewählt"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Zustellbestätigung",
+        "values": {
+          "verified": "Verifiziert",
+          "posted": "An das Betriebssystem übermittelt"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Tippen während des Sprechens",
+        "values": {
+          "observedInsertionsOnly": "Nur überwachte Einfügungen",
+          "guardedKeyboardInsertionsOnly": "Nur abgesicherte Tastatureinfügungen",
+          "unavailable": "Nicht verfügbar"
+        }
+      },
+      "submitSupport": {
+        "label": "Automatisch absenden",
+        "values": {
+          "supported": "Für dieses Ziel unterstützt",
+          "unsupported": "Für dieses Ziel nicht unterstützt"
+        }
+      },
+      "applicationTarget": {
+        "label": "Zielanwendung",
+        "values": {
+          "none": "Kein Ziel erfasst"
+        }
+      },
+      "status": {
+        "label": "Aktueller Status"
+      },
+      "reason": {
+        "label": "Grund",
+        "values": {
+          "none": "Kein Problem gemeldet"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Berechtigung für Bedienungshilfen",
+        "description": "Unter macOS erforderlich, um das fokussierte bearbeitbare Feld zu erkennen und das sichere Einfügen zu verifizieren.",
+        "action": "Zugriff auf Bedienungshilfen anfordern",
+        "help": "Gewähre Handy in den Systemeinstellungen Zugriff und kehre dann hierher zurück, um erneut zu prüfen."
+      },
+      "macInputMonitoring": {
+        "title": "Berechtigung zur Eingabeüberwachung",
+        "description": "Unter macOS erforderlich, um Tastatureingaben und unsichere Bearbeitungen bei aktiver Live-Ausgabe zu erkennen.",
+        "action": "Zugriff auf Eingabeüberwachung anfordern",
+        "help": "Gewähre Handy in den Systemeinstellungen Zugriff und kehre dann hierher zurück, um erneut zu prüfen."
+      }
+    },
+    "statuses": {
+      "armed": "Bereit für Live-Ausgabe",
+      "streaming": "Live-Ausgabe wird gesendet",
+      "fallback": "Normale endgültige Ausgabe wird verwendet",
+      "invalidated": "Live-Ausgabe wurde aus Sicherheitsgründen gestoppt",
+      "conflict": "Konflikt bei der endgültigen Transkription",
+      "completed": "Live-Ausgabe abgeschlossen",
+      "cancelled": "Live-Ausgabe abgebrochen",
+      "faulted": "Live-Ausgabe fehlgeschlagen"
+    },
+    "reasons": {
+      "disabled": "Die Ausgabe in das fokussierte Feld ist deaktiviert.",
+      "experimentalFeaturesDisabled": "Experimentelle Funktionen sind deaktiviert.",
+      "modelDoesNotSupportStreaming": "Das ausgewählte Modell unterstützt kein Live-Streaming.",
+      "postProcessingIncompatible": "Die Nachbearbeitung erfordert die normale endgültige Ausgabe.",
+      "pasteMethodDisabled": "Das Einfügen von Text ist in den Einfügeeinstellungen deaktiviert.",
+      "externalScriptIncompatible": "Externe Einfügeskripte können nicht mit der Live-Ausgabe verwendet werden.",
+      "accessibilityPermissionMissing": "Die macOS-Berechtigung für Bedienungshilfen ist erforderlich.",
+      "inputMonitoringPermissionMissing": "Die macOS-Berechtigung zur Eingabeüberwachung ist erforderlich.",
+      "atSpiUnavailable": "Der AT-SPI-Dienst für Bedienungshilfen ist nicht verfügbar.",
+      "typingToolUnavailable": "Es ist kein unterstütztes Eingabewerkzeug für die fokussierte Tastatur verfügbar.",
+      "controlShortcutUnsupported": "Das Aufnahmekürzel kann für die Live-Ausgabe nicht sicher verarbeitet werden.",
+      "autoSubmitUnsupported": "Automatisches Absenden wird für dieses Ziel nicht unterstützt.",
+      "secureInputActive": "Secure Input ist aktiv. Daher kann die Live-Ausgabe nicht gestartet werden.",
+      "secureField": "Die Live-Ausgabe ist in geschützten Feldern oder Passwortfeldern nicht zulässig.",
+      "handyOwnedTarget": "Die Live-Ausgabe kann nicht auf ein Fenster von Handy ausgerichtet werden.",
+      "noFocusedTarget": "Es wurde kein fokussiertes bearbeitbares Feld gefunden.",
+      "targetNotEditable": "Das fokussierte Ziel ist nicht bearbeitbar.",
+      "initialSelectionNotCollapsed": "Hebe die Auswahl auf und platziere den Cursor, bevor du die Live-Ausgabe startest.",
+      "targetUnsupported": "Das fokussierte Feld bietet nicht die für die Live-Ausgabe erforderlichen Sicherheitsprüfungen.",
+      "targetChanged": "Das fokussierte Ziel hat sich während der Live-Ausgabe geändert.",
+      "physicalPointerActivity": "Eine Zeigeraktivität hat die Live-Ausgabe gestoppt, um das Ziel zu schützen.",
+      "destructiveUserEdit": "Eine Löschung, Ersetzung, Einfügung oder andere destruktive Bearbeitung hat die Live-Ausgabe gestoppt.",
+      "caretMoved": "Das Verschieben des Cursors hat die Live-Ausgabe gestoppt.",
+      "selectionChanged": "Das Ändern der Auswahl hat die Live-Ausgabe gestoppt.",
+      "unsafeKeyboardCommand": "Ein Tastaturbefehl, der das Ziel verändern könnte, hat die Live-Ausgabe gestoppt.",
+      "imeCompositionUnsupported": "Die IME-Komposition kann während der Live-Ausgabe nicht sicher überwacht werden.",
+      "mixedInputUnavailable": "Tastatureingaben in diesem Feld können während der Live-Ausgabe nicht sicher überwacht werden.",
+      "targetClosed": "Das Zielfeld oder die Anwendung wurde geschlossen.",
+      "monitorUnavailable": "Die Zielüberwachung ist nicht mehr verfügbar.",
+      "backendDisconnected": "Die Verbindung zum System-Backend für Bedienungshilfen wurde getrennt.",
+      "injectionDenied": "Das System hat das Einfügen des Live-Texts verweigert.",
+      "injectionPartial": "Nur ein Teil einer Live-Texteinfügung konnte verifiziert werden. Daher wurde die Ausgabe gestoppt.",
+      "injectionAmbiguous": "Das Ergebnis einer Live-Texteinfügung konnte nicht bestätigt werden. Daher wurde die Ausgabe gestoppt.",
+      "injectionFailed": "Eine Live-Texteinfügung ist fehlgeschlagen. Daher wurde die Ausgabe gestoppt.",
+      "receiptTimeout": "Die Bestätigung einer Live-Texteinfügung hat das Zeitlimit überschritten.",
+      "finalConflict": "Die endgültige Transkription stimmte nicht mit dem bereits ausgegebenen Text überein.",
+      "historyUnavailable": "Die endgültige Transkription konnte nicht im Verlauf gespeichert werden.",
+      "streamFailed": "Die Live-Transkription ist während der Aufnahme fehlgeschlagen.",
+      "cancelled": "Die Aufnahme oder Live-Ausgabe wurde abgebrochen.",
+      "platformUnsupported": "Die Ausgabe in das fokussierte Feld wird auf dieser Plattform nicht unterstützt.",
+      "alreadyActive": "Eine andere Live-Ausgabesitzung ist bereits aktiv."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Normale endgültige Ausgabe wird verwendet",
+        "body": "Die Ausgabe in das fokussierte Feld ist für diese Aufnahme nicht verfügbar. Der Text wird nach Abschluss der Transkription eingefügt."
+      },
+      "invalidated": {
+        "title": "Live-Ausgabe wurde aus Sicherheitsgründen gestoppt",
+        "body": "Das Ziel konnte nicht mehr verifiziert werden. Bereits ausgegebener Text wurde nicht verändert."
+      },
+      "faulted": {
+        "title": "Live-Ausgabe gestoppt",
+        "body": "Die letzte Einfügung konnte nicht bestätigt werden. Bereits ausgegebener Text wurde nicht verändert."
+      },
+      "conflict": {
+        "title": "Konflikt bei der endgültigen Transkription",
+        "body": "Die endgültige Transkription wich vom bereits ausgegebenen Text ab. Dieser wurde nicht verändert."
+      },
+      "history": {
+        "action": "Verlauf öffnen",
+        "unavailable": "Diese Transkription konnte nicht im Verlauf gespeichert werden."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Die Verfügbarkeit wird beim Start der Aufnahme erneut geprüft. Auf einer unterstützten Plattform kann für das ausgewählte Feld dennoch die normale endgültige Ausgabe verwendet werden.",
+      "coediting": "Du kannst im selben Feld weiter tippen. Löschen, Auswählen, Navigieren, Befehle, IME-Komposition, Zeigeraktivität oder ein Zielwechsel stoppen die Live-Ausgabe.",
+      "guardedInputRace": "Bei der abgesicherten Tastaturausgabe wird das Feld vor jeder kleinen Einfügung verifiziert. Der Fokus kann sich jedoch noch ändern, bevor das Betriebssystem die Eingabe verarbeitet.",
+      "guardedSubmitRace": "Das automatische Absenden wird unmittelbar vor dem Übermitteln des Tastenkürzels geprüft. Der Fokus kann sich jedoch noch ändern, bevor das Betriebssystem es verarbeitet.",
+      "deliveredTextSafety": "Wenn die Live-Ausgabe stoppt, löscht oder überschreibt Handy niemals bereits ausgegebenen Text."
+    }
   }
 }

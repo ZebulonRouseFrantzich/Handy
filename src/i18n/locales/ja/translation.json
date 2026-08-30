@@ -613,6 +613,20 @@
         "label": "新機能を表示",
         "description": "Handy のアップデート後にリリースノートを表示"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "逐次出力先",
+      "description": "話している間、途中の文字起こしを表示する場所を選択します。この設定はストリーミング対応モデルにのみ適用されます。",
+      "options": {
+        "overlay": {
+          "label": "オーバーレイ",
+          "description": "ほかのアプリケーションに入力せず、Handyのオーバーレイにリアルタイムの文字起こしを表示します。"
+        },
+        "focusedField": {
+          "label": "フォーカス中のフィールド",
+          "description": "安全性を確認したうえで、リアルタイムの文字起こしをフォーカス中の編集可能なフィールドに入力します。未対応または安全でない入力先では、通常の確定後出力を使用します。"
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "解決方法",
     "recorderBlocked": "現在ショートカットを記録できません。macOS の Secure Input がキーイベントをブロックしています。先に Secure Input の警告を解消してください。",
     "dismiss": "閉じる"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "利用可否",
+        "values": {
+          "available": "利用可能",
+          "unavailable": "利用不可",
+          "targetCheckedAtStart": "録音開始時に入力先を確認"
+        }
+      },
+      "backend": {
+        "label": "バックエンド",
+        "values": {
+          "windows": "Windowsアクセシビリティと入力",
+          "macOs": "macOSアクセシビリティとCore Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "テスト用バックエンド"
+        }
+      },
+      "safety": {
+        "label": "安全性",
+        "values": {
+          "verifiedControl": "検証済みコントロール",
+          "guardedFocusedControl": "保護されたフォーカス中のコントロール",
+          "unavailable": "利用不可"
+        }
+      },
+      "insertionRoute": {
+        "label": "挿入経路",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode入力",
+          "macAxSelectedText": "macOSアクセシビリティの選択テキスト",
+          "macCgEventUnicode": "macOS Core Graphics Unicode入力",
+          "atSpiEditableText": "AT-SPI編集可能テキスト",
+          "linuxFocusedKeyboard": "Linuxのフォーカス中キーボード",
+          "test": "テスト用経路",
+          "none": "録画開始時に選択"
+        }
+      },
+      "receiptConfidence": {
+        "label": "配信確認",
+        "values": {
+          "verified": "検証済み",
+          "posted": "OSに送信済み"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "発話中のキー入力",
+        "values": {
+          "observedInsertionsOnly": "監視可能な挿入のみ",
+          "guardedKeyboardInsertionsOnly": "保護されたキーボード挿入のみ",
+          "unavailable": "利用不可"
+        }
+      },
+      "submitSupport": {
+        "label": "自動送信",
+        "values": {
+          "supported": "この入力先で利用可能",
+          "unsupported": "この入力先では利用不可"
+        }
+      },
+      "applicationTarget": {
+        "label": "入力先アプリケーション",
+        "values": {
+          "none": "入力先を取得していません"
+        }
+      },
+      "status": {
+        "label": "最新の状態"
+      },
+      "reason": {
+        "label": "理由",
+        "values": {
+          "none": "問題は報告されていません"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "アクセシビリティ権限",
+        "description": "macOSでフォーカス中の編集可能なフィールドを特定し、安全な挿入を検証するために必要です。",
+        "action": "アクセシビリティへのアクセスを要求",
+        "help": "システム設定でHandyにアクセスを許可してから、ここに戻って再確認してください。"
+      },
+      "macInputMonitoring": {
+        "title": "入力監視の権限",
+        "description": "macOSでリアルタイム出力中のキー入力や安全でない編集を検出するために必要です。",
+        "action": "入力監視へのアクセスを要求",
+        "help": "システム設定でHandyにアクセスを許可してから、ここに戻って再確認してください。"
+      }
+    },
+    "statuses": {
+      "armed": "リアルタイム出力の準備完了",
+      "streaming": "リアルタイム出力を送信中",
+      "fallback": "通常の確定後出力を使用中",
+      "invalidated": "安全のためリアルタイム出力を停止",
+      "conflict": "最終文字起こしの不一致",
+      "completed": "リアルタイム出力が完了",
+      "cancelled": "リアルタイム出力をキャンセル",
+      "faulted": "リアルタイム出力に失敗"
+    },
+    "reasons": {
+      "disabled": "フォーカス中のフィールドへの出力がオフになっています。",
+      "experimentalFeaturesDisabled": "試験的機能がオフになっています。",
+      "modelDoesNotSupportStreaming": "選択したモデルはリアルタイムストリーミングに対応していません。",
+      "postProcessingIncompatible": "後処理には通常の確定後出力が必要です。",
+      "pasteMethodDisabled": "貼り付け設定でテキスト挿入が無効になっています。",
+      "externalScriptIncompatible": "外部の貼り付けスクリプトはリアルタイム出力では使用できません。",
+      "accessibilityPermissionMissing": "macOSのアクセシビリティ権限が必要です。",
+      "inputMonitoringPermissionMissing": "macOSの入力監視権限が必要です。",
+      "atSpiUnavailable": "AT-SPIアクセシビリティサービスを利用できません。",
+      "typingToolUnavailable": "フォーカス中のフィールドへのキーボード入力に対応するツールがありません。",
+      "controlShortcutUnsupported": "録音ショートカットをリアルタイム出力で安全に処理できません。",
+      "autoSubmitUnsupported": "この入力先は自動送信に対応していません。",
+      "secureInputActive": "セキュア入力が有効なため、リアルタイム出力を開始できません。",
+      "secureField": "セキュアフィールドやパスワードフィールドではリアルタイム出力を使用できません。",
+      "handyOwnedTarget": "Handyのウィンドウをリアルタイム出力先にはできません。",
+      "noFocusedTarget": "フォーカス中の編集可能なフィールドが見つかりません。",
+      "targetNotEditable": "フォーカス中の入力先は編集できません。",
+      "initialSelectionNotCollapsed": "選択を解除してキャレットを置いてから、リアルタイム出力を開始してください。",
+      "targetUnsupported": "フォーカス中のフィールドでは、リアルタイム出力に必要な安全確認を行えません。",
+      "targetChanged": "リアルタイム出力中にフォーカス先が変わりました。",
+      "physicalPointerActivity": "入力先を保護するため、ポインター操作を検出してリアルタイム出力を停止しました。",
+      "destructiveUserEdit": "削除、置換、貼り付けなどの破壊的な編集を検出したため、リアルタイム出力を停止しました。",
+      "caretMoved": "キャレットが移動したため、リアルタイム出力を停止しました。",
+      "selectionChanged": "選択範囲が変わったため、リアルタイム出力を停止しました。",
+      "unsafeKeyboardCommand": "入力先を変更する可能性のあるキーボードコマンドを検出したため、リアルタイム出力を停止しました。",
+      "imeCompositionUnsupported": "リアルタイム出力中のIME変換を安全に監視できません。",
+      "mixedInputUnavailable": "リアルタイム出力中、このフィールドへのキー入力を安全に監視できません。",
+      "targetClosed": "入力先のフィールドまたはアプリケーションが閉じられました。",
+      "monitorUnavailable": "入力先を監視できなくなりました。",
+      "backendDisconnected": "システムのアクセシビリティバックエンドとの接続が切れました。",
+      "injectionDenied": "システムにリアルタイムのテキスト挿入を拒否されました。",
+      "injectionPartial": "リアルタイムのテキスト挿入の一部しか検証できなかったため、出力を停止しました。",
+      "injectionAmbiguous": "リアルタイムのテキスト挿入結果を確認できなかったため、出力を停止しました。",
+      "injectionFailed": "リアルタイムのテキスト挿入に失敗したため、出力を停止しました。",
+      "receiptTimeout": "リアルタイムのテキスト挿入確認がタイムアウトしました。",
+      "finalConflict": "最終文字起こしが配信済みのテキストと一致しませんでした。",
+      "historyUnavailable": "最終文字起こしを履歴に保存できませんでした。",
+      "streamFailed": "録音中にリアルタイム文字起こしが失敗しました。",
+      "cancelled": "録音またはリアルタイム出力がキャンセルされました。",
+      "platformUnsupported": "このプラットフォームでは、フォーカス中のフィールドへの出力に対応していません。",
+      "alreadyActive": "別のリアルタイム出力セッションがすでに実行中です。"
+    },
+    "notifications": {
+      "fallback": {
+        "title": "通常の確定後出力を使用",
+        "body": "この録音では、フォーカス中のフィールドへの出力を利用できません。文字起こしの完了後にテキストを挿入します。"
+      },
+      "invalidated": {
+        "title": "安全のためリアルタイム出力を停止",
+        "body": "入力先を検証できなくなりました。配信済みのテキストは変更していません。"
+      },
+      "faulted": {
+        "title": "リアルタイム出力を停止",
+        "body": "直前の挿入を確認できませんでした。配信済みのテキストは変更していません。"
+      },
+      "conflict": {
+        "title": "最終文字起こしの不一致",
+        "body": "最終文字起こしが配信済みのテキストと異なっていたため、配信済みのテキストは変更していません。"
+      },
+      "history": {
+        "action": "履歴を開く",
+        "unavailable": "この文字起こしを履歴に保存できませんでした。"
+      }
+    },
+    "help": {
+      "runtimeChecks": "録音開始時に利用可否を再確認します。対応プラットフォームでも、選択したフィールドによっては通常の確定後出力を使用します。",
+      "coediting": "同じフィールドでキー入力を続けられます。ただし、削除、選択、移動、コマンド、IME変換、ポインター操作、フォーカス先の変更があると、リアルタイム出力は停止します。",
+      "guardedInputRace": "保護されたキーボード出力では、短いテキストを挿入するたびにフィールドを検証しますが、OSが入力を処理する前にフォーカスが変わる可能性があります。",
+      "guardedSubmitRace": "自動送信ではショートカットを送信する直前に確認しますが、OSが入力を処理する前にフォーカスが変わる可能性があります。",
+      "deliveredTextSafety": "リアルタイム出力が停止しても、Handyが配信済みのテキストを削除または書き換えることはありません。"
+    }
   }
 }

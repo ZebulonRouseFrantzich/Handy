@@ -613,6 +613,20 @@
         "label": "הצג מה חדש",
         "description": "הצג הערות גרסה לאחר עדכוני Handy"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "יעד הפלט ההדרגתי",
+      "description": "בחרו היכן יופיע התמלול החלקי בזמן הדיבור. הגדרה זו חלה רק על מודלים שתומכים בהזרמה.",
+      "options": {
+        "overlay": {
+          "label": "שכבת-על",
+          "description": "הצגת התמלול החי בשכבת-העל של Handy בלי להקליד ביישום אחר."
+        },
+        "focusedField": {
+          "label": "שדה במיקוד",
+          "description": "הקלדת התמלול החי בשדה העריכה שבמיקוד לאחר בדיקות בטיחות. ביעדים לא נתמכים או לא בטוחים ייעשה שימוש בפלט הסופי הרגיל."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "איך לתקן את זה",
     "recorderBlocked": "לא ניתן להקליט קיצורים כרגע — Secure Input של macOS חוסם אירועי מקשים. פתור תחילה את אזהרת Secure Input.",
     "dismiss": "התעלם"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "זמינות",
+        "values": {
+          "available": "זמין",
+          "unavailable": "לא זמין",
+          "targetCheckedAtStart": "היעד נבדק בתחילת ההקלטה"
+        }
+      },
+      "backend": {
+        "label": "מנגנון",
+        "values": {
+          "windows": "נגישות וקלט של Windows",
+          "macOs": "נגישות ו-Core Graphics של macOS",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "מנגנון בדיקה"
+        }
+      },
+      "safety": {
+        "label": "בטיחות",
+        "values": {
+          "verifiedControl": "פקד מאומת",
+          "guardedFocusedControl": "פקד מוגן במיקוד",
+          "unavailable": "לא זמין"
+        }
+      },
+      "insertionRoute": {
+        "label": "נתיב הוספה",
+        "values": {
+          "windowsUnicodeSendInput": "קלט Unicode של Windows",
+          "macAxSelectedText": "טקסט נבחר של נגישות macOS",
+          "macCgEventUnicode": "קלט Unicode של macOS Core Graphics",
+          "atSpiEditableText": "טקסט ניתן לעריכה של AT-SPI",
+          "linuxFocusedKeyboard": "מקלדת Linux במיקוד",
+          "test": "נתיב בדיקה",
+          "none": "ייבחר עם תחילת ההקלטה"
+        }
+      },
+      "receiptConfidence": {
+        "label": "אישור מסירה",
+        "values": {
+          "verified": "מאומת",
+          "posted": "נשלח למערכת ההפעלה"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "הקלדה בזמן הדיבור",
+        "values": {
+          "observedInsertionsOnly": "הוספות שנצפו בלבד",
+          "guardedKeyboardInsertionsOnly": "הוספות מקלדת מוגנות בלבד",
+          "unavailable": "לא זמין"
+        }
+      },
+      "submitSupport": {
+        "label": "שליחה אוטומטית",
+        "values": {
+          "supported": "נתמכת עבור יעד זה",
+          "unsupported": "אינה נתמכת עבור יעד זה"
+        }
+      },
+      "applicationTarget": {
+        "label": "יישום היעד",
+        "values": {
+          "none": "לא נקלט יעד"
+        }
+      },
+      "status": {
+        "label": "המצב העדכני ביותר"
+      },
+      "reason": {
+        "label": "סיבה",
+        "values": {
+          "none": "לא דווחה בעיה"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "הרשאת נגישות",
+        "description": "נדרשת ב-macOS כדי לזהות את שדה העריכה שבמיקוד ולאמת הוספה בטוחה.",
+        "action": "בקשת גישה לנגישות",
+        "help": "העניקו ל-Handy גישה בהגדרות המערכת, ואז חזרו לכאן כדי לבדוק שוב."
+      },
+      "macInputMonitoring": {
+        "title": "הרשאת ניטור קלט",
+        "description": "נדרשת ב-macOS כדי לזהות הקלדה ועריכות לא בטוחות בזמן שפלט חי פעיל.",
+        "action": "בקשת גישה לניטור קלט",
+        "help": "העניקו ל-Handy גישה בהגדרות המערכת, ואז חזרו לכאן כדי לבדוק שוב."
+      }
+    },
+    "statuses": {
+      "armed": "מוכן לפלט חי",
+      "streaming": "שולח פלט חי",
+      "fallback": "נעשה שימוש בפלט הסופי הרגיל",
+      "invalidated": "הפלט החי הופסק מטעמי בטיחות",
+      "conflict": "התנגשות בתמלול הסופי",
+      "completed": "הפלט החי הושלם",
+      "cancelled": "הפלט החי בוטל",
+      "faulted": "הפלט החי נכשל"
+    },
+    "reasons": {
+      "disabled": "הפלט לשדה שבמיקוד כבוי.",
+      "experimentalFeaturesDisabled": "תכונות ניסיוניות כבויות.",
+      "modelDoesNotSupportStreaming": "המודל שנבחר אינו תומך בהזרמה חיה.",
+      "postProcessingIncompatible": "העיבוד שלאחר התמלול מחייב שימוש בפלט הסופי הרגיל.",
+      "pasteMethodDisabled": "הוספת טקסט מושבתת בהגדרות ההדבקה.",
+      "externalScriptIncompatible": "אי אפשר להשתמש בסקריפטים חיצוניים להדבקה עם פלט חי.",
+      "accessibilityPermissionMissing": "נדרשת הרשאת נגישות ב-macOS.",
+      "inputMonitoringPermissionMissing": "נדרשת הרשאת ניטור קלט ב-macOS.",
+      "atSpiUnavailable": "שירות הנגישות AT-SPI אינו זמין.",
+      "typingToolUnavailable": "לא זמין כלי נתמך להקלדה באמצעות המקלדת שבמיקוד.",
+      "controlShortcutUnsupported": "אי אפשר לטפל בקיצור הדרך להקלטה באופן בטוח עבור פלט חי.",
+      "autoSubmitUnsupported": "שליחה אוטומטית אינה נתמכת עבור יעד זה.",
+      "secureInputActive": "קלט מאובטח פעיל, ולכן אי אפשר להתחיל פלט חי.",
+      "secureField": "פלט חי אינו מורשה בשדות מאובטחים או בשדות סיסמה.",
+      "handyOwnedTarget": "אי אפשר להפנות פלט חי לחלון של Handy.",
+      "noFocusedTarget": "לא נמצא שדה עריכה במיקוד.",
+      "targetNotEditable": "היעד שבמיקוד אינו ניתן לעריכה.",
+      "initialSelectionNotCollapsed": "נקו את הבחירה והציבו את הסמן לפני התחלת הפלט החי.",
+      "targetUnsupported": "השדה שבמיקוד אינו מספק את בדיקות הבטיחות הנדרשות לפלט חי.",
+      "targetChanged": "היעד שבמיקוד השתנה במהלך הפלט החי.",
+      "physicalPointerActivity": "פעילות של המצביע עצרה את הפלט החי כדי להגן על היעד.",
+      "destructiveUserEdit": "מחיקה, החלפה, הדבקה או עריכה הרסנית אחרת עצרה את הפלט החי.",
+      "caretMoved": "הזזת הסמן עצרה את הפלט החי.",
+      "selectionChanged": "שינוי הבחירה עצר את הפלט החי.",
+      "unsafeKeyboardCommand": "פקודת מקלדת שעלולה לשנות את היעד עצרה את הפלט החי.",
+      "imeCompositionUnsupported": "אי אפשר לנטר בבטחה יצירה באמצעות IME במהלך פלט חי.",
+      "mixedInputUnavailable": "אי אפשר לנטר בבטחה הקלדה בשדה זה במהלך פלט חי.",
+      "targetClosed": "שדה היעד או היישום נסגרו.",
+      "monitorUnavailable": "ניטור היעד אינו זמין עוד.",
+      "backendDisconnected": "מנגנון הנגישות של המערכת נותק.",
+      "injectionDenied": "המערכת דחתה את הוספת הטקסט החי.",
+      "injectionPartial": "אפשר היה לאמת רק חלק מהוספת טקסט חי, ולכן הפלט הופסק.",
+      "injectionAmbiguous": "לא היה אפשר לאשר את התוצאה של הוספת טקסט חי, ולכן הפלט הופסק.",
+      "injectionFailed": "הוספת טקסט חי נכשלה, ולכן הפלט הופסק.",
+      "receiptTimeout": "פג הזמן שהוקצב לאישור הוספת טקסט חי.",
+      "finalConflict": "התמלול הסופי לא תאם לטקסט שכבר נמסר.",
+      "historyUnavailable": "לא היה אפשר לשמור את התמלול הסופי בהיסטוריה.",
+      "streamFailed": "התמלול החי נכשל במהלך ההקלטה.",
+      "cancelled": "ההקלטה או הפלט החי בוטלו.",
+      "platformUnsupported": "פלט לשדה שבמיקוד אינו נתמך בפלטפורמה זו.",
+      "alreadyActive": "כבר פעילה הפעלה אחרת של פלט חי."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "נעשה שימוש בפלט הסופי הרגיל",
+        "body": "פלט לשדה שבמיקוד אינו זמין להקלטה זו. הטקסט יתווסף לאחר סיום התמלול."
+      },
+      "invalidated": {
+        "title": "הפלט החי הופסק מטעמי בטיחות",
+        "body": "לא היה אפשר עוד לאמת את היעד. הטקסט שכבר נמסר נותר ללא שינוי."
+      },
+      "faulted": {
+        "title": "הפלט החי הופסק",
+        "body": "לא היה אפשר לאשר את ההוספה האחרונה. הטקסט שכבר נמסר נותר ללא שינוי."
+      },
+      "conflict": {
+        "title": "התנגשות בתמלול הסופי",
+        "body": "התמלול הסופי היה שונה מהטקסט שכבר נמסר, שנותר ללא שינוי."
+      },
+      "history": {
+        "action": "פתיחת ההיסטוריה",
+        "unavailable": "לא היה אפשר לשמור תמלול זה בהיסטוריה."
+      }
+    },
+    "help": {
+      "runtimeChecks": "הזמינות נבדקת שוב בתחילת ההקלטה. גם בפלטפורמה נתמכת ייתכן שייעשה שימוש בפלט הסופי הרגיל עבור השדה שנבחר.",
+      "coediting": "אפשר להמשיך להקליד באותו שדה. מחיקה, בחירה, ניווט, פקודות, יצירה באמצעות IME, פעילות מצביע או שינוי יעד עוצרים את הפלט החי.",
+      "guardedInputRace": "פלט מקלדת מוגן מאמת את השדה לפני כל הוספה קטנה, אך המיקוד עדיין עשוי להשתנות לפני שמערכת ההפעלה קולטת אותה.",
+      "guardedSubmitRace": "השליחה האוטומטית נבדקת מיד לפני שליחת קיצור הדרך, אך המיקוד עדיין עשוי להשתנות לפני שמערכת ההפעלה קולטת אותו.",
+      "deliveredTextSafety": "כשהפלט החי נעצר, Handy לעולם אינה מוחקת או משכתבת טקסט שכבר מסרה."
+    }
   }
 }

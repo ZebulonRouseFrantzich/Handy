@@ -613,6 +613,20 @@
         "label": "새 소식 표시",
         "description": "Handy 업데이트 후 릴리스 노트를 표시합니다"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "점진적 출력 대상",
+      "description": "말하는 동안 부분 전사가 표시될 위치를 선택하세요. 이 설정은 스트리밍을 지원하는 모델에만 적용됩니다.",
+      "options": {
+        "overlay": {
+          "label": "오버레이",
+          "description": "다른 애플리케이션에 입력하지 않고 Handy 오버레이에 실시간 전사를 표시합니다."
+        },
+        "focusedField": {
+          "label": "포커스된 필드",
+          "description": "안전 검사를 거친 후 포커스된 편집 가능 필드에 실시간 전사를 입력합니다. 지원되지 않거나 안전하지 않은 대상에는 일반 최종 출력을 사용합니다."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "해결 방법",
     "recorderBlocked": "지금은 단축키를 등록할 수 없습니다. macOS Secure Input이 키 이벤트를 차단하고 있습니다. Secure Input 경고를 먼저 해결하세요.",
     "dismiss": "닫기"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "사용 가능 여부",
+        "values": {
+          "available": "사용 가능",
+          "unavailable": "사용 불가",
+          "targetCheckedAtStart": "녹음 시작 시 대상 확인"
+        }
+      },
+      "backend": {
+        "label": "백엔드",
+        "values": {
+          "windows": "Windows 접근성 및 입력",
+          "macOs": "macOS 접근성 및 Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "테스트 백엔드"
+        }
+      },
+      "safety": {
+        "label": "안전성",
+        "values": {
+          "verifiedControl": "검증된 컨트롤",
+          "guardedFocusedControl": "보호된 포커스 컨트롤",
+          "unavailable": "사용 불가"
+        }
+      },
+      "insertionRoute": {
+        "label": "삽입 경로",
+        "values": {
+          "windowsUnicodeSendInput": "Windows Unicode 입력",
+          "macAxSelectedText": "macOS 접근성 선택 텍스트",
+          "macCgEventUnicode": "macOS Core Graphics Unicode 입력",
+          "atSpiEditableText": "AT-SPI 편집 가능 텍스트",
+          "linuxFocusedKeyboard": "Linux 포커스 키보드",
+          "test": "테스트 경로",
+          "none": "녹화 시작 시 선택됨"
+        }
+      },
+      "receiptConfidence": {
+        "label": "전달 확인",
+        "values": {
+          "verified": "검증됨",
+          "posted": "운영 체제로 전송됨"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "말하는 동안 입력",
+        "values": {
+          "observedInsertionsOnly": "감지된 삽입만",
+          "guardedKeyboardInsertionsOnly": "보호된 키보드 삽입만",
+          "unavailable": "사용 불가"
+        }
+      },
+      "submitSupport": {
+        "label": "자동 제출",
+        "values": {
+          "supported": "이 대상에서 지원됨",
+          "unsupported": "이 대상에서 지원되지 않음"
+        }
+      },
+      "applicationTarget": {
+        "label": "애플리케이션 대상",
+        "values": {
+          "none": "캡처된 대상 없음"
+        }
+      },
+      "status": {
+        "label": "최신 상태"
+      },
+      "reason": {
+        "label": "이유",
+        "values": {
+          "none": "보고된 문제 없음"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "접근성 권한",
+        "description": "macOS에서 포커스된 편집 가능 필드를 식별하고 안전한 삽입을 검증하는 데 필요합니다.",
+        "action": "접근성 권한 요청",
+        "help": "시스템 설정에서 Handy에 권한을 부여한 후 여기로 돌아와 다시 확인하세요."
+      },
+      "macInputMonitoring": {
+        "title": "입력 모니터링 권한",
+        "description": "macOS에서 실시간 출력 중 입력 및 안전하지 않은 편집을 감지하는 데 필요합니다.",
+        "action": "입력 모니터링 권한 요청",
+        "help": "시스템 설정에서 Handy에 권한을 부여한 후 여기로 돌아와 다시 확인하세요."
+      }
+    },
+    "statuses": {
+      "armed": "실시간 출력 준비 완료",
+      "streaming": "실시간 출력 전송 중",
+      "fallback": "일반 최종 출력 사용 중",
+      "invalidated": "안전을 위해 실시간 출력 중지됨",
+      "conflict": "최종 전사 충돌",
+      "completed": "실시간 출력 완료",
+      "cancelled": "실시간 출력 취소됨",
+      "faulted": "실시간 출력 실패"
+    },
+    "reasons": {
+      "disabled": "포커스된 필드 출력이 꺼져 있습니다.",
+      "experimentalFeaturesDisabled": "실험적 기능이 꺼져 있습니다.",
+      "modelDoesNotSupportStreaming": "선택한 모델은 실시간 스트리밍을 지원하지 않습니다.",
+      "postProcessingIncompatible": "후처리에는 일반 최종 출력이 필요합니다.",
+      "pasteMethodDisabled": "붙여넣기 설정에서 텍스트 삽입이 비활성화되어 있습니다.",
+      "externalScriptIncompatible": "외부 붙여넣기 스크립트는 실시간 출력과 함께 사용할 수 없습니다.",
+      "accessibilityPermissionMissing": "macOS 접근성 권한이 필요합니다.",
+      "inputMonitoringPermissionMissing": "macOS 입력 모니터링 권한이 필요합니다.",
+      "atSpiUnavailable": "AT-SPI 접근성 서비스를 사용할 수 없습니다.",
+      "typingToolUnavailable": "지원되는 포커스 키보드 입력 도구가 없습니다.",
+      "controlShortcutUnsupported": "실시간 출력에서 녹음 단축키를 안전하게 처리할 수 없습니다.",
+      "autoSubmitUnsupported": "이 대상에서는 자동 제출이 지원되지 않습니다.",
+      "secureInputActive": "보안 입력이 활성화되어 있어 실시간 출력을 시작할 수 없습니다.",
+      "secureField": "보안 또는 비밀번호 필드에서는 실시간 출력이 허용되지 않습니다.",
+      "handyOwnedTarget": "Handy 창을 실시간 출력 대상으로 지정할 수 없습니다.",
+      "noFocusedTarget": "포커스된 편집 가능 필드를 찾을 수 없습니다.",
+      "targetNotEditable": "포커스된 대상은 편집할 수 없습니다.",
+      "initialSelectionNotCollapsed": "실시간 출력을 시작하기 전에 선택을 해제하고 캐럿을 배치하세요.",
+      "targetUnsupported": "포커스된 필드가 실시간 출력에 필요한 안전 검사를 제공하지 않습니다.",
+      "targetChanged": "실시간 출력 중 포커스된 대상이 변경되었습니다.",
+      "physicalPointerActivity": "대상을 보호하기 위해 포인터 동작으로 실시간 출력이 중지되었습니다.",
+      "destructiveUserEdit": "삭제, 바꾸기, 붙여넣기 또는 기타 파괴적 편집으로 실시간 출력이 중지되었습니다.",
+      "caretMoved": "캐럿 이동으로 실시간 출력이 중지되었습니다.",
+      "selectionChanged": "선택 영역 변경으로 실시간 출력이 중지되었습니다.",
+      "unsafeKeyboardCommand": "대상을 변경할 수 있는 키보드 명령으로 실시간 출력이 중지되었습니다.",
+      "imeCompositionUnsupported": "실시간 출력 중에는 IME 조합을 안전하게 모니터링할 수 없습니다.",
+      "mixedInputUnavailable": "실시간 출력 중에는 이 필드의 입력을 안전하게 모니터링할 수 없습니다.",
+      "targetClosed": "대상 필드 또는 애플리케이션이 닫혔습니다.",
+      "monitorUnavailable": "더 이상 대상을 모니터링할 수 없습니다.",
+      "backendDisconnected": "시스템 접근성 백엔드의 연결이 끊겼습니다.",
+      "injectionDenied": "시스템이 실시간 텍스트 삽입을 거부했습니다.",
+      "injectionPartial": "실시간 텍스트 삽입의 일부만 검증되어 출력이 중지되었습니다.",
+      "injectionAmbiguous": "실시간 텍스트 삽입 결과를 확인할 수 없어 출력이 중지되었습니다.",
+      "injectionFailed": "실시간 텍스트 삽입에 실패하여 출력이 중지되었습니다.",
+      "receiptTimeout": "실시간 텍스트 삽입 확인 시간이 초과되었습니다.",
+      "finalConflict": "최종 전사가 이미 전달된 텍스트와 일치하지 않았습니다.",
+      "historyUnavailable": "최종 전사를 기록에 저장할 수 없습니다.",
+      "streamFailed": "녹음 중 실시간 전사에 실패했습니다.",
+      "cancelled": "녹음 또는 실시간 출력이 취소되었습니다.",
+      "platformUnsupported": "이 플랫폼에서는 포커스된 필드 출력이 지원되지 않습니다.",
+      "alreadyActive": "다른 실시간 출력 세션이 이미 활성화되어 있습니다."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "일반 최종 출력 사용 중",
+        "body": "이 녹음에서는 포커스된 필드 출력을 사용할 수 없습니다. 전사가 끝난 후 텍스트가 삽입됩니다."
+      },
+      "invalidated": {
+        "title": "안전을 위해 실시간 출력 중지됨",
+        "body": "대상을 더 이상 검증할 수 없습니다. 이미 전달된 텍스트는 변경하지 않았습니다."
+      },
+      "faulted": {
+        "title": "실시간 출력 중지됨",
+        "body": "최근 삽입을 확인할 수 없습니다. 이미 전달된 텍스트는 변경하지 않았습니다."
+      },
+      "conflict": {
+        "title": "최종 전사 충돌",
+        "body": "최종 전사가 이미 전달된 텍스트와 달랐으며, 기존 텍스트는 변경하지 않았습니다."
+      },
+      "history": {
+        "action": "기록 열기",
+        "unavailable": "이 전사를 기록에 저장할 수 없습니다."
+      }
+    },
+    "help": {
+      "runtimeChecks": "녹음이 시작되면 사용 가능 여부를 다시 확인합니다. 지원되는 플랫폼에서도 선택한 필드에 일반 최종 출력을 사용할 수 있습니다.",
+      "coediting": "같은 필드에 계속 입력할 수 있습니다. 삭제, 선택, 탐색, 명령, IME 조합, 포인터 동작 또는 대상 변경 시 실시간 출력이 중지됩니다.",
+      "guardedInputRace": "보호된 키보드 출력은 짧은 텍스트를 삽입할 때마다 필드를 검증하지만, 운영 체제가 입력을 처리하기 전에 포커스가 바뀔 수 있습니다.",
+      "guardedSubmitRace": "자동 제출은 단축키를 전송하기 직전에 확인하지만, 운영 체제가 단축키를 처리하기 전에 포커스가 바뀔 수 있습니다.",
+      "deliveredTextSafety": "실시간 출력이 중지되어도 Handy는 이미 전달한 텍스트를 삭제하거나 다시 쓰지 않습니다."
+    }
   }
 }

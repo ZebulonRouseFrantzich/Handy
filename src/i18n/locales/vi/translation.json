@@ -613,6 +613,20 @@
         "label": "Hiển thị điểm mới",
         "description": "Hiển thị ghi chú phát hành sau khi Handy cập nhật"
       }
+    },
+    "progressiveOutputDestination": {
+      "title": "Nơi xuất nội dung theo thời gian thực",
+      "description": "Chọn nơi hiển thị bản chép lời từng phần khi bạn nói. Cài đặt này chỉ áp dụng cho các mô hình hỗ trợ truyền phát.",
+      "options": {
+        "overlay": {
+          "label": "Lớp phủ",
+          "description": "Hiển thị bản chép lời trực tiếp trên lớp phủ của Handy mà không nhập vào ứng dụng khác."
+        },
+        "focusedField": {
+          "label": "Trường đang có tiêu điểm",
+          "description": "Nhập bản chép lời trực tiếp vào trường có thể chỉnh sửa đang có tiêu điểm sau khi kiểm tra an toàn. Các đích không được hỗ trợ hoặc không an toàn sẽ dùng đầu ra cuối thông thường."
+        }
+      }
     }
   },
   "footer": {
@@ -691,5 +705,179 @@
     "learnMore": "Cách khắc phục",
     "recorderBlocked": "Hiện không thể ghi phím tắt — Secure Input của macOS đang chặn các sự kiện phím. Hãy xử lý cảnh báo Secure Input trước.",
     "dismiss": "Bỏ qua"
+  },
+  "focusedOutput": {
+    "capability": {
+      "availability": {
+        "label": "Khả dụng",
+        "values": {
+          "available": "Có sẵn",
+          "unavailable": "Không có sẵn",
+          "targetCheckedAtStart": "Đích được kiểm tra khi bắt đầu ghi âm"
+        }
+      },
+      "backend": {
+        "label": "Hệ thống nền",
+        "values": {
+          "windows": "Khả năng truy cập và nhập liệu của Windows",
+          "macOs": "Trợ năng macOS và Core Graphics",
+          "linuxAtSpi": "Linux AT-SPI",
+          "test": "Hệ thống nền thử nghiệm"
+        }
+      },
+      "safety": {
+        "label": "An toàn",
+        "values": {
+          "verifiedControl": "Điều khiển đã xác minh",
+          "guardedFocusedControl": "Điều khiển có tiêu điểm được bảo vệ",
+          "unavailable": "Không có sẵn"
+        }
+      },
+      "insertionRoute": {
+        "label": "Phương thức chèn",
+        "values": {
+          "windowsUnicodeSendInput": "Nhập Unicode trên Windows",
+          "macAxSelectedText": "Văn bản được chọn qua Trợ năng macOS",
+          "macCgEventUnicode": "Nhập Unicode qua Core Graphics trên macOS",
+          "atSpiEditableText": "Văn bản có thể chỉnh sửa qua AT-SPI",
+          "linuxFocusedKeyboard": "Bàn phím có tiêu điểm trên Linux",
+          "test": "Phương thức thử nghiệm",
+          "none": "Được chọn khi bắt đầu ghi âm"
+        }
+      },
+      "receiptConfidence": {
+        "label": "Xác nhận chuyển nội dung",
+        "values": {
+          "verified": "Đã xác minh",
+          "posted": "Đã gửi đến hệ điều hành"
+        }
+      },
+      "mixedInputSupport": {
+        "label": "Nhập trong khi nói",
+        "values": {
+          "observedInsertionsOnly": "Chỉ nội dung chèn được theo dõi",
+          "guardedKeyboardInsertionsOnly": "Chỉ nội dung chèn bằng bàn phím được bảo vệ",
+          "unavailable": "Không có sẵn"
+        }
+      },
+      "submitSupport": {
+        "label": "Tự động gửi",
+        "values": {
+          "supported": "Được hỗ trợ cho đích này",
+          "unsupported": "Không được hỗ trợ cho đích này"
+        }
+      },
+      "applicationTarget": {
+        "label": "Ứng dụng đích",
+        "values": {
+          "none": "Chưa ghi nhận đích"
+        }
+      },
+      "status": {
+        "label": "Trạng thái mới nhất"
+      },
+      "reason": {
+        "label": "Lý do",
+        "values": {
+          "none": "Không có sự cố nào được báo cáo"
+        }
+      }
+    },
+    "permissions": {
+      "macAccessibility": {
+        "title": "Quyền Trợ năng",
+        "description": "Cần có trên macOS để xác định trường có thể chỉnh sửa đang có tiêu điểm và xác minh việc chèn an toàn.",
+        "action": "Yêu cầu quyền truy cập Trợ năng",
+        "help": "Cấp quyền truy cập cho Handy trong Cài đặt hệ thống, rồi quay lại đây để kiểm tra lại."
+      },
+      "macInputMonitoring": {
+        "title": "Quyền Giám sát đầu vào",
+        "description": "Cần có trên macOS để phát hiện thao tác nhập và các chỉnh sửa không an toàn khi đầu ra trực tiếp đang hoạt động.",
+        "action": "Yêu cầu quyền Giám sát đầu vào",
+        "help": "Cấp quyền truy cập cho Handy trong Cài đặt hệ thống, rồi quay lại đây để kiểm tra lại."
+      }
+    },
+    "statuses": {
+      "armed": "Sẵn sàng xuất trực tiếp",
+      "streaming": "Đang gửi đầu ra trực tiếp",
+      "fallback": "Đang dùng đầu ra cuối thông thường",
+      "invalidated": "Đã dừng đầu ra trực tiếp để đảm bảo an toàn",
+      "conflict": "Xung đột bản chép lời cuối",
+      "completed": "Đã hoàn tất đầu ra trực tiếp",
+      "cancelled": "Đã hủy đầu ra trực tiếp",
+      "faulted": "Đầu ra trực tiếp không thành công"
+    },
+    "reasons": {
+      "disabled": "Đầu ra vào Trường đang có tiêu điểm đã bị tắt.",
+      "experimentalFeaturesDisabled": "Các tính năng thử nghiệm đã bị tắt.",
+      "modelDoesNotSupportStreaming": "Mô hình đã chọn không hỗ trợ truyền phát trực tiếp.",
+      "postProcessingIncompatible": "Hậu xử lý yêu cầu đầu ra cuối thông thường.",
+      "pasteMethodDisabled": "Tính năng chèn văn bản đã bị tắt trong cài đặt dán.",
+      "externalScriptIncompatible": "Không thể dùng tập lệnh dán bên ngoài với đầu ra trực tiếp.",
+      "accessibilityPermissionMissing": "Cần có quyền Trợ năng trên macOS.",
+      "inputMonitoringPermissionMissing": "Cần có quyền Giám sát đầu vào trên macOS.",
+      "atSpiUnavailable": "Dịch vụ trợ năng AT-SPI không có sẵn.",
+      "typingToolUnavailable": "Không có công cụ nhập bằng bàn phím có tiêu điểm nào được hỗ trợ.",
+      "controlShortcutUnsupported": "Không thể xử lý phím tắt ghi âm một cách an toàn cho đầu ra trực tiếp.",
+      "autoSubmitUnsupported": "Tự động gửi không được hỗ trợ cho đích này.",
+      "secureInputActive": "Nhập liệu bảo mật đang hoạt động nên không thể bắt đầu đầu ra trực tiếp.",
+      "secureField": "Không cho phép đầu ra trực tiếp trong trường bảo mật hoặc trường mật khẩu.",
+      "handyOwnedTarget": "Không thể xuất trực tiếp vào cửa sổ Handy.",
+      "noFocusedTarget": "Không tìm thấy trường có thể chỉnh sửa đang có tiêu điểm.",
+      "targetNotEditable": "Đích đang có tiêu điểm không thể chỉnh sửa.",
+      "initialSelectionNotCollapsed": "Bỏ vùng chọn và đặt con trỏ trước khi bắt đầu đầu ra trực tiếp.",
+      "targetUnsupported": "Trường đang có tiêu điểm không cung cấp các bước kiểm tra an toàn cần thiết cho đầu ra trực tiếp.",
+      "targetChanged": "Đích đang có tiêu điểm đã thay đổi trong khi xuất trực tiếp.",
+      "physicalPointerActivity": "Hoạt động của con trỏ đã dừng đầu ra trực tiếp để bảo vệ đích.",
+      "destructiveUserEdit": "Thao tác xóa, thay thế, dán hoặc chỉnh sửa phá hủy khác đã dừng đầu ra trực tiếp.",
+      "caretMoved": "Việc di chuyển con trỏ soạn thảo đã dừng đầu ra trực tiếp.",
+      "selectionChanged": "Việc thay đổi vùng chọn đã dừng đầu ra trực tiếp.",
+      "unsafeKeyboardCommand": "Một lệnh bàn phím có thể làm thay đổi đích đã dừng đầu ra trực tiếp.",
+      "imeCompositionUnsupported": "Không thể giám sát an toàn quá trình soạn thảo IME trong khi xuất trực tiếp.",
+      "mixedInputUnavailable": "Không thể giám sát an toàn thao tác nhập trong trường này khi đang xuất trực tiếp.",
+      "targetClosed": "Trường hoặc ứng dụng đích đã bị đóng.",
+      "monitorUnavailable": "Tính năng giám sát đích không còn khả dụng.",
+      "backendDisconnected": "Hệ thống nền trợ năng của hệ thống đã ngắt kết nối.",
+      "injectionDenied": "Hệ thống đã từ chối việc chèn văn bản trực tiếp.",
+      "injectionPartial": "Chỉ xác minh được một phần nội dung chèn trực tiếp nên đầu ra đã dừng.",
+      "injectionAmbiguous": "Không thể xác nhận kết quả chèn văn bản trực tiếp nên đầu ra đã dừng.",
+      "injectionFailed": "Không chèn được văn bản trực tiếp nên đầu ra đã dừng.",
+      "receiptTimeout": "Đã hết thời gian chờ xác nhận việc chèn văn bản trực tiếp.",
+      "finalConflict": "Bản chép lời cuối không khớp với văn bản đã chuyển.",
+      "historyUnavailable": "Không thể lưu bản chép lời cuối vào Lịch sử.",
+      "streamFailed": "Chép lời trực tiếp không thành công trong khi ghi âm.",
+      "cancelled": "Đã hủy ghi âm hoặc đầu ra trực tiếp.",
+      "platformUnsupported": "Đầu ra vào Trường đang có tiêu điểm không được hỗ trợ trên nền tảng này.",
+      "alreadyActive": "Một phiên đầu ra trực tiếp khác đang hoạt động."
+    },
+    "notifications": {
+      "fallback": {
+        "title": "Đang dùng đầu ra cuối thông thường",
+        "body": "Đầu ra vào Trường đang có tiêu điểm không khả dụng cho bản ghi này. Văn bản sẽ được chèn sau khi chép lời xong."
+      },
+      "invalidated": {
+        "title": "Đã dừng đầu ra trực tiếp để đảm bảo an toàn",
+        "body": "Không thể tiếp tục xác minh đích. Văn bản đã chuyển được giữ nguyên."
+      },
+      "faulted": {
+        "title": "Đã dừng đầu ra trực tiếp",
+        "body": "Không thể xác nhận lần chèn gần nhất. Văn bản đã chuyển được giữ nguyên."
+      },
+      "conflict": {
+        "title": "Xung đột bản chép lời cuối",
+        "body": "Bản chép lời cuối khác với văn bản đã chuyển; văn bản đó được giữ nguyên."
+      },
+      "history": {
+        "action": "Mở Lịch sử",
+        "unavailable": "Không thể lưu bản chép lời này vào Lịch sử."
+      }
+    },
+    "help": {
+      "runtimeChecks": "Tính khả dụng được kiểm tra lại khi bắt đầu ghi âm. Nền tảng được hỗ trợ vẫn có thể dùng đầu ra cuối thông thường cho trường đã chọn.",
+      "coediting": "Bạn có thể tiếp tục nhập trong cùng trường. Thao tác xóa, chọn, điều hướng, dùng lệnh, soạn thảo IME, hoạt động con trỏ hoặc thay đổi đích sẽ dừng đầu ra trực tiếp.",
+      "guardedInputRace": "Đầu ra bàn phím được bảo vệ sẽ xác minh trường trước mỗi lần chèn nhỏ, nhưng tiêu điểm vẫn có thể thay đổi trước khi hệ điều hành xử lý nội dung đó.",
+      "guardedSubmitRace": "Tự động gửi được kiểm tra ngay trước khi phím tắt được gửi đi, nhưng tiêu điểm vẫn có thể thay đổi trước khi hệ điều hành xử lý phím tắt đó.",
+      "deliveredTextSafety": "Khi đầu ra trực tiếp dừng, Handy không bao giờ xóa hoặc viết lại văn bản đã chuyển."
+    }
   }
 }
