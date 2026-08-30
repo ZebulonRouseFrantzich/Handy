@@ -217,6 +217,7 @@
               cargo
               rust-analyzer
               clippy
+              rustfmt
               # Frontend
               nodejs
               bun

@@ -8,6 +8,7 @@ mod catalog;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod focused_output;
 mod helpers;
 mod input;
 mod llm_client;
