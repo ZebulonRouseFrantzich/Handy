@@ -132,6 +132,14 @@ pub enum OverlayStyle {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum ProgressiveOutputDestination {
+    #[default]
+    Overlay,
+    FocusedField,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelUnloadTimeout {
     Never,
     Immediately,
@@ -447,6 +455,8 @@ pub struct AppSettings {
     pub experimental_enabled: bool,
     #[serde(default)]
     pub lazy_stream_close: bool,
+    #[serde(default)]
+    pub progressive_output_destination: ProgressiveOutputDestination,
     #[serde(default)]
     pub keyboard_implementation: KeyboardImplementation,
     #[serde(default = "default_show_tray_icon")]
@@ -931,6 +941,7 @@ pub fn get_default_settings() -> AppSettings {
         theme: default_theme(),
         experimental_enabled: false,
         lazy_stream_close: false,
+        progressive_output_destination: ProgressiveOutputDestination::default(),
         keyboard_implementation: KeyboardImplementation::default(),
         show_tray_icon: default_show_tray_icon(),
         paste_delay_ms: default_paste_delay_ms(),
@@ -1202,6 +1213,50 @@ mod tests {
         assert!(settings.filler_word_removal_enabled);
         // Bindings default to empty; the load path merges the real defaults in.
         assert!(settings.bindings.is_empty());
+        assert_eq!(
+            settings.progressive_output_destination,
+            ProgressiveOutputDestination::Overlay
+        );
+    }
+
+    #[test]
+    fn progressive_output_destination_is_backward_compatible_and_strict() {
+        let missing: AppSettings =
+            serde_json::from_value(serde_json::json!({ "experimental_enabled": true })).unwrap();
+        assert_eq!(
+            missing.progressive_output_destination,
+            ProgressiveOutputDestination::Overlay
+        );
+        assert_eq!(
+            missing.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
+
+        let focused: AppSettings = serde_json::from_value(serde_json::json!({
+            "progressive_output_destination": "focused_field"
+        }))
+        .unwrap();
+        assert_eq!(
+            focused.progressive_output_destination,
+            ProgressiveOutputDestination::FocusedField
+        );
+        assert_eq!(
+            serde_json::to_value(focused.progressive_output_destination).unwrap(),
+            serde_json::json!("focused_field")
+        );
+
+        for invalid in [
+            "focusedField",
+            "FocusedField",
+            "focused-field",
+            "focused_field ",
+        ] {
+            assert!(
+                serde_json::from_value::<ProgressiveOutputDestination>(serde_json::json!(invalid))
+                    .is_err(),
+                "{invalid:?} must not be accepted"
+            );
+        }
     }
 
     /// Frozen snapshot of a real v0.9.0-era settings store, as written to
@@ -1333,6 +1388,10 @@ mod tests {
             TranscribeAcceleratorSetting::Auto
         );
         assert_eq!(settings.transcribe_gpu_device, None);
+        assert_eq!(
+            settings.progressive_output_destination,
+            ProgressiveOutputDestination::Overlay
+        );
     }
 
     #[test]
@@ -1374,6 +1433,25 @@ mod tests {
         assert_eq!(salvaged.paste_delay_ms, default_paste_delay_ms());
         assert_eq!(salvaged.sound_theme, default_sound_theme());
         assert_eq!(salvaged.custom_words, vec!["handy".to_string()]);
+    }
+
+    #[test]
+    fn salvage_invalid_progressive_destination_preserves_other_fields() {
+        let mut stored = default_settings_json();
+        stored["progressive_output_destination"] = serde_json::json!("focusedField");
+        stored["selected_model"] = serde_json::json!("kept-model");
+
+        assert!(serde_json::from_value::<AppSettings>(stored.clone()).is_err());
+        let salvaged = salvage_settings(&stored);
+        assert_eq!(
+            salvaged.progressive_output_destination,
+            ProgressiveOutputDestination::Overlay
+        );
+        assert_eq!(salvaged.selected_model, "kept-model");
+        assert_eq!(
+            salvaged.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
     }
 
     #[test]

@@ -17,6 +17,18 @@ const CONTROL_QUEUE_CAPACITY: usize = 4;
 const MAX_INSERTION_SCALARS: usize = 16;
 const MANAGER_WAIT: Duration = Duration::from_secs(2);
 
+/// Tauri-free destination for content-free lifecycle transitions.
+pub trait FocusedOutputStatusSink: Send + Sync {
+    fn publish(&self, event: &FocusedOutputStatusEvent);
+}
+
+#[derive(Default)]
+pub struct NoopFocusedOutputStatusSink;
+
+impl FocusedOutputStatusSink for NoopFocusedOutputStatusSink {
+    fn publish(&self, _event: &FocusedOutputStatusEvent) {}
+}
+
 struct SessionEventEnvelope {
     session_id: DictationSessionId,
     event: TargetInteractionEvent,
@@ -35,6 +47,10 @@ enum ControlMessage {
         barrier_revision: Option<u64>,
         options: FinalizeOptions,
         response: Sender<FinalDeliveryDisposition>,
+    },
+    FinishNoText {
+        session_id: DictationSessionId,
+        response: Sender<()>,
     },
     Shutdown {
         response: Sender<()>,
@@ -207,15 +223,25 @@ struct ManagerState {
     plan: Option<OutputPlan>,
     beginning: Option<DictationSessionId>,
     latest_status: Option<FocusedOutputStatusEvent>,
+    status_sink: Arc<dyn FocusedOutputStatusSink>,
 }
 
 impl ManagerState {
-    fn new() -> Self {
+    fn new(status_sink: Arc<dyn FocusedOutputStatusSink>) -> Self {
         Self {
             plan: None,
             beginning: None,
             latest_status: None,
+            status_sink,
         }
+    }
+
+    fn set_status(&mut self, event: FocusedOutputStatusEvent) {
+        if self.latest_status.as_ref() == Some(&event) {
+            return;
+        }
+        self.status_sink.publish(&event);
+        self.latest_status = Some(event);
     }
 }
 
@@ -239,12 +265,19 @@ pub struct FocusedOutputManager {
 
 impl FocusedOutputManager {
     pub fn new(backend: Arc<dyn FocusedFieldBackend>) -> Arc<Self> {
+        Self::new_with_status_sink(backend, Arc::new(NoopFocusedOutputStatusSink))
+    }
+
+    pub fn new_with_status_sink(
+        backend: Arc<dyn FocusedFieldBackend>,
+        status_sink: Arc<dyn FocusedOutputStatusSink>,
+    ) -> Arc<Self> {
         let (event_tx, event_rx) = bounded(EVENT_QUEUE_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = bounded(LIFECYCLE_QUEUE_CAPACITY);
         let (terminal_tx, terminal_rx) = bounded(TERMINAL_QUEUE_CAPACITY);
         let (wake_tx, wake_rx) = bounded(1);
         let (control_tx, control_rx) = bounded(CONTROL_QUEUE_CAPACITY);
-        let state = Arc::new(Mutex::new(ManagerState::new()));
+        let state = Arc::new(Mutex::new(ManagerState::new(status_sink)));
         let latest_snapshot = Arc::new(Mutex::new(None));
         let active_session = Arc::new(AtomicU64::new(0));
         let active_cancellation = Arc::new(Mutex::new(None));
@@ -317,7 +350,7 @@ impl FocusedOutputManager {
             session_id,
             authority: FallbackAuthority::new(),
         });
-        state.latest_status = Some(FocusedOutputStatusEvent {
+        state.set_status(FocusedOutputStatusEvent {
             session_id,
             status: FocusedOutputStatus::Fallback,
             reason: None,
@@ -338,13 +371,22 @@ impl FocusedOutputManager {
         }
         let session_id = context.session_id;
         let auto_submit_requested = context.auto_submit_requested;
-        {
+        let upgrading_fallback = {
             let mut state = lock_recover(&self.state);
-            if state.plan.is_some() || state.beginning.is_some() {
+            if state.beginning.is_some() {
                 return Err(FocusedOutputReasonCode::AlreadyActive);
             }
+            let upgrading = match state.plan.as_ref() {
+                None => false,
+                Some(OutputPlan::Fallback {
+                    session_id: fallback_id,
+                    ..
+                }) if *fallback_id == session_id => true,
+                Some(_) => return Err(FocusedOutputReasonCode::AlreadyActive),
+            };
             state.beginning = Some(session_id);
-        }
+            upgrading
+        };
         self.active_session
             .store(session_id.get(), Ordering::Release);
         let cancellation = SessionCancellation::default();
@@ -364,6 +406,12 @@ impl FocusedOutputManager {
         } = match result {
             Ok(session) => session,
             Err(reason) => {
+                if cancellation.is_cancelled()
+                    || self.active_session.load(Ordering::Acquire) != session_id.get()
+                {
+                    self.clear_cancelled_begin(session_id);
+                    return Err(FocusedOutputReasonCode::Cancelled);
+                }
                 self.clear_failed_begin(session_id, reason);
                 return Err(reason);
             }
@@ -372,22 +420,7 @@ impl FocusedOutputManager {
             || self.active_session.load(Ordering::Acquire) != session_id.get()
         {
             session.close();
-            let mut state = lock_recover(&self.state);
-            if state.beginning == Some(session_id) {
-                state.beginning = None;
-                state.latest_status = Some(FocusedOutputStatusEvent {
-                    session_id,
-                    status: FocusedOutputStatus::Cancelled,
-                    reason: Some(FocusedOutputReasonCode::Cancelled),
-                    capability: None,
-                    target_application: None,
-                    speech_delivered_chars: 0,
-                    external_edit_epoch: 0,
-                    history_available: false,
-                });
-            }
-            drop(state);
-            self.clear_active_identity(session_id);
+            self.clear_cancelled_begin(session_id);
             return Err(FocusedOutputReasonCode::Cancelled);
         }
         if receipt.session_id() != session_id || !receipt.capability().is_resolved() {
@@ -408,9 +441,23 @@ impl FocusedOutputManager {
         }
 
         let mut state = lock_recover(&self.state);
-        if state.beginning != Some(session_id) || state.plan.is_some() {
+        let plan_is_expected = if upgrading_fallback {
+            matches!(
+                state.plan.as_ref(),
+                Some(OutputPlan::Fallback {
+                    session_id: fallback_id,
+                    ..
+                }) if *fallback_id == session_id
+            )
+        } else {
+            state.plan.is_none()
+        };
+        if state.beginning != Some(session_id) || !plan_is_expected {
             session.close();
-            state.beginning = None;
+            if state.beginning == Some(session_id) {
+                state.beginning = None;
+            }
+            drop(state);
             self.clear_active_identity(session_id);
             return Err(FocusedOutputReasonCode::AlreadyActive);
         }
@@ -422,28 +469,77 @@ impl FocusedOutputManager {
             target_application,
             cancellation,
         );
-        state.latest_status = Some(armed.status(FocusedOutputStatus::Armed, false));
+        state.set_status(armed.status(FocusedOutputStatus::Armed, false));
         state.plan = Some(OutputPlan::Armed(armed));
         Ok(receipt)
     }
 
-    fn clear_failed_begin(&self, session_id: DictationSessionId, reason: FocusedOutputReasonCode) {
+    fn clear_cancelled_begin(&self, session_id: DictationSessionId) {
         let mut state = lock_recover(&self.state);
         if state.beginning == Some(session_id) {
             state.beginning = None;
-            state.latest_status = Some(FocusedOutputStatusEvent {
-                session_id,
-                status: FocusedOutputStatus::Fallback,
-                reason: Some(reason),
-                capability: None,
-                target_application: None,
-                speech_delivered_chars: 0,
-                external_edit_epoch: 0,
-                history_available: false,
-            });
         }
+        if matches!(
+            state.plan.as_ref(),
+            Some(OutputPlan::Fallback {
+                session_id: fallback_id,
+                ..
+            }) if *fallback_id == session_id
+        ) {
+            state.plan = None;
+        }
+        state.set_status(FocusedOutputStatusEvent {
+            session_id,
+            status: FocusedOutputStatus::Cancelled,
+            reason: Some(FocusedOutputReasonCode::Cancelled),
+            capability: None,
+            target_application: None,
+            speech_delivered_chars: 0,
+            external_edit_epoch: 0,
+            history_available: false,
+        });
         drop(state);
         self.clear_active_identity(session_id);
+    }
+
+    fn clear_failed_begin(&self, session_id: DictationSessionId, reason: FocusedOutputReasonCode) {
+        let retained_fallback = {
+            let mut state = lock_recover(&self.state);
+            if state.beginning != Some(session_id) {
+                false
+            } else {
+                state.beginning = None;
+                let retained = matches!(
+                    state.plan.as_ref(),
+                    Some(OutputPlan::Fallback {
+                        session_id: fallback_id,
+                        ..
+                    }) if *fallback_id == session_id
+                );
+                state.set_status(FocusedOutputStatusEvent {
+                    session_id,
+                    status: FocusedOutputStatus::Fallback,
+                    reason: Some(reason),
+                    capability: None,
+                    target_application: None,
+                    speech_delivered_chars: 0,
+                    external_edit_epoch: 0,
+                    history_available: false,
+                });
+                retained
+            }
+        };
+
+        if retained_fallback {
+            let mut active = lock_recover(&self.active_cancellation);
+            if active.as_ref().is_some_and(|(id, _)| *id == session_id) {
+                *active = None;
+            }
+            self.active_session
+                .store(session_id.get(), Ordering::Release);
+        } else {
+            self.clear_active_identity(session_id);
+        }
     }
 
     fn clear_active_identity(&self, session_id: DictationSessionId) {
@@ -462,6 +558,42 @@ impl FocusedOutputManager {
     pub fn active_session_id(&self) -> Option<DictationSessionId> {
         let id = self.active_session.load(Ordering::Acquire);
         (id != 0).then_some(DictationSessionId(id))
+    }
+
+    pub fn active_plan(&self) -> Option<ActivePlan> {
+        let state = lock_recover(&self.state);
+        state.plan.as_ref().map(|plan| ActivePlan {
+            session_id: plan.session_id(),
+            kind: match plan {
+                OutputPlan::Fallback { .. } => OutputPlanKind::Fallback,
+                OutputPlan::Armed(_) => OutputPlanKind::Focused,
+            },
+        })
+    }
+
+    /// Completes an exact active session without granting legacy paste authority.
+    ///
+    /// Processing runs on the manager worker so any already-published terminal
+    /// transition wins before the plan is consumed.
+    pub fn finish_no_text(&self, session_id: DictationSessionId) {
+        if self.active_session.load(Ordering::Acquire) != session_id.get() {
+            return;
+        }
+        self.cancel_token_if_active(session_id);
+        let (response_tx, response_rx) = bounded(1);
+        if self
+            .control_tx
+            .send_timeout(
+                ControlMessage::FinishNoText {
+                    session_id,
+                    response: response_tx,
+                },
+                MANAGER_WAIT,
+            )
+            .is_ok()
+        {
+            let _ = response_rx.recv_timeout(MANAGER_WAIT);
+        }
     }
 
     /// Lossy, nonblocking publication. A different session replaces the slot;
@@ -587,8 +719,9 @@ impl FocusedOutputManager {
         if state.plan.is_some() || state.beginning.is_some() {
             return Err(FocusedOutputReasonCode::AlreadyActive);
         }
+        let result = self.backend.request_permission(permission);
         drop(state);
-        self.backend.request_permission(permission)
+        result
     }
 
     pub fn latest_status(&self) -> Option<FocusedOutputStatusEvent> {
@@ -665,6 +798,14 @@ fn worker_loop(
                     clear_worker_identity(session_id, &active_session, &active_cancellation);
                     let _ = response.try_send(disposition);
                 }
+                Ok(ControlMessage::FinishNoText { session_id, response }) => {
+                    drain_terminals(&state, &terminal_rx);
+                    drain_lifecycle(&state, &lifecycle_rx);
+                    drain_events(&state, &event_rx, &overflow_session);
+                    finish_no_text_plan(&state, session_id);
+                    clear_worker_identity(session_id, &active_session, &active_cancellation);
+                    let _ = response.try_send(());
+                }
                 Ok(ControlMessage::Shutdown { response }) => {
                     close_active_plan(&state);
                     if let Ok(mut latest) = latest_snapshot.lock() {
@@ -724,8 +865,8 @@ fn drain_lifecycle(state: &Mutex<ManagerState>, receiver: &Receiver<StreamLifecy
             0..=3 => None,
             _ => unreachable!(),
         };
-        if latest.is_some() {
-            state.latest_status = latest;
+        if let Some(event) = latest {
+            state.set_status(event);
         }
     }
 }
@@ -754,9 +895,12 @@ fn drain_events(
                     continue;
                 }
                 apply_interaction(armed, envelope.event);
-                if let Some(reason) = armed.terminal_reason {
+                let latest = armed.terminal_reason.map(|reason| {
                     let status = status_for_terminal(reason);
-                    state.latest_status = Some(armed.status(status, false));
+                    armed.status(status, false)
+                });
+                if let Some(event) = latest {
+                    state.set_status(event);
                 }
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -839,7 +983,8 @@ fn process_latest_snapshot(
         .terminal_reason
         .map(status_for_terminal)
         .unwrap_or(FocusedOutputStatus::Streaming);
-    state.latest_status = Some(armed.status(status, false));
+    let event = armed.status(status, false);
+    state.set_status(event);
 }
 
 fn process_snapshot(armed: &mut ArmedSession, snapshot: &TranscriptSnapshot) {
@@ -986,6 +1131,60 @@ fn weakest_receipt(left: ReceiptConfidence, right: ReceiptConfidence) -> Receipt
         ReceiptConfidence::Verified
     }
 }
+fn finish_no_text_plan(state: &Mutex<ManagerState>, session_id: DictationSessionId) {
+    let mut state = lock_recover(state);
+    let matching_begin = state.beginning == Some(session_id);
+    if matching_begin {
+        state.beginning = None;
+    }
+    if !matching_begin
+        && state
+            .plan
+            .as_ref()
+            .is_none_or(|plan| plan.session_id() != session_id)
+    {
+        return;
+    }
+
+    let event = match state.plan.take() {
+        Some(OutputPlan::Armed(mut armed)) if armed.session_id == session_id => {
+            let status = armed
+                .terminal_reason
+                .map(status_for_terminal)
+                .unwrap_or(FocusedOutputStatus::Completed);
+            armed.close();
+            armed.status(status, false)
+        }
+        Some(OutputPlan::Fallback {
+            session_id: fallback_id,
+            ..
+        }) if fallback_id == session_id => FocusedOutputStatusEvent {
+            session_id,
+            status: FocusedOutputStatus::Completed,
+            reason: None,
+            capability: None,
+            target_application: None,
+            speech_delivered_chars: 0,
+            external_edit_epoch: 0,
+            history_available: false,
+        },
+        Some(other) => {
+            state.plan = Some(other);
+            return;
+        }
+        None => FocusedOutputStatusEvent {
+            session_id,
+            status: FocusedOutputStatus::Completed,
+            reason: None,
+            capability: None,
+            target_application: None,
+            speech_delivered_chars: 0,
+            external_edit_epoch: 0,
+            history_available: false,
+        },
+    };
+    state.set_status(event);
+}
 
 fn outcome_reason(outcome: InsertOutcome) -> Option<FocusedOutputReasonCode> {
     match outcome {
@@ -1017,7 +1216,7 @@ fn finalize_plan(
     match plan {
         OutputPlan::Fallback { authority, .. } => {
             let mut state = lock_recover(state);
-            state.latest_status = Some(FocusedOutputStatusEvent {
+            state.set_status(FocusedOutputStatusEvent {
                 session_id,
                 status: FocusedOutputStatus::Completed,
                 reason: None,
@@ -1049,8 +1248,9 @@ fn finalize_plan(
                 ) => status_for_terminal(reason),
                 FinalDeliveryDisposition::LegacyPaste(_) => unreachable!(),
             };
+            let event = armed.status(status, options.history_available);
             let mut state = lock_recover(state);
-            state.latest_status = Some(armed.status(status, options.history_available));
+            state.set_status(event);
             disposition
         }
     }
@@ -1184,16 +1384,20 @@ fn apply_terminal(
     reason: TerminalReason,
 ) {
     let mut state = lock_recover(state);
-    let fallback_cancel = matches!(
-        state.plan.as_ref(),
-        Some(OutputPlan::Fallback {
-            session_id: active,
-            ..
-        }) if *active == session_id && reason == TerminalReason::Cancelled
-    );
+    let fallback_cancel = reason == TerminalReason::Cancelled
+        && matches!(
+            state.plan.as_ref(),
+            Some(OutputPlan::Fallback {
+                session_id: active,
+                ..
+            }) if *active == session_id
+        );
     if fallback_cancel {
+        if state.beginning == Some(session_id) {
+            state.beginning = None;
+        }
         state.plan = None;
-        state.latest_status = Some(FocusedOutputStatusEvent {
+        state.set_status(FocusedOutputStatusEvent {
             session_id,
             status: FocusedOutputStatus::Cancelled,
             reason: Some(FocusedOutputReasonCode::Cancelled),
@@ -1213,7 +1417,8 @@ fn apply_terminal(
     }
     armed.set_terminal(reason, reason_code(reason));
     let retained = armed.terminal_reason.unwrap_or(reason);
-    state.latest_status = Some(armed.status(status_for_terminal(retained), false));
+    let event = armed.status(status_for_terminal(retained), false);
+    state.set_status(event);
 }
 
 fn interaction_reason_code(event: TargetInteractionEvent) -> Option<FocusedOutputReasonCode> {
@@ -1308,7 +1513,9 @@ fn should_replace_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::focused_output::platform::conformance::{posted_capability, FakeBackend};
     use crate::settings::{AutoSubmitKey, ClipboardHandling};
+    use std::sync::Mutex;
 
     struct UnavailableBackend;
 
@@ -1336,6 +1543,44 @@ mod tests {
         fn shutdown(&self) {}
     }
 
+    struct CancellingBackend;
+
+    impl FocusedFieldBackend for CancellingBackend {
+        fn global_capability(&self) -> FocusedOutputCapability {
+            FocusedOutputCapability::global_ready(FocusedOutputBackend::Test)
+        }
+
+        fn request_permission(
+            &self,
+            _permission: FocusedOutputPermission,
+        ) -> Result<FocusedOutputCapability, FocusedOutputReasonCode> {
+            Ok(self.global_capability())
+        }
+
+        fn begin(
+            &self,
+            _context: BeginContext,
+            _event_sink: Arc<dyn SessionEventSink>,
+            cancellation: SessionCancellation,
+        ) -> Result<BeginSession, FocusedOutputReasonCode> {
+            cancellation.cancel();
+            Err(FocusedOutputReasonCode::Cancelled)
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingStatusSink {
+        events: Mutex<Vec<FocusedOutputStatusEvent>>,
+    }
+
+    impl FocusedOutputStatusSink for RecordingStatusSink {
+        fn publish(&self, event: &FocusedOutputStatusEvent) {
+            lock_recover(&self.events).push(event.clone());
+        }
+    }
+
     fn options() -> FinalizeOptions {
         FinalizeOptions {
             append_trailing_space: false,
@@ -1343,6 +1588,16 @@ mod tests {
             auto_submit: false,
             auto_submit_key: AutoSubmitKey::Enter,
             history_available: true,
+        }
+    }
+
+    fn context(session_id: DictationSessionId) -> BeginContext {
+        BeginContext {
+            session_id,
+            control_shortcut: None,
+            auto_submit_requested: false,
+            #[cfg(target_os = "linux")]
+            typing_tool: crate::settings::TypingTool::Auto,
         }
     }
 
@@ -1395,11 +1650,11 @@ mod tests {
         manager.register_fallback(session_id).unwrap();
 
         assert!(matches!(
-            manager.finalize(session_id, "private final text".to_owned(), None, options(),),
+            manager.finalize(session_id, "private final text".to_owned(), None, options()),
             FinalDeliveryDisposition::LegacyPaste(_)
         ));
         assert!(matches!(
-            manager.finalize(session_id, "private final text".to_owned(), None, options(),),
+            manager.finalize(session_id, "private final text".to_owned(), None, options()),
             FinalDeliveryDisposition::NoText
         ));
         manager.shutdown();
@@ -1413,12 +1668,199 @@ mod tests {
         manager.cancel(session_id);
 
         assert!(matches!(
-            manager.finalize(session_id, "private final text".to_owned(), None, options(),),
+            manager.finalize(session_id, "private final text".to_owned(), None, options()),
             FinalDeliveryDisposition::NoText
         ));
         manager.shutdown();
     }
+
+    #[test]
+    fn matching_fallback_is_atomically_upgraded_to_focused() {
+        let backend = FakeBackend::new(posted_capability(false));
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+
+        manager.begin(context(session_id)).unwrap();
+        assert_eq!(
+            manager.active_plan(),
+            Some(ActivePlan {
+                session_id,
+                kind: OutputPlanKind::Focused,
+            })
+        );
+        assert!(!matches!(
+            manager.finalize(session_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::LegacyPaste(_)
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn fallback_upgrade_rejects_a_mismatched_session() {
+        let manager = FocusedOutputManager::new(Arc::new(UnavailableBackend));
+        let fallback_id = manager.allocate_session_id();
+        let other_id = manager.allocate_session_id();
+        manager.register_fallback(fallback_id).unwrap();
+
+        assert!(matches!(
+            manager.begin(context(other_id)),
+            Err(FocusedOutputReasonCode::AlreadyActive)
+        ));
+        assert!(matches!(
+            manager.finalize(fallback_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::LegacyPaste(_)
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn pre_arm_failure_retains_fallback_authority() {
+        let manager = FocusedOutputManager::new(Arc::new(UnavailableBackend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+
+        assert!(matches!(
+            manager.begin(context(session_id)),
+            Err(FocusedOutputReasonCode::TargetUnsupported)
+        ));
+        assert_eq!(
+            manager.active_plan(),
+            Some(ActivePlan {
+                session_id,
+                kind: OutputPlanKind::Fallback,
+            })
+        );
+        assert!(matches!(
+            manager.finalize(session_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::LegacyPaste(_)
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn cancellation_during_begin_consumes_fallback_and_never_rearms() {
+        let manager = FocusedOutputManager::new(Arc::new(CancellingBackend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+
+        assert!(matches!(
+            manager.begin(context(session_id)),
+            Err(FocusedOutputReasonCode::Cancelled)
+        ));
+        assert_eq!(manager.active_plan(), None);
+        assert_eq!(manager.active_session_id(), None);
+        assert!(matches!(
+            manager.finalize(session_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::NoText
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn post_arm_failure_cannot_recover_legacy_paste_authority() {
+        let backend = FakeBackend::new(posted_capability(false));
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+        manager.begin(context(session_id)).unwrap();
+
+        manager.terminate(session_id, TerminalReason::StreamFailed);
+        assert!(matches!(
+            manager.finalize(session_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::Focused(_) | FinalDeliveryDisposition::NoText
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn armed_cancel_keeps_an_earlier_unsafe_terminal_and_preserves_partial() {
+        let backend = FakeBackend::new(posted_capability(false));
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+        manager.begin(context(session_id)).unwrap();
+
+        manager.terminate(session_id, TerminalReason::UnsafeUserEdit);
+        manager.cancel(session_id);
+        assert!(matches!(
+            manager.finalize(session_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::UnsafeUserEdit,
+                ..
+            })
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn status_sink_receives_fallback_armed_streaming_and_final_transitions() {
+        let backend = FakeBackend::new(posted_capability(false));
+        let sink = Arc::new(RecordingStatusSink::default());
+        let manager = FocusedOutputManager::new_with_status_sink(Arc::new(backend), sink.clone());
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+        manager.begin(context(session_id)).unwrap();
+        manager
+            .publish_lifecycle(StreamLifecycleEvent::Started {
+                session_id,
+                worker_token: 1,
+            })
+            .unwrap();
+        let _ = manager.finalize(session_id, String::new(), None, options());
+
+        let statuses = lock_recover(&sink.events)
+            .iter()
+            .map(|event| event.status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                FocusedOutputStatus::Fallback,
+                FocusedOutputStatus::Armed,
+                FocusedOutputStatus::Streaming,
+                FocusedOutputStatus::Completed,
+            ]
+        );
+        manager.shutdown();
+    }
+
+    #[test]
+    fn status_sink_delivers_content_free_terminal_transition_before_cleanup() {
+        let backend = FakeBackend::new(posted_capability(false));
+        let sink = Arc::new(RecordingStatusSink::default());
+        let manager = FocusedOutputManager::new_with_status_sink(Arc::new(backend), sink.clone());
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+        manager.begin(context(session_id)).unwrap();
+
+        manager.terminate(session_id, TerminalReason::StreamFailed);
+        manager.finish_no_text(session_id);
+
+        let event = lock_recover(&sink.events).last().cloned().unwrap();
+        assert_eq!(event.status, FocusedOutputStatus::Faulted);
+        assert_eq!(event.reason, Some(FocusedOutputReasonCode::StreamFailed));
+        assert_eq!(event.capability, None);
+        assert_eq!(event.target_application, None);
+        assert_eq!(manager.active_plan(), None);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn permission_request_is_rejected_while_any_plan_is_active() {
+        let manager = FocusedOutputManager::new(Arc::new(UnavailableBackend));
+        let session_id = manager.allocate_session_id();
+        manager.register_fallback(session_id).unwrap();
+
+        assert_eq!(
+            manager.request_permission(FocusedOutputPermission::MacAccessibility),
+            Err(FocusedOutputReasonCode::AlreadyActive)
+        );
+        manager.finish_no_text(session_id);
+        manager.shutdown();
+    }
 }
+
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

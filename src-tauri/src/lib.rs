@@ -32,7 +32,10 @@ use specta_typescript::{BigIntExportBehavior, Typescript};
 use tauri_specta::{collect_commands, collect_events, Builder};
 
 use env_filter::Builder as EnvFilterBuilder;
-use focused_output::NoopStreamTranscriptObserver;
+use focused_output::{
+    FocusedOutputManager, FocusedOutputPublisher, NoopStreamTranscriptObserver,
+    TauriFocusedOutputStatusSink,
+};
 use managers::audio::AudioRecordingManager;
 use managers::history::HistoryManager;
 use managers::model::ModelManager;
@@ -148,11 +151,40 @@ fn should_force_show_permissions_window(app: &AppHandle) -> bool {
     false
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusedOutputConstruction {
+    GuiNative,
+    HeadlessNoop,
+}
+
+fn focused_output_construction(headless: bool) -> FocusedOutputConstruction {
+    if headless {
+        FocusedOutputConstruction::HeadlessNoop
+    } else {
+        FocusedOutputConstruction::GuiNative
+    }
+}
+
 fn initialize_core_logic(app_handle: &AppHandle) {
     // Note: Enigo (keyboard/mouse simulation) is NOT initialized here.
     // The frontend is responsible for calling the `initialize_enigo` command
     // after onboarding completes. This avoids triggering permission dialogs
     // on macOS before the user is ready.
+
+    // Native focused-output construction is intentionally confined to this GUI
+    // path. The headless path selects the no-op observer without invoking this
+    // factory, so capability probes and permission/input infrastructure cannot
+    // start during one-shot CLI work.
+    debug_assert_eq!(
+        focused_output_construction(false),
+        FocusedOutputConstruction::GuiNative
+    );
+    let focused_backend = focused_output::platform::native_backend();
+    let status_sink = Arc::new(TauriFocusedOutputStatusSink::new(app_handle.clone()));
+    let focused_output_manager =
+        FocusedOutputManager::new_with_status_sink(focused_backend, status_sink);
+    let focused_output_publisher =
+        Arc::new(FocusedOutputPublisher::new(focused_output_manager.clone()));
 
     // Initialize the managers. The audio recorder receives the streaming router
     // explicitly, so always-on microphone startup can wire live-preview frames
@@ -160,12 +192,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     let model_manager =
         Arc::new(ModelManager::new(app_handle).expect("Failed to initialize model manager"));
     let transcription_manager = Arc::new(
-        TranscriptionManager::new(
-            app_handle,
-            model_manager.clone(),
-            Arc::new(NoopStreamTranscriptObserver),
-        )
-        .expect("Failed to initialize transcription manager"),
+        TranscriptionManager::new(app_handle, model_manager.clone(), focused_output_publisher)
+            .expect("Failed to initialize transcription manager"),
     );
     let recording_manager = Arc::new(
         AudioRecordingManager::new(app_handle, transcription_manager.stream_router())
@@ -182,6 +210,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     managers::transcription::apply_accelerator_settings(app_handle);
 
     // Add managers to Tauri's managed state
+    app_handle.manage(focused_output_manager);
     app_handle.manage(recording_manager.clone());
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
@@ -387,7 +416,7 @@ where
 
 #[cfg(test)]
 mod headless_guard_tests {
-    use super::run_headless_guarded;
+    use super::{focused_output_construction, run_headless_guarded, FocusedOutputConstruction};
 
     #[test]
     fn preserves_normal_exit_codes() {
@@ -397,6 +426,18 @@ mod headless_guard_tests {
     #[test]
     fn converts_worker_panics_to_runtime_failures() {
         assert_eq!(run_headless_guarded(|| panic!("simulated failure")), 1);
+    }
+
+    #[test]
+    fn headless_construction_selects_only_noop_observer_path() {
+        assert_eq!(
+            focused_output_construction(true),
+            FocusedOutputConstruction::HeadlessNoop
+        );
+        assert_eq!(
+            focused_output_construction(false),
+            FocusedOutputConstruction::GuiNative
+        );
     }
 }
 
@@ -649,6 +690,7 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_auto_submit_key_setting,
             shortcut::change_post_process_enabled_setting,
             shortcut::change_experimental_enabled_setting,
+            shortcut::change_progressive_output_destination_setting,
             shortcut::change_post_process_base_url_setting,
             shortcut::change_post_process_api_key_setting,
             shortcut::change_post_process_model_setting,
@@ -674,6 +716,9 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,
             shortcut::change_show_tray_icon_setting,
+            focused_output::commands::get_focused_output_capability,
+            focused_output::commands::get_focused_output_status,
+            focused_output::commands::request_focused_output_permission,
             shortcut::change_transcribe_accelerator_setting,
             shortcut::change_ort_accelerator_setting,
             shortcut::change_transcribe_gpu_device,
@@ -740,6 +785,7 @@ pub fn run(cli_args: CliArgs) {
             managers::history::HistoryUpdatePayload,
             managers::transcription::StreamTextEvent,
             managers::transcription::StreamPhaseEvent,
+            focused_output::types::FocusedOutputStatusEvent,
         ]);
 
     #[cfg(debug_assertions)] // <- Only export on non-release builds
@@ -865,19 +911,23 @@ pub fn run(cli_args: CliArgs) {
             // transcribe-cpp backend + accelerator settings — then run on a worker
             // thread and exit. Deliberately skips the window, tray, overlay, audio
             // recorder (so it never opens the mic, even with always_on_microphone),
-            // signal handlers, and autostart that initialize_core_logic sets up.
+            // signal handlers, autostart, and native focused-output construction.
             if headless_mode {
                 let app_handle = app.handle().clone();
                 let model_manager = Arc::new(
                     ModelManager::new(&app_handle).expect("Failed to initialize model manager"),
                 );
+                let stream_observer = match focused_output_construction(headless_mode) {
+                    FocusedOutputConstruction::HeadlessNoop => {
+                        Arc::new(NoopStreamTranscriptObserver)
+                    }
+                    FocusedOutputConstruction::GuiNative => {
+                        unreachable!("headless setup cannot select a native focused-output backend")
+                    }
+                };
                 let transcription_manager = Arc::new(
-                    TranscriptionManager::new(
-                        &app_handle,
-                        model_manager.clone(),
-                        Arc::new(NoopStreamTranscriptObserver),
-                    )
-                    .expect("Failed to initialize transcription manager"),
+                    TranscriptionManager::new(&app_handle, model_manager.clone(), stream_observer)
+                        .expect("Failed to initialize transcription manager"),
                 );
                 app_handle.manage(model_manager);
                 app_handle.manage(transcription_manager);
@@ -1044,6 +1094,9 @@ pub fn run(cli_args: CliArgs) {
             }
             // Teardown transcribe.cpp before exit
             tauri::RunEvent::Exit => {
+                if let Some(focused) = app.try_state::<Arc<FocusedOutputManager>>() {
+                    focused.shutdown();
+                }
                 if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                     let _ = tm.unload_model();
                 }

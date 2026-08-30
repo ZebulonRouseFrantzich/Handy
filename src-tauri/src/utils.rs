@@ -1,3 +1,4 @@
+use crate::focused_output::{DictationSessionId, FocusedOutputManager};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::transcription::TranscriptionManager;
 use crate::shortcut;
@@ -70,11 +71,28 @@ fn native_windows_machine() -> Option<u16> {
         .then_some(native_machine)
     }
 }
+fn cancel_focused_session(
+    session_id: Option<DictationSessionId>,
+    mut cancel: impl FnMut(DictationSessionId),
+) {
+    if let Some(session_id) = session_id {
+        cancel(session_id);
+    }
+}
 
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// Handles cancelling both recording and transcription operations and updates UI state.
 pub fn cancel_current_operation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
+
+    // Snapshot and cancel focused delivery first. The exact tag prevents a
+    // delayed cancellation from touching a newer dictation, and flipping the
+    // manager token before audio/ASR cleanup stops native target dispatch.
+    let focused_manager = app.state::<Arc<FocusedOutputManager>>();
+    let focused_session_id = focused_manager.active_session_id();
+    cancel_focused_session(focused_session_id, |session_id| {
+        focused_manager.cancel(session_id)
+    });
 
     // Unregister the cancel shortcut asynchronously
     shortcut::unregister_cancel_shortcut(app);
@@ -151,5 +169,15 @@ mod tests {
         assert!(!native_machine_is_arm64(Some(0x8664))); // AMD64
         assert!(!native_machine_is_arm64(Some(0x014c))); // I386
         assert!(!native_machine_is_arm64(None)); // API unavailable or failed
+    }
+
+    #[test]
+    fn focused_cancel_uses_only_the_captured_session() {
+        let captured = DictationSessionId(41);
+        let mut cancelled = Vec::new();
+        cancel_focused_session(Some(captured), |session_id| cancelled.push(session_id));
+        cancel_focused_session(None, |session_id| cancelled.push(session_id));
+
+        assert_eq!(cancelled, vec![captured]);
     }
 }

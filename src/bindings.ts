@@ -224,6 +224,14 @@ async changeExperimentalEnabledSetting(enabled: boolean) : Promise<Result<null, 
     else return { status: "error", error: e  as any };
 }
 },
+async changeProgressiveOutputDestinationSetting(value: ProgressiveOutputDestination) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_progressive_output_destination_setting", { value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changePostProcessBaseUrlSetting(providerId: string, baseUrl: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_post_process_base_url_setting", { providerId, baseUrl }) };
@@ -430,6 +438,20 @@ async getKeyboardImplementation() : Promise<string> {
 async changeShowTrayIconSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_show_tray_icon_setting", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getFocusedOutputCapability() : Promise<FocusedOutputCapability> {
+    return await TAURI_INVOKE("get_focused_output_capability");
+},
+async getFocusedOutputStatus() : Promise<FocusedOutputStatusEvent | null> {
+    return await TAURI_INVOKE("get_focused_output_status");
+},
+async requestFocusedOutputPermission(permission: FocusedOutputPermission) : Promise<Result<FocusedOutputCapability, FocusedOutputReasonCode>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("request_focused_output_permission", { permission }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -897,10 +919,8 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
@@ -916,10 +936,12 @@ async isLaptop() : Promise<Result<boolean, string>> {
 
 
 export const events = __makeEvents__<{
+focusedOutputStatusEvent: FocusedOutputStatusEvent,
 historyUpdatePayload: HistoryUpdatePayload,
 streamPhaseEvent: StreamPhaseEvent,
 streamTextEvent: StreamTextEvent
 }>({
+focusedOutputStatusEvent: "focused-output-status-event",
 historyUpdatePayload: "history-update-payload",
 streamPhaseEvent: "stream-phase-event",
 streamTextEvent: "stream-text-event"
@@ -961,7 +983,7 @@ whats_new_last_seen_version?: string; selected_model?: string; onboarding_comple
  * Which input channel to use on the selected microphone device.
  * None means "average all channels" (original behavior).
  */
-selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; paste_delay_after_ms?: number; 
+selected_channel?: number | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; progressive_output_destination?: ProgressiveOutputDestination; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; paste_delay_after_ms?: number; 
 /**
  * Debug-gated ("beta") receipt-sequenced paste: restore the clipboard only
  * after the target app actually reads the transcript, instead of after a
@@ -990,6 +1012,7 @@ export type AvailableAccelerators = { transcribe: string[]; ort: string[]; gpu_d
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
 export type CustomSounds = { start: boolean; stop: boolean }
+export type DictationSessionId = number
 export type EngineType = 
 /**
  * Any GGML/GGUF model loaded through transcribe-cpp (Whisper, Parakeet,
@@ -997,6 +1020,17 @@ export type EngineType =
  * the file, so this one variant covers the whole transcribe-cpp family.
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
+export type FocusedOutputBackend = "windows" | "mac_os" | "linux_at_spi" | "test"
+/**
+ * A capability is constructed through one of the three state constructors so
+ * route and reason fields cannot contradict the lifecycle state.
+ */
+export type FocusedOutputCapability = { available: boolean; safety_level: FocusedOutputSafetyLevel; backend: FocusedOutputBackend; route: ResolvedInsertionCapability | null; mixed_input_support: MixedInputSupport; supports_auto_submit: boolean; reason_code: FocusedOutputReasonCode | null }
+export type FocusedOutputPermission = "mac_accessibility" | "mac_input_monitoring"
+export type FocusedOutputReasonCode = "disabled" | "experimental_features_disabled" | "model_does_not_support_streaming" | "post_processing_incompatible" | "paste_method_disabled" | "external_script_incompatible" | "accessibility_permission_missing" | "input_monitoring_permission_missing" | "at_spi_unavailable" | "typing_tool_unavailable" | "control_shortcut_unsupported" | "auto_submit_unsupported" | "secure_input_active" | "secure_field" | "handy_owned_target" | "no_focused_target" | "target_not_editable" | "initial_selection_not_collapsed" | "target_unsupported" | "target_changed" | "physical_pointer_activity" | "destructive_user_edit" | "caret_moved" | "selection_changed" | "unsafe_keyboard_command" | "ime_composition_unsupported" | "mixed_input_unavailable" | "target_closed" | "monitor_unavailable" | "backend_disconnected" | "injection_denied" | "injection_partial" | "injection_ambiguous" | "injection_failed" | "receipt_timeout" | "final_conflict" | "history_unavailable" | "stream_failed" | "cancelled" | "platform_unsupported" | "already_active"
+export type FocusedOutputSafetyLevel = "verified_control" | "guarded_focused_control" | "unavailable"
+export type FocusedOutputStatus = "armed" | "streaming" | "fallback" | "invalidated" | "conflict" | "completed" | "cancelled" | "faulted"
+export type FocusedOutputStatusEvent = { session_id: DictationSessionId; status: FocusedOutputStatus; reason: FocusedOutputReasonCode | null; capability: FocusedOutputCapability | null; target_application: string | null; speech_delivered_chars: number; external_edit_epoch: number; history_available: boolean }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
@@ -1008,6 +1042,7 @@ export type ImplementationChangeResult = { success: boolean;
  * List of binding IDs that were reset to defaults due to incompatibility
  */
 reset_bindings: string[] }
+export type InsertionTransport = "windows_unicode_send_input" | "mac_ax_selected_text" | "mac_cg_event_unicode" | "at_spi_editable_text" | "linux_focused_keyboard" | "test"
 export type KeyboardDiagnosticReport = { secure_input_enabled: boolean; culprit_pid: number | null; culprit_name: string | null; 
 /**
  * Counts only — key identity is deliberately never captured.
@@ -1016,6 +1051,7 @@ key_down: number; key_up: number; flags_changed: number; mouse: number; duration
 export type KeyboardImplementation = "tauri" | "handy_keys"
 export type LLMPrompt = { id: string; name: string; prompt: string }
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
+export type MixedInputSupport = "observed_insertions_only" | "guarded_keyboard_insertions_only" | "unavailable"
 export type ModelInfo = { id: string; name: string; description: string; filename: string; source: ModelSource; size_mb: number; is_downloaded: boolean; is_downloading: boolean; partial_size: number; is_directory: boolean; engine_type: EngineType; accuracy_score: number; speed_score: number; supports_translation: boolean; is_recommended: boolean; supported_languages: string[]; supports_language_selection: boolean; is_custom: boolean; supports_streaming: boolean; supports_language_detection: boolean }
 export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null }
 /**
@@ -1056,7 +1092,10 @@ export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
+export type ProgressiveOutputDestination = "overlay" | "focused_field"
+export type ReceiptConfidence = "verified" | "posted"
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
+export type ResolvedInsertionCapability = { insertion_transport: InsertionTransport; receipt_confidence: ReceiptConfidence }
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
 /**

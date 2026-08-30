@@ -22,8 +22,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation, LLMPrompt,
-    OverlayPosition, OverlayStyle, PasteMethod, ShortcutBinding, SoundTheme, Theme, TypingTool,
-    VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
+    OverlayPosition, OverlayStyle, PasteMethod, ProgressiveOutputDestination, ShortcutBinding,
+    SoundTheme, Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
 };
 use crate::tray;
 
@@ -1001,6 +1001,18 @@ pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Res
     }
 
     crate::secure_input::reconcile_fallback(&app);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_progressive_output_destination_setting(
+    app: AppHandle,
+    value: ProgressiveOutputDestination,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.progressive_output_destination = value;
+    settings::write_settings(&app, settings);
     Ok(())
 }
 

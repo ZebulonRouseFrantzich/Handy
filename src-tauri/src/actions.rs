@@ -2,13 +2,21 @@
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
+use crate::focused_output::{
+    ActivePlan, BeginContext, DictationSessionId, FinalDeliveryDisposition, FinalizeOptions,
+    FocusedDeliveryDisposition, FocusedOutputCapability, FocusedOutputManager,
+    FocusedOutputReasonCode, LegacyPasteAuthority, OutputPlanKind, TerminalReason,
+};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::{
     StreamFinalOutcome, StreamStartContext, StreamWorkKind, TranscriptionManager,
 };
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::settings::{
+    get_settings, AppSettings, ClipboardHandling, OverlayStyle, PasteMethod,
+    ProgressiveOutputDestination, APPLE_INTELLIGENCE_PROVIDER_ID,
+};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -115,8 +123,170 @@ where
     }
 }
 
-fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool {
-    style == OverlayStyle::Live && is_streaming
+fn should_use_streaming_overlay(
+    style: OverlayStyle,
+    is_streaming: bool,
+    output_kind: OutputPlanKind,
+) -> bool {
+    output_kind == OutputPlanKind::Fallback && style == OverlayStyle::Live && is_streaming
+}
+
+#[derive(Clone, Copy)]
+struct FocusedEligibilityInput {
+    experimental_enabled: bool,
+    destination: ProgressiveOutputDestination,
+    model_supports_streaming: bool,
+    post_process: bool,
+    paste_method: PasteMethod,
+}
+
+fn focused_preflight_eligibility(
+    input: FocusedEligibilityInput,
+) -> Result<(), FocusedOutputReasonCode> {
+    if input.destination != ProgressiveOutputDestination::FocusedField {
+        return Err(FocusedOutputReasonCode::Disabled);
+    }
+    if !input.experimental_enabled {
+        return Err(FocusedOutputReasonCode::ExperimentalFeaturesDisabled);
+    }
+    if !input.model_supports_streaming {
+        return Err(FocusedOutputReasonCode::ModelDoesNotSupportStreaming);
+    }
+    if input.post_process {
+        return Err(FocusedOutputReasonCode::PostProcessingIncompatible);
+    }
+    match input.paste_method {
+        PasteMethod::None => Err(FocusedOutputReasonCode::PasteMethodDisabled),
+        PasteMethod::ExternalScript => Err(FocusedOutputReasonCode::ExternalScriptIncompatible),
+        PasteMethod::CtrlV
+        | PasteMethod::Direct
+        | PasteMethod::ShiftInsert
+        | PasteMethod::CtrlShiftV => Ok(()),
+    }
+}
+
+fn focused_backend_eligibility(
+    capability: &FocusedOutputCapability,
+) -> Result<(), FocusedOutputReasonCode> {
+    if capability.available() {
+        Ok(())
+    } else {
+        Err(capability
+            .reason_code()
+            .unwrap_or(FocusedOutputReasonCode::PlatformUnsupported))
+    }
+}
+
+enum DeliveryRoute {
+    LegacyPaste(LegacyPasteAuthority),
+    Focused { trailing_space_delivered: bool },
+    CleanupOnly,
+}
+
+fn delivery_route(disposition: FinalDeliveryDisposition) -> DeliveryRoute {
+    match disposition {
+        FinalDeliveryDisposition::LegacyPaste(authority) => DeliveryRoute::LegacyPaste(authority),
+        FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+            trailing_space_delivered,
+            ..
+        }) => DeliveryRoute::Focused {
+            trailing_space_delivered,
+        },
+        FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+            ..
+        }) => DeliveryRoute::Focused {
+            trailing_space_delivered: false,
+        },
+        FinalDeliveryDisposition::NoText => DeliveryRoute::CleanupOnly,
+    }
+}
+
+fn focused_start_context(
+    session_id: DictationSessionId,
+    binding_id: &str,
+    shortcut: &str,
+    settings: &AppSettings,
+) -> BeginContext {
+    let control_shortcut = if shortcut.is_empty() {
+        settings
+            .bindings
+            .get(binding_id)
+            .map(|binding| binding.current_binding.clone())
+            .filter(|binding| !binding.is_empty())
+    } else {
+        Some(shortcut.to_owned())
+    };
+    BeginContext {
+        session_id,
+        control_shortcut,
+        auto_submit_requested: settings.auto_submit,
+        #[cfg(target_os = "linux")]
+        typing_tool: settings.typing_tool,
+    }
+}
+
+fn transcription_stream_context(
+    output_kind: OutputPlanKind,
+    session_id: DictationSessionId,
+) -> StreamStartContext {
+    match output_kind {
+        OutputPlanKind::Focused => StreamStartContext::focused(session_id),
+        OutputPlanKind::Fallback => StreamStartContext::overlay(),
+    }
+}
+
+struct ExactSessionFinishGuard {
+    manager: Arc<FocusedOutputManager>,
+    active_plan: Option<ActivePlan>,
+    finished: bool,
+}
+
+impl ExactSessionFinishGuard {
+    fn new(manager: Arc<FocusedOutputManager>, active_plan: Option<ActivePlan>) -> Self {
+        Self {
+            manager,
+            active_plan,
+            finished: false,
+        }
+    }
+
+    fn session_id(&self) -> Option<DictationSessionId> {
+        self.active_plan.map(|plan| plan.session_id)
+    }
+
+    fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+
+    fn finish_no_text(&mut self) {
+        if let Some(session_id) = self.session_id() {
+            self.manager.finish_no_text(session_id);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ExactSessionFinishGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(session_id) = self.session_id() {
+            self.manager
+                .terminate(session_id, TerminalReason::Cancelled);
+            self.manager.finish_no_text(session_id);
+        }
+    }
+}
+
+fn manager_finalize_options(settings: &AppSettings, history_available: bool) -> FinalizeOptions {
+    FinalizeOptions {
+        append_trailing_space: settings.append_trailing_space,
+        clipboard_handling: settings.clipboard_handling,
+        auto_submit: settings.auto_submit,
+        auto_submit_key: settings.auto_submit_key,
+        history_available,
+    }
 }
 
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
@@ -467,45 +637,40 @@ pub(crate) async fn process_transcription_output(
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
-        // Load model in the background
+        let focused_manager = Arc::clone(&app.state::<Arc<FocusedOutputManager>>());
+        let session_id = focused_manager.allocate_session_id();
+        if let Err(reason) = focused_manager.register_fallback(session_id) {
+            warn!("Unable to register dictation output plan: {reason:?}");
+            return;
+        }
+
+        // Load ASR and VAD in parallel after the exact output session has been
+        // registered, so every later failure has a tagged cleanup authority.
         let tm = app.state::<Arc<TranscriptionManager>>();
         let rm = app.state::<Arc<AudioRecordingManager>>();
-
-        // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
         tm.initiate_model_load();
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
-            if let Err(e) = rm_clone.preload_vad() {
-                debug!("VAD pre-load failed: {}", e);
+            if let Err(error) = rm_clone.preload_vad() {
+                debug!("VAD pre-load failed: {error}");
             }
         });
         let kickoff_elapsed = kickoff_started.elapsed();
 
-        let binding_id = binding_id.to_string();
-        let tray_started = Instant::now();
-        set_tray_state(app, TrayIconState::Recording);
-        let tray_elapsed = tray_started.elapsed();
-
-        // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
         let settings = get_settings(app);
         let is_always_on = settings.always_on_microphone;
-
         let selected_model_info = app
             .state::<Arc<ModelManager>>()
             .get_model_info(&settings.selected_model);
-
-        // Use the app-facing model capability as the single pre-recording source
-        // for live streaming decisions. Unknown support is represented as false
-        // until the model registry is updated by discovery or runtime load.
         let model_supports_streaming = selected_model_info
             .as_ref()
-            .map(|m| m.supports_streaming)
+            .map(|model| model.supports_streaming)
             .unwrap_or(false);
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
@@ -514,8 +679,56 @@ impl ShortcutAction for TranscribeAction {
         } else {
             VadPolicy::Offline
         };
+
+        let eligibility = focused_preflight_eligibility(FocusedEligibilityInput {
+            experimental_enabled: settings.experimental_enabled,
+            destination: settings.progressive_output_destination,
+            model_supports_streaming,
+            post_process: self.post_process,
+            paste_method: settings.paste_method,
+        })
+        .and_then(|()| {
+            let capability = focused_manager.global_capability();
+            focused_backend_eligibility(&capability)
+        });
+
+        let output_kind = if eligibility.is_ok() {
+            match focused_manager.begin(focused_start_context(
+                session_id,
+                binding_id,
+                shortcut_str,
+                &settings,
+            )) {
+                Ok(_) => OutputPlanKind::Focused,
+                Err(reason) => {
+                    debug!("Focused output unavailable before recording: {reason:?}");
+                    OutputPlanKind::Fallback
+                }
+            }
+        } else {
+            OutputPlanKind::Fallback
+        };
+
+        // Target capture and monitoring are fully armed before streaming
+        // admission. Once armed, admission failure cannot regain paste authority.
         if model_supports_streaming {
-            if let Err(error) = tm.start_stream(StreamStartContext::overlay()) {
+            let context = transcription_stream_context(output_kind, session_id);
+            if let Err(error) = tm.start_stream(context) {
+                if output_kind == OutputPlanKind::Focused {
+                    warn!("Focused streaming admission failed: {error}");
+                    focused_manager.terminate(session_id, TerminalReason::StreamFailed);
+                    focused_manager.finish_no_text(session_id);
+                    tm.cancel_stream();
+                    set_tray_state(app, TrayIconState::Idle);
+                    let _ = app.emit(
+                        "recording-error",
+                        RecordingErrorEvent {
+                            error_type: "focused_stream_admission_failed".to_owned(),
+                            detail: None,
+                        },
+                    );
+                    return;
+                }
                 warn!(
                     "Live streaming admission failed; continuing with batch transcription: {error}"
                 );
@@ -523,17 +736,24 @@ impl ShortcutAction for TranscribeAction {
         }
         let plan_elapsed = plan_started.elapsed();
 
-        // Sizing the overlay follows the same advertised capability. A model that
-        // doesn't stream (or whose capability is not known yet) gets the compact
-        // pill instead of an oversized transparent live window.
+        let tray_started = Instant::now();
+        set_tray_state(app, TrayIconState::Recording);
+        let tray_elapsed = tray_started.elapsed();
+
         let overlay_started = Instant::now();
-        match settings.overlay_style {
-            OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(app),
-            OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(app),
-            OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
+        match output_kind {
+            OutputPlanKind::Focused => {
+                #[cfg(not(target_os = "linux"))]
+                show_recording_overlay(app);
+            }
+            OutputPlanKind::Fallback => match settings.overlay_style {
+                OverlayStyle::Live if model_supports_streaming => {
+                    utils::show_streaming_overlay(app)
+                }
+                OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(app),
+                OverlayStyle::None => {}
+            },
         }
-        // Everything above runs before capture can begin, so each span here is
-        // added keypress->capture latency.
         debug!(
             "start-path pre-recording steps: model_kickoff={:?} tray={:?} settings+stream_plan={:?} overlay={:?}",
             kickoff_elapsed,
@@ -543,6 +763,7 @@ impl ShortcutAction for TranscribeAction {
         );
         debug!("Microphone mode - always_on: {}", is_always_on);
 
+        let binding_id = binding_id.to_string();
         let mut recording_error: Option<String> = None;
         let recording_start_time = Instant::now();
         match rm.try_start_recording(&binding_id, vad_policy) {
@@ -560,9 +781,6 @@ impl ShortcutAction for TranscribeAction {
                         return;
                     }
 
-                    // Development-only preview hook for evaluating the brief
-                    // arming animation on hardware that normally starts too fast
-                    // to make it visible.
                     #[cfg(debug_assertions)]
                     if let Ok(delay_ms) = std::env::var("HANDY_DEBUG_MIC_READY_DELAY_MS")
                         .unwrap_or_default()
@@ -582,11 +800,6 @@ impl ShortcutAction for TranscribeAction {
 
                     debug!("Microphone is receiving samples; recording is ready");
                     utils::emit_recording_ready(&app_clone);
-
-                    // The start chime is a readiness cue, so it must follow the
-                    // first real input callback rather than Stream::play() or a
-                    // fixed delay. The helper returns immediately when feedback
-                    // is disabled; mute still follows the same readiness point.
                     if rm_clone.is_recording_readiness_current(generation) {
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
                     }
@@ -595,25 +808,23 @@ impl ShortcutAction for TranscribeAction {
                     }
                 });
             }
-            Err(e) => {
-                debug!("Failed to start recording: {}", e);
-                recording_error = Some(e);
+            Err(error) => {
+                debug!("Failed to start recording: {error}");
+                recording_error = Some(error);
             }
         }
 
         if recording_error.is_none() {
-            // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
-            // Starting failed (for example due to blocked microphone permissions).
-            // Revert UI state so we don't stay stuck in the recording overlay.
             tm.cancel_stream();
+            focused_manager.finish_no_text(session_id);
             utils::hide_recording_overlay(app);
             set_tray_state(app, TrayIconState::Idle);
-            if let Some(err) = recording_error {
-                let error_type = if is_microphone_access_denied(&err) {
+            if let Some(error) = recording_error {
+                let error_type = if is_microphone_access_denied(&error) {
                     "microphone_permission_denied"
-                } else if is_no_input_device_error(&err) {
+                } else if is_no_input_device_error(&error) {
                     "no_input_device"
                 } else {
                     "unknown"
@@ -622,7 +833,7 @@ impl ShortcutAction for TranscribeAction {
                     "recording-error",
                     RecordingErrorEvent {
                         error_type: error_type.to_string(),
-                        detail: Some(err),
+                        detail: Some(error),
                     },
                 );
             }
@@ -635,12 +846,8 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        // Prevent a slow microphone from emitting a ready event or start chime
-        // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
             .invalidate_recording_readiness();
-
-        // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
 
         let stop_time = Instant::now();
@@ -650,238 +857,286 @@ impl ShortcutAction for TranscribeAction {
         let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
         let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
+        let focused_manager = Arc::clone(&app.state::<Arc<FocusedOutputManager>>());
+
+        // This is the only active-plan read for finalization. Move the exact
+        // session and structural kind into the task; stale work never consults
+        // whichever session may be current later.
+        let active_plan = focused_manager.active_plan();
+        let output_kind = active_plan
+            .map(|plan| plan.kind)
+            .unwrap_or(OutputPlanKind::Fallback);
 
         set_tray_state(app, TrayIconState::Transcribing);
-        // Stop should give immediate visual feedback. Live streaming can keep
-        // the larger panel, but it still switches from listening to a working
-        // spinner while the stream finalizes. Non-streaming paths use the
-        // compact transcribing pill (None no-ops in show_*).
-        let style = get_settings(app).overlay_style;
-        // Capture this before finalizing the stream so every later working state
-        // targets the same overlay that was shown for this transcription.
-        let use_streaming_overlay = should_use_streaming_overlay(style, tm.is_streaming());
+        let settings = get_settings(app);
+        let use_streaming_overlay =
+            should_use_streaming_overlay(settings.overlay_style, tm.is_streaming(), output_kind);
         if use_streaming_overlay {
             tm.emit_stream_working(StreamWorkKind::Transcribing);
-        } else {
+        } else if output_kind == OutputPlanKind::Fallback {
             show_transcribing_overlay(app);
         }
 
-        // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
-
-        // Play audio feedback for recording stop
         play_feedback_sound(app, SoundType::Stop);
 
-        let binding_id = binding_id.to_string(); // Clone binding_id for the async task
+        let binding_id = binding_id.to_string();
         let post_process = self.post_process;
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
             let _guard = FinishGuard(ah.clone());
+            let mut session_guard =
+                ExactSessionFinishGuard::new(Arc::clone(&focused_manager), active_plan);
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
-                debug!(
-                    "Recording stopped and samples retrieved in {:?}, sample count: {}",
-                    stop_recording_time.elapsed(),
-                    samples.len()
-                );
+            let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) else {
+                debug!("No samples retrieved from recording stop");
+                tm.cancel_stream();
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            };
+            debug!(
+                "Recording stopped and samples retrieved in {:?}, sample count: {}",
+                stop_recording_time.elapsed(),
+                samples.len()
+            );
 
-                if rm.was_cancelled_since(cancel_generation) {
-                    debug!("Transcription operation cancelled after recording stop");
-                    tm.cancel_stream();
-                    utils::hide_recording_overlay(&ah);
-                    set_tray_state(&ah, TrayIconState::Idle);
-                    return;
+            if rm.was_cancelled_since(cancel_generation) {
+                debug!("Transcription operation cancelled after recording stop");
+                tm.cancel_stream();
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            }
+
+            if samples.is_empty() {
+                debug!("Recording produced no audio samples; skipping persistence");
+                tm.cancel_stream();
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            }
+            let sample_count = samples.len();
+            let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
+            let wav_path = hm.recordings_dir().join(&file_name);
+            let wav_path_for_verify = wav_path.clone();
+            let samples_for_wav = samples.clone();
+            let wav_handle = tauri::async_runtime::spawn_blocking(move || {
+                crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+            });
+
+            let transcription_time = Instant::now();
+            let (transcription_result, barrier_revision) = match tm.finalize_stream() {
+                Ok(finalization) => {
+                    let result = match finalization.outcome {
+                        StreamFinalOutcome::StreamText(text) => Ok(text),
+                        StreamFinalOutcome::BatchFallback | StreamFinalOutcome::NoWorker => {
+                            tm.transcribe(samples)
+                        }
+                    };
+                    (result, finalization.barrier_revision)
                 }
+                Err(error) => {
+                    if let Some(session_id) = session_guard.session_id() {
+                        focused_manager.terminate(session_id, TerminalReason::StreamFailed);
+                    }
+                    (Err(error), None)
+                }
+            };
 
-                if samples.is_empty() {
-                    debug!("Recording produced no audio samples; skipping persistence");
-                    // Tear down any streaming worker so its channel doesn't leak
-                    // and block the next start_stream.
-                    tm.cancel_stream();
-                    utils::hide_recording_overlay(&ah);
-                    set_tray_state(&ah, TrayIconState::Idle);
-                } else {
-                    // Save WAV concurrently with transcription
-                    let sample_count = samples.len();
-                    let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
-                    let wav_path = hm.recordings_dir().join(&file_name);
-                    let wav_path_for_verify = wav_path.clone();
-                    let samples_for_wav = samples.clone();
-                    let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
-                    });
-
-                    // Transcribe concurrently with WAV save. If a live stream was
-                    // running, finalize it and use its text (all audio was already
-                    // fed to the stream); otherwise batch-transcribe the samples.
-                    let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        Ok(finalization) => match finalization.outcome {
-                            StreamFinalOutcome::StreamText(text) => Ok(text),
-                            StreamFinalOutcome::BatchFallback | StreamFinalOutcome::NoWorker => {
-                                tm.transcribe(samples)
-                            }
-                        },
-                        Err(error) => Err(error),
-                    };
-
-                    // Await WAV save and verify
-                    let wav_saved = match wav_handle.await {
-                        Ok(Ok(())) => {
-                            match crate::audio_toolkit::verify_wav_file(
-                                &wav_path_for_verify,
-                                sample_count,
-                            ) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    error!("WAV verification failed: {}", e);
-                                    false
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            error!("Failed to save WAV file: {}", e);
+            let wav_saved = match wav_handle.await {
+                Ok(Ok(())) => {
+                    match crate::audio_toolkit::verify_wav_file(&wav_path_for_verify, sample_count)
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            error!("WAV verification failed: {error}");
                             false
                         }
-                        Err(e) => {
-                            error!("WAV save task panicked: {}", e);
-                            false
-                        }
-                    };
+                    }
+                }
+                Ok(Err(error)) => {
+                    error!("Failed to save WAV file: {error}");
+                    false
+                }
+                Err(error) => {
+                    error!("WAV save task panicked: {error}");
+                    false
+                }
+            };
 
+            if rm.was_cancelled_since(cancel_generation) {
+                debug!("Transcription operation cancelled before output handling");
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            }
+
+            let transcription = match transcription_result {
+                Ok(transcription) => {
+                    debug!(
+                        "Transcription completed in {:?}",
+                        transcription_time.elapsed()
+                    );
+                    transcription
+                }
+                Err(error) => {
                     if rm.was_cancelled_since(cancel_generation) {
-                        debug!("Transcription operation cancelled before output handling");
+                        debug!("Transcription operation cancelled after transcription error");
+                        session_guard.finish_no_text();
                         utils::hide_recording_overlay(&ah);
                         set_tray_state(&ah, TrayIconState::Idle);
                         return;
                     }
 
-                    match transcription_result {
-                        Ok(transcription) => {
-                            debug!(
-                                "Transcription completed in {:?}",
-                                transcription_time.elapsed()
-                            );
-
-                            if post_process {
-                                if use_streaming_overlay {
-                                    tm.emit_stream_working(StreamWorkKind::Polishing);
-                                } else {
-                                    show_processing_overlay(&ah);
-                                }
-                            }
-                            let Some(processed) = complete_unless_cancelled(
-                                process_transcription_output(&ah, &transcription, post_process),
-                                || rm.was_cancelled_since(cancel_generation),
-                            )
-                            .await
-                            else {
-                                debug!("Transcription operation cancelled during output handling");
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
-                            };
-
-                            if rm.was_cancelled_since(cancel_generation) {
-                                debug!("Transcription operation cancelled before paste");
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
-                            }
-
-                            // Save to history if WAV was saved
-                            if wav_saved {
-                                if let Err(err) = hm.save_entry(
-                                    file_name,
-                                    transcription,
-                                    post_process,
-                                    processed.post_processed_text.clone(),
-                                    processed.post_process_prompt.clone(),
-                                ) {
-                                    error!("Failed to save history entry: {}", err);
-                                }
-                            }
-
-                            if processed.final_text.is_empty() {
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                            } else {
-                                let ah_clone = ah.clone();
-                                let paste_time = Instant::now();
-                                let final_text = processed.final_text;
-                                let rm_for_paste = Arc::clone(&rm);
-                                ah.run_on_main_thread(move || {
-                                    if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                        debug!("Transcription operation cancelled before paste");
-                                        utils::hide_recording_overlay(&ah_clone);
-                                        set_tray_state(&ah_clone, TrayIconState::Idle);
-                                        return;
-                                    }
-
-                                    match utils::paste(final_text, ah_clone.clone()) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to paste transcription: {}", e);
-                                            let _ = ah_clone.emit("paste-error", ());
-                                        }
-                                    }
-                                    utils::hide_recording_overlay(&ah_clone);
-                                    set_tray_state(&ah_clone, TrayIconState::Idle);
-                                })
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    set_tray_state(&ah, TrayIconState::Idle);
-                                });
+                    error!("Transcription failed: {error}");
+                    let _ = ah.emit("transcription-error", error.to_string());
+                    let history_available = if wav_saved {
+                        match hm.save_entry(file_name, String::new(), post_process, None, None) {
+                            Ok(_) => true,
+                            Err(save_error) => {
+                                error!("Failed to save failed history entry: {save_error}");
+                                false
                             }
                         }
-                        Err(err) => {
-                            if rm.was_cancelled_since(cancel_generation) {
-                                debug!(
-                                    "Transcription operation cancelled after transcription error"
-                                );
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
-                            }
+                    } else {
+                        false
+                    };
+                    if let Some(session_id) = session_guard.session_id() {
+                        focused_manager.terminate(session_id, TerminalReason::StreamFailed);
+                        let _ = focused_manager.finalize(
+                            session_id,
+                            String::new(),
+                            barrier_revision,
+                            manager_finalize_options(&settings, history_available),
+                        );
+                    }
+                    session_guard.mark_finished();
+                    utils::hide_recording_overlay(&ah);
+                    set_tray_state(&ah, TrayIconState::Idle);
+                    return;
+                }
+            };
 
-                            error!("Transcription failed: {}", err);
-                            // Surface the failure to the UI (toast). The full
-                            // message is also in handy.log via the line above.
-                            let _ = ah.emit("transcription-error", err.to_string());
-                            // Save entry with empty text so user can retry
-                            if wav_saved {
-                                if let Err(save_err) = hm.save_entry(
-                                    file_name,
-                                    String::new(),
-                                    post_process,
-                                    None,
-                                    None,
-                                ) {
-                                    error!("Failed to save failed history entry: {}", save_err);
-                                }
-                            }
-                            utils::hide_recording_overlay(&ah);
-                            set_tray_state(&ah, TrayIconState::Idle);
-                        }
+            if post_process {
+                if use_streaming_overlay {
+                    tm.emit_stream_working(StreamWorkKind::Polishing);
+                } else if output_kind == OutputPlanKind::Fallback {
+                    show_processing_overlay(&ah);
+                }
+            }
+            let Some(processed) = complete_unless_cancelled(
+                process_transcription_output(&ah, &transcription, post_process),
+                || rm.was_cancelled_since(cancel_generation),
+            )
+            .await
+            else {
+                debug!("Transcription operation cancelled during output handling");
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            };
+
+            if rm.was_cancelled_since(cancel_generation) {
+                debug!("Transcription operation cancelled before delivery");
+                session_guard.finish_no_text();
+                utils::hide_recording_overlay(&ah);
+                set_tray_state(&ah, TrayIconState::Idle);
+                return;
+            }
+
+            let history_available = if wav_saved {
+                match hm.save_entry(
+                    file_name,
+                    transcription,
+                    post_process,
+                    processed.post_processed_text.clone(),
+                    processed.post_process_prompt.clone(),
+                ) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        error!("Failed to save history entry: {error}");
+                        false
                     }
                 }
             } else {
-                debug!("No samples retrieved from recording stop");
-                // Tear down any streaming worker so its channel doesn't leak.
-                tm.cancel_stream();
+                false
+            };
+
+            let final_text = processed.final_text;
+            let disposition = match session_guard.session_id() {
+                Some(session_id) => focused_manager.finalize(
+                    session_id,
+                    final_text.clone(),
+                    barrier_revision,
+                    manager_finalize_options(&settings, history_available),
+                ),
+                None => FinalDeliveryDisposition::NoText,
+            };
+            session_guard.mark_finished();
+
+            let route = delivery_route(disposition);
+            let clipboard_handling = settings.clipboard_handling;
+            let rm_for_delivery = Arc::clone(&rm);
+            let ah_clone = ah.clone();
+            ah.run_on_main_thread(move || {
+                if rm_for_delivery.was_cancelled_since(cancel_generation) {
+                    debug!("Transcription operation cancelled before final delivery");
+                    utils::hide_recording_overlay(&ah_clone);
+                    set_tray_state(&ah_clone, TrayIconState::Idle);
+                    return;
+                }
+
+                match route {
+                    DeliveryRoute::LegacyPaste(_authority) => {
+                        let paste_time = Instant::now();
+                        match utils::paste(final_text, ah_clone.clone()) {
+                            Ok(()) => {
+                                debug!("Text pasted successfully in {:?}", paste_time.elapsed())
+                            }
+                            Err(error) => {
+                                error!("Failed to paste transcription: {error}");
+                                let _ = ah_clone.emit("paste-error", ());
+                            }
+                        }
+                    }
+                    DeliveryRoute::Focused {
+                        trailing_space_delivered,
+                    } if clipboard_handling == ClipboardHandling::CopyToClipboard => {
+                        let clipboard_text = if trailing_space_delivered {
+                            format!("{final_text} ")
+                        } else {
+                            final_text
+                        };
+                        if let Err(error) =
+                            utils::copy_text_to_clipboard(&ah_clone, &clipboard_text)
+                        {
+                            error!("Failed to copy focused transcription: {error}");
+                            let _ = ah_clone.emit("paste-error", ());
+                        }
+                    }
+                    DeliveryRoute::Focused { .. } | DeliveryRoute::CleanupOnly => {}
+                }
+
+                utils::hide_recording_overlay(&ah_clone);
+                set_tray_state(&ah_clone, TrayIconState::Idle);
+            })
+            .unwrap_or_else(|error| {
+                error!("Failed to run final delivery on main thread: {error:?}");
                 utils::hide_recording_overlay(&ah);
                 set_tray_state(&ah, TrayIconState::Idle);
-            }
+            });
         });
 
         debug!(
@@ -954,10 +1209,18 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        complete_unless_cancelled, delivery_route, focused_backend_eligibility,
+        focused_preflight_eligibility, is_blank_transcription, should_use_streaming_overlay,
+        strip_think_block, transcription_stream_context, DeliveryRoute, FocusedEligibilityInput,
     };
-    use crate::settings::OverlayStyle;
+    use crate::focused_output::{
+        DictationSessionId, FinalDeliveryDisposition, FocusedDeliveryDisposition,
+        FocusedOutputBackend, FocusedOutputCapability, FocusedOutputReasonCode,
+        FocusedOutputSafetyLevel, OutputPlanKind, ReceiptConfidence, SubmitDisposition,
+        TerminalReason,
+    };
+    use crate::managers::transcription::StreamOutputTarget;
+    use crate::settings::{OverlayStyle, PasteMethod, ProgressiveOutputDestination};
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1032,10 +1295,142 @@ mod tests {
     }
 
     #[test]
-    fn live_overlay_uses_streaming_states_only_for_streaming_models() {
-        assert!(should_use_streaming_overlay(OverlayStyle::Live, true));
-        assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
-        assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
-        assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
+    fn overlay_and_stream_routing_follow_the_structural_plan_kind() {
+        assert!(should_use_streaming_overlay(
+            OverlayStyle::Live,
+            true,
+            OutputPlanKind::Fallback,
+        ));
+        assert!(!should_use_streaming_overlay(
+            OverlayStyle::Live,
+            true,
+            OutputPlanKind::Focused,
+        ));
+        assert!(!should_use_streaming_overlay(
+            OverlayStyle::Live,
+            false,
+            OutputPlanKind::Fallback,
+        ));
+        assert!(!should_use_streaming_overlay(
+            OverlayStyle::Minimal,
+            true,
+            OutputPlanKind::Fallback,
+        ));
+
+        let session_id = DictationSessionId(73);
+        assert_eq!(
+            transcription_stream_context(OutputPlanKind::Focused, session_id).target,
+            StreamOutputTarget::Focused(session_id)
+        );
+        assert_eq!(
+            transcription_stream_context(OutputPlanKind::Fallback, session_id).target,
+            StreamOutputTarget::Overlay
+        );
+    }
+
+    fn eligible_input() -> FocusedEligibilityInput {
+        FocusedEligibilityInput {
+            experimental_enabled: true,
+            destination: ProgressiveOutputDestination::FocusedField,
+            model_supports_streaming: true,
+            post_process: false,
+            paste_method: PasteMethod::CtrlV,
+        }
+    }
+
+    #[test]
+    fn focused_preflight_is_default_off_and_requires_every_gate() {
+        assert_eq!(focused_preflight_eligibility(eligible_input()), Ok(()));
+
+        let mut input = eligible_input();
+        input.destination = ProgressiveOutputDestination::Overlay;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::Disabled)
+        );
+
+        let mut input = eligible_input();
+        input.experimental_enabled = false;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::ExperimentalFeaturesDisabled)
+        );
+
+        let mut input = eligible_input();
+        input.model_supports_streaming = false;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::ModelDoesNotSupportStreaming)
+        );
+
+        let mut input = eligible_input();
+        input.post_process = true;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::PostProcessingIncompatible)
+        );
+
+        let mut input = eligible_input();
+        input.paste_method = PasteMethod::None;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::PasteMethodDisabled)
+        );
+
+        let mut input = eligible_input();
+        input.paste_method = PasteMethod::ExternalScript;
+        assert_eq!(
+            focused_preflight_eligibility(input),
+            Err(FocusedOutputReasonCode::ExternalScriptIncompatible)
+        );
+    }
+
+    #[test]
+    fn focused_backend_gate_preserves_content_free_unavailability_reason() {
+        let ready = FocusedOutputCapability::global_ready(FocusedOutputBackend::Test);
+        assert_eq!(focused_backend_eligibility(&ready), Ok(()));
+
+        let unavailable = FocusedOutputCapability::unavailable(
+            FocusedOutputBackend::Test,
+            FocusedOutputReasonCode::MonitorUnavailable,
+        );
+        assert_eq!(
+            focused_backend_eligibility(&unavailable),
+            Err(FocusedOutputReasonCode::MonitorUnavailable)
+        );
+    }
+
+    #[test]
+    fn focused_and_no_text_dispositions_have_no_legacy_paste_route() {
+        let delivered = FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+            safety_level: FocusedOutputSafetyLevel::VerifiedControl,
+            receipt_confidence: ReceiptConfidence::Verified,
+            external_edit_epoch: 0,
+            trailing_space_delivered: true,
+            submit: SubmitDisposition::NotRequested,
+        });
+        assert!(matches!(
+            delivery_route(delivered),
+            DeliveryRoute::Focused {
+                trailing_space_delivered: true
+            }
+        ));
+
+        let preserved =
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::FinalConflict,
+                speech_delivered_chars: 3,
+                external_edit_epoch: 1,
+            });
+        assert!(matches!(
+            delivery_route(preserved),
+            DeliveryRoute::Focused {
+                trailing_space_delivered: false
+            }
+        ));
+        assert!(matches!(
+            delivery_route(FinalDeliveryDisposition::NoText),
+            DeliveryRoute::CleanupOnly
+        ));
     }
 }

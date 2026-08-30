@@ -426,6 +426,18 @@ pub enum TerminalReason {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPlanKind {
+    Fallback,
+    Focused,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivePlan {
+    pub session_id: DictationSessionId,
+    pub kind: OutputPlanKind,
+}
+
 pub enum FinalDeliveryDisposition {
     Focused(FocusedDeliveryDisposition),
     LegacyPaste(LegacyPasteAuthority),
@@ -577,7 +589,7 @@ pub enum FocusedOutputStatus {
     Faulted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Type)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Type, tauri_specta::Event)]
 pub struct FocusedOutputStatusEvent {
     pub session_id: DictationSessionId,
     pub status: FocusedOutputStatus,

@@ -41,6 +41,19 @@ fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), Str
         .map_err(|e| format!("Failed to write to clipboard: {}", e))
 }
 
+fn copy_text_with<T>(
+    text: &str,
+    write: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    write(text)
+}
+
+/// Writes final focused-output text to the clipboard without synthesizing any
+/// keyboard or pointer input.
+pub(crate) fn copy_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), String> {
+    copy_text_with(text, |text| write_text_to_clipboard(app_handle, text))
+}
+
 fn finish_clipboard_paste(
     paste_result: Result<(), String>,
     paste_delay_after_ms: u64,
@@ -539,23 +552,59 @@ fn type_text_via_kwtype(text: &str) -> Result<(), String> {
 }
 
 /// Write text to clipboard via wl-copy (Wayland clipboard tool).
-/// Uses Stdio::null() to avoid blocking on repeated calls — wl-copy forks a
-/// daemon that inherits piped fds, causing read_to_end to hang indefinitely.
+///
+/// Transcript text is provided only over stdin, never argv, and child output is
+/// discarded. The child is killed and reaped if it exceeds the focused-output
+/// process deadline.
 #[cfg(target_os = "linux")]
 fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
+    use std::io::Write;
     use std::process::Stdio;
-    let status = Command::new("wl-copy")
-        .arg("--")
-        .arg(text)
+
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to execute wl-copy: {}", e))?;
+        .spawn()
+        .map_err(|error| format!("Failed to execute wl-copy: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "wl-copy stdin unavailable".to_owned())?;
 
+    let deadline = std::time::Instant::now() + crate::focused_output::CHILD_PROCESS_DEADLINE;
+    let (write_result, status) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(text.as_bytes()));
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err("wl-copy timed out".to_owned());
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err("wl-copy failed".to_owned());
+                }
+            }
+        };
+        let write_result = writer
+            .join()
+            .map_err(|_| "wl-copy stdin writer failed".to_owned())
+            .and_then(|result| result.map_err(|_| "wl-copy stdin write failed".to_owned()));
+        (write_result, status)
+    });
+
+    write_result?;
+    let status = status?;
     if !status.success() {
         return Err("wl-copy failed".into());
     }
-
     Ok(())
 }
 
@@ -1011,5 +1060,17 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
             .expect("external script should return without waiting for its child");
         fs::remove_file(script_path).expect("remove external script");
         assert!(result.is_ok());
+    }
+    #[test]
+    fn focused_clipboard_copy_invokes_only_the_writer_once() {
+        let calls = Cell::new(0);
+        let copied = copy_text_with("final speech ", |text| {
+            calls.set(calls.get() + 1);
+            Ok(text.to_owned())
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(copied, "final speech ");
     }
 }
