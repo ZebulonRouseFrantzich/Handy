@@ -363,6 +363,7 @@ jobs:
           ORT_DIR="$(pwd)/onnxruntime-linux-x86_64-${ORT_VERSION}"
           echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> $GITHUB_ENV
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$ORT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Resolve symlinks so the deb bundler gets real files (not broken symlinks)
           for f in "$ORT_DIR"/lib/libonnxruntime.so*; do
             if [ -L "$f" ]; then
