@@ -103,6 +103,7 @@ mod tests {
 }
 
 #[cfg(all(test, target_os = "windows"))]
+#[allow(unused_imports)]
 mod windows_dependency_contract {
     use windows::Win32::System::Com as _;
     use windows::Win32::UI::Accessibility as _;
@@ -110,6 +111,7 @@ mod windows_dependency_contract {
 }
 
 #[cfg(all(test, target_os = "macos"))]
+#[allow(unused_imports)]
 mod macos_dependency_contract {
     use objc2_application_services as _;
     use objc2_core_foundation as _;
