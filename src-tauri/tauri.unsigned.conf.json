@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "signingIdentity": null
+    },
+    "windows": {
+      "signCommand": null
+    }
+  }
+}

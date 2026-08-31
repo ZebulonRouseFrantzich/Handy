@@ -24,7 +24,8 @@ use atspi::proxy::text::TextProxy;
 use atspi::zbus;
 use atspi::{
     connection::{read_session_accessibility, set_session_accessibility},
-    AccessibilityConnection, CacheItem, Interface, ObjectRefOwned, Operation, Role, State,
+    AccessibilityConnection, CacheItem, Interface, InterfaceSet, ObjectRefOwned, Operation, Role,
+    State, StateSet,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use futures_util::{Stream, StreamExt};
@@ -844,6 +845,15 @@ async fn application_cache_items(
     }
 }
 
+fn live_target_metadata_eligible(states: StateSet, interfaces: InterfaceSet) -> bool {
+    states.contains(State::Focused)
+        && states.contains(State::Sensitive)
+        && states.contains(State::Editable)
+        && !states.contains(State::Defunct)
+        && interfaces.contains(Interface::Accessible)
+        && interfaces.contains(Interface::Text)
+}
+
 async fn live_focused_candidates(
     connection: &AccessibilityConnection,
     items: Vec<CacheItem>,
@@ -874,16 +884,7 @@ async fn live_focused_candidates(
         let Ok(attributes) = target.get_attributes().await else {
             continue;
         };
-        if !states.contains(State::Focused) {
-            continue;
-        }
-        if !states.contains(State::Enabled)
-            || !states.contains(State::Sensitive)
-            || !states.contains(State::Editable)
-            || states.contains(State::Defunct)
-            || !interfaces.contains(Interface::Accessible)
-            || !interfaces.contains(Interface::Text)
-        {
+        if !live_target_metadata_eligible(states, interfaces) {
             continue;
         }
         if role == Role::PasswordText || secure_metadata(role, &attributes) {
@@ -957,14 +958,7 @@ async fn capture_target(
     if secure_metadata(live_role, &attributes) {
         return Err(FocusedOutputReasonCode::SecureField);
     }
-    if !live_states.contains(State::Focused)
-        || !live_states.contains(State::Enabled)
-        || !live_states.contains(State::Sensitive)
-        || !live_states.contains(State::Editable)
-        || live_states.contains(State::Defunct)
-        || !live_interfaces.contains(Interface::Accessible)
-        || !live_interfaces.contains(Interface::Text)
-    {
+    if !live_target_metadata_eligible(live_states, live_interfaces) {
         return Err(FocusedOutputReasonCode::TargetUnsupported);
     }
     let direct = live_interfaces.contains(Interface::EditableText);
@@ -1214,13 +1208,7 @@ async fn validate_target(
         session.monitor.terminal(T_SECURE);
         return Err(FocusedOutputReasonCode::SecureField);
     }
-    if !states.contains(State::Focused)
-        || !states.contains(State::Enabled)
-        || !states.contains(State::Sensitive)
-        || !states.contains(State::Editable)
-        || states.contains(State::Defunct)
-        || !interfaces.contains(Interface::Accessible)
-        || !interfaces.contains(Interface::Text)
+    if !live_target_metadata_eligible(states, interfaces)
         || (matches!(&session.route, Route::Direct)
             && !interfaces.contains(Interface::EditableText))
     {
@@ -2998,6 +2986,38 @@ mod tests {
         assert!(rejects(500, 100, &parents));
         assert!(!rejects(900, 100, &parents));
         assert!(rejects(777, 100, &parents));
+    }
+
+    #[test]
+    fn live_target_metadata_accepts_required_metadata_without_enabled() {
+        let states = StateSet::new(State::Focused | State::Sensitive | State::Editable);
+        let interfaces = InterfaceSet::new(Interface::Accessible | Interface::Text);
+
+        assert!(!states.contains(State::Enabled));
+        assert!(live_target_metadata_eligible(states, interfaces));
+    }
+
+    #[test]
+    fn live_target_metadata_rejects_missing_requirements_and_defunct_targets() {
+        let states = StateSet::new(State::Focused | State::Sensitive | State::Editable);
+        let interfaces = InterfaceSet::new(Interface::Accessible | Interface::Text);
+
+        for missing in [State::Focused, State::Sensitive, State::Editable] {
+            let mut incomplete = states;
+            incomplete.remove(missing);
+            assert!(!live_target_metadata_eligible(incomplete, interfaces));
+        }
+
+        let mut defunct = states;
+        defunct.insert(State::Defunct);
+        assert!(!live_target_metadata_eligible(defunct, interfaces));
+
+        for incomplete in [
+            InterfaceSet::new(Interface::Accessible),
+            InterfaceSet::new(Interface::Text),
+        ] {
+            assert!(!live_target_metadata_eligible(states, incomplete));
+        }
     }
 
     #[test]

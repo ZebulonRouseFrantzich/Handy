@@ -5,7 +5,7 @@ on: workflow_dispatch
 jobs:
   build-test:
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +36,9 @@ jobs:
     with:
       platform: ${{ matrix.platform }}
       target: ${{ matrix.target }}
-      build-args: ${{ matrix.args }}
+      build-args: ${{ format('{0} --no-sign --config src-tauri/tauri.unsigned.conf.json', matrix.args) }}
       run-native-tests: true
-      sign-binaries: true
+      sign-binaries: false
       asset-prefix: "handy-test"
       upload-artifacts: true
       is-debug-build: ${{ contains(matrix.args, '--debug') }}
