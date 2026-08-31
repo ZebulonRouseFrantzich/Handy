@@ -1,4 +1,5 @@
 name: "test"
+# Re-saved after enabling Actions so GitHub indexes the fork's default-branch workflows.
 on:
   workflow_dispatch:
   push:
