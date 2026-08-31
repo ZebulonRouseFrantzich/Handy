@@ -5,7 +5,7 @@ on: workflow_dispatch
 jobs:
   build-test:
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:
