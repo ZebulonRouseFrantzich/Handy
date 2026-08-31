@@ -8,6 +8,7 @@ use crate::focused_output::types::{
 };
 use crate::settings::AutoSubmitKey;
 use std::ffi::{c_char, c_double, c_float, c_long, c_void, CString};
+use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -18,11 +19,13 @@ use std::time::{Duration, Instant};
 const QUEUE_LEN: usize = 64;
 const COMMAND_LEN: usize = 4;
 const LOOP_SLICE: Duration = Duration::from_millis(4);
+const DUPLICATE_GUARD: Duration = Duration::from_millis(25);
 const AX_OK: i32 = 0;
 const AX_CANNOT_COMPLETE: i32 = -25204;
 const UTF8: u32 = 0x0800_0100;
 const AX_CF_RANGE: i32 = 4;
-const MARKER: i64 = 0x4841_4e44_59;
+const CF_RUN_LOOP_HANDLED_SOURCE: i32 = 4;
+const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 const EVENT_VALUE: u8 = 1;
 const EVENT_SELECTION: u8 = 2;
 const EVENT_TARGET_LOST: u8 = 3;
@@ -36,8 +39,18 @@ const TERMINAL_MONITOR: u8 = 3;
 const KEY_DOWN: u32 = 10;
 const FLAGS_CHANGED: u32 = 12;
 const LEFT_DOWN: u32 = 1;
+const LEFT_UP: u32 = 2;
 const RIGHT_DOWN: u32 = 3;
+const RIGHT_UP: u32 = 4;
 const MOUSE_MOVED: u32 = 5;
+const LEFT_DRAGGED: u32 = 6;
+const RIGHT_DRAGGED: u32 = 7;
+const SCROLL_WHEEL: u32 = 22;
+const TABLET_POINTER: u32 = 23;
+const TABLET_PROXIMITY: u32 = 24;
+const OTHER_DOWN: u32 = 25;
+const OTHER_UP: u32 = 26;
+const OTHER_DRAGGED: u32 = 27;
 const TAP_TIMEOUT: u32 = u32::MAX - 1;
 const TAP_DISABLED: u32 = u32::MAX;
 const EVENT_KEYCODE: u32 = 9;
@@ -47,6 +60,16 @@ const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
 const RETURN_KEY: u16 = 36;
+const KEYPAD_ENTER_KEY: u16 = 76;
+const KEY_INTENT_PRINTABLE: u64 = 0;
+const KEY_INTENT_DELETE: u64 = 1;
+const KEY_INTENT_SELECTION: u64 = 2;
+const KEY_INTENT_CARET: u64 = 3;
+const KEY_INTENT_FOCUS: u64 = 4;
+const KEY_INTENT_SUBMIT: u64 = 5;
+const KEY_INTENT_COMMAND: u64 = 6;
+const KEY_INTENT_IME: u64 = 7;
+const KEY_INTENT_UNKNOWN: u64 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,13 +150,32 @@ unsafe extern "C" {
     fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventSourceCreate(state: i32) -> CFTypeRef;
     fn CGEventCreateKeyboardEvent(source: CFTypeRef, key: u16, down: bool) -> CGEventRef;
+    fn CGEventKeyboardGetUnicodeString(
+        event: CGEventRef,
+        max_len: usize,
+        actual_len: *mut usize,
+        text: *mut u16,
+    );
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, len: usize, text: *const u16);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: CGEventRef);
 }
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecRandomDefault: *const c_void;
+    fn SecRandomCopyBytes(random: *const c_void, count: usize, bytes: *mut u8) -> i32;
+}
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffer_size: u32) -> i32;
+}
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
+    static kTISPropertyInputSourceType: CFStringRef;
+    static kTISTypeKeyboardLayout: CFStringRef;
+    fn TISCopyCurrentKeyboardInputSource() -> CFTypeRef;
+    fn TISGetInputSourceProperty(input_source: CFTypeRef, property_key: CFStringRef) -> CFTypeRef;
     fn IsSecureEventInputEnabled() -> u8;
 }
 fn secure_input_enabled() -> bool {
@@ -215,31 +257,39 @@ unsafe impl Send for Owned {}
 struct Ring {
     head: AtomicU64,
     tail: AtomicU64,
-    slots: [AtomicU64; QUEUE_LEN],
+    kinds: [AtomicU8; QUEUE_LEN],
+    data: [AtomicU64; QUEUE_LEN],
 }
 impl Ring {
     fn new() -> Self {
         Self {
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
-            slots: [const { AtomicU64::new(0) }; QUEUE_LEN],
+            kinds: [const { AtomicU8::new(0) }; QUEUE_LEN],
+            data: [const { AtomicU64::new(0) }; QUEUE_LEN],
         }
     }
-    fn push(&self, value: u64) -> bool {
+    fn push(&self, kind: u8, data: u64) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         if head.wrapping_sub(self.tail.load(Ordering::Acquire)) >= QUEUE_LEN as u64 {
             return false;
         }
-        self.slots[head as usize % QUEUE_LEN].store(value, Ordering::Relaxed);
+        let index = head as usize % QUEUE_LEN;
+        self.data[index].store(data, Ordering::Relaxed);
+        self.kinds[index].store(kind, Ordering::Relaxed);
         self.head.store(head.wrapping_add(1), Ordering::Release);
         true
     }
-    fn pop(&self) -> Option<u64> {
+    fn pop(&self) -> Option<(u8, u64)> {
         let tail = self.tail.load(Ordering::Relaxed);
         if tail == self.head.load(Ordering::Acquire) {
             return None;
         }
-        let value = self.slots[tail as usize % QUEUE_LEN].load(Ordering::Relaxed);
+        let index = tail as usize % QUEUE_LEN;
+        let value = (
+            self.kinds[index].load(Ordering::Relaxed),
+            self.data[index].load(Ordering::Relaxed),
+        );
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(value)
     }
@@ -248,14 +298,14 @@ struct CallbackState {
     ring: Ring,
     terminal: AtomicU8,
     injection: AtomicU64,
+    session_marker: u64,
+    active_marker: AtomicU64,
+    active_seen: AtomicU64,
     guard: Option<KeyGuard>,
 }
 impl CallbackState {
     fn publish(&self, kind: u8, data: u64) {
-        if !self
-            .ring
-            .push((kind as u64) << 56 | data & 0x00ff_ffff_ffff_ffff)
-        {
+        if !self.ring.push(kind, data) {
             self.terminal(TERMINAL_MONITOR);
         }
     }
@@ -317,19 +367,53 @@ unsafe extern "C" fn tap_callback(
         state.publish(EVENT_TAP_LOST, 0);
         return event;
     }
-    if kind == LEFT_DOWN || kind == RIGHT_DOWN || kind == MOUSE_MOVED {
+    if pointer_event(kind) {
         state.terminal(TERMINAL_POINTER);
         state.publish(EVENT_POINTER, 0);
         return event;
     }
-    if kind == KEY_DOWN && unsafe { CGEventGetIntegerValueField(event, EVENT_USER_DATA) } != MARKER
-    {
-        let key = unsafe { CGEventGetIntegerValueField(event, EVENT_KEYCODE) } as u16;
-        let flags = unsafe { CGEventGetFlags(event) } & modifier_mask();
-        if state.guard != Some(KeyGuard { key, flags }) {
-            state.publish(EVENT_KEY, (flags << 16) | key as u64);
-        }
+    if kind != KEY_DOWN {
+        return event;
     }
+    let marker = unsafe { CGEventGetIntegerValueField(event, EVENT_USER_DATA) } as u64;
+    match marker_disposition(marker, state.active_marker.load(Ordering::Acquire)) {
+        MarkerDisposition::Active => {
+            state.active_seen.store(marker, Ordering::Release);
+            return event;
+        }
+        MarkerDisposition::Foreign => {
+            state.terminal(TERMINAL_TARGET);
+            state.publish(EVENT_KEY, KEY_INTENT_UNKNOWN);
+            return event;
+        }
+        MarkerDisposition::Physical => {}
+    }
+    let key = unsafe { CGEventGetIntegerValueField(event, EVENT_KEYCODE) } as u16;
+    let flags = unsafe { CGEventGetFlags(event) } & modifier_mask();
+    if state.guard == Some(KeyGuard { key, flags }) {
+        return event;
+    }
+    let mut unicode = [0u16; 8];
+    let mut unicode_len = 0;
+    unsafe {
+        CGEventKeyboardGetUnicodeString(
+            event,
+            unicode.len(),
+            &mut unicode_len,
+            unicode.as_mut_ptr(),
+        )
+    };
+    let intent = if unicode_len <= unicode.len() {
+        classify_key_intent(
+            key,
+            flags,
+            &unicode[..unicode_len],
+            keyboard_layout_active(),
+        )
+    } else {
+        KEY_INTENT_IME
+    };
+    state.publish(EVENT_KEY, intent);
     event
 }
 
@@ -340,6 +424,109 @@ struct KeyGuard {
 }
 fn modifier_mask() -> u64 {
     FLAG_SHIFT | FLAG_CONTROL | FLAG_OPTION | FLAG_COMMAND
+}
+fn pointer_event(kind: u32) -> bool {
+    matches!(
+        kind,
+        LEFT_DOWN
+            | LEFT_UP
+            | RIGHT_DOWN
+            | RIGHT_UP
+            | MOUSE_MOVED
+            | LEFT_DRAGGED
+            | RIGHT_DRAGGED
+            | SCROLL_WHEEL
+            | TABLET_POINTER
+            | TABLET_PROXIMITY
+            | OTHER_DOWN
+            | OTHER_UP
+            | OTHER_DRAGGED
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerDisposition {
+    Physical,
+    Active,
+    Foreign,
+}
+fn marker_disposition(observed: u64, active: u64) -> MarkerDisposition {
+    if observed == 0 {
+        MarkerDisposition::Physical
+    } else if active != 0 && observed == active {
+        MarkerDisposition::Active
+    } else {
+        MarkerDisposition::Foreign
+    }
+}
+fn printable_keycode(key: u16) -> bool {
+    matches!(
+        key,
+        0..=9
+            | 11..=35
+            | 37..=47
+            | 49..=50
+            | 65
+            | 67
+            | 69
+            | 75
+            | 78
+            | 81..=92
+    )
+}
+fn classify_key_intent(key: u16, flags: u64, unicode: &[u16], layout_active: bool) -> u64 {
+    if matches!(key, RETURN_KEY | KEYPAD_ENTER_KEY) {
+        return KEY_INTENT_SUBMIT;
+    }
+    if flags & (FLAG_COMMAND | FLAG_CONTROL) != 0 {
+        return KEY_INTENT_COMMAND;
+    }
+    if flags & FLAG_OPTION != 0 {
+        return KEY_INTENT_IME;
+    }
+    if matches!(key, 51 | 117) {
+        return KEY_INTENT_DELETE;
+    }
+    if matches!(key, 115 | 116 | 119 | 121 | 123..=126) {
+        return if flags & FLAG_SHIFT != 0 {
+            KEY_INTENT_SELECTION
+        } else {
+            KEY_INTENT_CARET
+        };
+    }
+    if key == 48 {
+        return KEY_INTENT_FOCUS;
+    }
+    if !layout_active {
+        return KEY_INTENT_IME;
+    }
+    if !printable_keycode(key) {
+        return KEY_INTENT_UNKNOWN;
+    }
+    let mut chars = char::decode_utf16(unicode.iter().copied());
+    match (chars.next(), chars.next()) {
+        (Some(Ok(value)), None) if !value.is_control() => KEY_INTENT_PRINTABLE,
+        _ => KEY_INTENT_IME,
+    }
+}
+fn keyboard_layout_active() -> bool {
+    let Some(source) = Owned::new(unsafe { TISCopyCurrentKeyboardInputSource() }) else {
+        return false;
+    };
+    let kind = unsafe { TISGetInputSourceProperty(source.0, kTISPropertyInputSourceType) };
+    !kind.is_null() && unsafe { CFEqual(kind, kTISTypeKeyboardLayout.cast()) }
+}
+fn key_intent_kind(intent: u64) -> UnsafeEditKind {
+    match intent {
+        KEY_INTENT_DELETE => UnsafeEditKind::Delete,
+        KEY_INTENT_SELECTION => UnsafeEditKind::SelectionChanged,
+        KEY_INTENT_CARET => UnsafeEditKind::CaretRepositioned,
+        KEY_INTENT_FOCUS => UnsafeEditKind::FocusTraversal,
+        KEY_INTENT_SUBMIT => UnsafeEditKind::SubmitOrNewlineAmbiguous,
+        KEY_INTENT_COMMAND => UnsafeEditKind::CommandShortcut,
+        KEY_INTENT_IME => UnsafeEditKind::ImeComposition,
+        _ => UnsafeEditKind::Unknown,
+    }
 }
 fn parse_guard(value: Option<&str>) -> Result<Option<KeyGuard>, FocusedOutputReasonCode> {
     let Some(value) = value else { return Ok(None) };
@@ -388,23 +575,46 @@ fn negotiate(settable: bool, readable: bool) -> Route {
         Route::Cg
     }
 }
-fn provider(app: &str, role: &str) -> Provider {
-    let app = app.to_ascii_lowercase();
-    if app.contains("safari") || app.contains("webkit") {
+fn provider(executable: &str) -> Provider {
+    let executable = executable.to_ascii_lowercase();
+    if executable == "safari"
+        || executable == "webkit"
+        || executable.starts_with("com.apple.webkit.")
+    {
         Provider::WebKit
-    } else if ["chrome", "chromium", "edge", "brave", "electron"]
-        .iter()
-        .any(|v| app.contains(v))
+    } else if matches!(
+        executable.as_str(),
+        "google chrome" | "chromium" | "microsoft edge" | "brave browser" | "electron"
+    ) || executable.starts_with("google chrome helper")
+        || executable.starts_with("chromium helper")
+        || executable.starts_with("microsoft edge helper")
+        || executable.starts_with("brave browser helper")
+        || executable.starts_with("electron helper")
     {
         Provider::Chromium
-    } else if matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox") {
+    } else if matches!(
+        executable.as_str(),
+        "notes" | "textedit" | "mail" | "messages"
+    ) {
         Provider::AppKit
     } else {
         Provider::Unknown
     }
 }
+fn checked_security_metadata(
+    subrole: Result<String, i32>,
+    protected: Result<bool, i32>,
+) -> Result<String, FocusedOutputReasonCode> {
+    let subrole = subrole.map_err(|_| FocusedOutputReasonCode::SecureField)?;
+    let protected = protected.map_err(|_| FocusedOutputReasonCode::SecureField)?;
+    if subrole == "AXSecureTextField" || protected {
+        Err(FocusedOutputReasonCode::SecureField)
+    } else {
+        Ok(subrole)
+    }
+}
 fn submit_supported(provider: Provider, role: &str, _: AutoSubmitKey) -> bool {
-    provider != Provider::Unknown && matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+    provider != Provider::Unknown && role == "AXTextField"
 }
 fn capability(route: Route, submit: bool) -> FocusedOutputCapability {
     let resolved = ResolvedInsertionCapability {
@@ -435,14 +645,6 @@ fn capability(route: Route, submit: bool) -> FocusedOutputCapability {
         )
     }
 }
-fn exact_prefix(expected: &str, observed: &str) -> usize {
-    expected
-        .char_indices()
-        .map(|(i, c)| i + c.len_utf8())
-        .take_while(|n| observed.get(..*n) == expected.get(..*n))
-        .last()
-        .unwrap_or(0)
-}
 fn classify_ax(request: &str, set_error: Option<i32>, readback: Option<&str>) -> InsertOutcome {
     if let Some(error) = set_error {
         return if error == AX_CANNOT_COMPLETE {
@@ -465,26 +667,30 @@ fn classify_ax(request: &str, set_error: Option<i32>, readback: Option<&str>) ->
             receipt: ReceiptConfidence::Verified,
         }
     } else {
-        let accepted_bytes = exact_prefix(request, readback);
-        if accepted_bytes > 0 {
-            InsertOutcome::Partial {
-                accepted_bytes,
-                receipt: ReceiptConfidence::Verified,
-                reason: FocusedOutputReasonCode::InjectionPartial,
-            }
-        } else {
-            InsertOutcome::Ambiguous {
-                reason: FocusedOutputReasonCode::InjectionAmbiguous,
-            }
+        InsertOutcome::Ambiguous {
+            reason: FocusedOutputReasonCode::InjectionAmbiguous,
         }
     }
 }
-fn scalars(text: &str) -> impl Iterator<Item = ([u16; 2], usize)> + '_ {
+fn scalars(text: &str) -> impl Iterator<Item = ([u16; 2], usize, usize)> + '_ {
     text.chars().map(|c| {
         let mut b = [0; 2];
         let n = c.encode_utf16(&mut b).len();
-        (b, n)
+        (b, n, c.len_utf8())
     })
+}
+fn verified_cg_prefix(total_bytes: usize, accepted_bytes: usize) -> InsertOutcome {
+    if accepted_bytes == total_bytes {
+        InsertOutcome::Complete {
+            receipt: ReceiptConfidence::Verified,
+        }
+    } else {
+        InsertOutcome::Partial {
+            accepted_bytes,
+            receipt: ReceiptConfidence::Verified,
+            reason: FocusedOutputReasonCode::InjectionPartial,
+        }
+    }
 }
 
 pub struct MacFocusedFieldBackend {
@@ -767,6 +973,7 @@ struct Identity {
     window: Owned,
     pid: i32,
     role: String,
+    subrole: String,
     identifier: String,
 }
 struct Subscription {
@@ -813,10 +1020,32 @@ impl Drop for Tap {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Snapshot {
     caret: c_long,
     utf16: usize,
+}
+enum CgScalarOutcome {
+    Observed(Snapshot),
+    VerifiedNoReceipt(Snapshot),
+    Rejected,
+    Ambiguous,
+}
+fn verified_ax_partial_bytes(
+    request: &str,
+    before: Snapshot,
+    after: Snapshot,
+    observed: &str,
+) -> Option<usize> {
+    let caret_units = after.caret.checked_sub(before.caret)?;
+    let value_units = after.utf16.checked_sub(before.utf16)?;
+    (caret_units > 0
+        && caret_units as usize == value_units
+        && !observed.is_empty()
+        && observed.len() < request.len()
+        && observed.encode_utf16().count() == value_units
+        && request.starts_with(observed))
+    .then_some(observed.len())
 }
 struct Native {
     id: DictationSessionId,
@@ -835,7 +1064,9 @@ struct Native {
     invalid: bool,
     last: Snapshot,
     last_injection: u64,
-    pending_external_key: bool,
+    last_marker: u64,
+    pending_external_key: Option<Instant>,
+    allowed_external_selection: Option<(Snapshot, Instant)>,
 }
 impl Native {
     fn capture(
@@ -860,6 +1091,14 @@ impl Native {
         if pid == std::process::id() as i32 {
             return Err(FocusedOutputReasonCode::HandyOwnedTarget);
         }
+        let executable =
+            process_executable(pid).ok_or(FocusedOutputReasonCode::TargetUnsupported)?;
+        if matches!(
+            executable.to_ascii_lowercase().as_str(),
+            "handy" | "handy.app"
+        ) {
+            return Err(FocusedOutputReasonCode::HandyOwnedTarget);
+        }
         if unsafe { AXUIElementSetMessagingTimeout(app.ax(), deadlines.target_call.as_secs_f32()) }
             != AX_OK
         {
@@ -869,20 +1108,16 @@ impl Native {
             .map_err(|_| FocusedOutputReasonCode::NoFocusedTarget)?;
         let window = attr(app.ax(), "AXFocusedWindow")
             .map_err(|_| FocusedOutputReasonCode::NoFocusedTarget)?;
-        let app_name = string_attr(app.ax(), "AXTitle")
-            .ok()
-            .and_then(|v| sanitize(&v));
-        if app_name
-            .as_deref()
-            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "handy" | "handy.app"))
-        {
-            return Err(FocusedOutputReasonCode::HandyOwnedTarget);
-        }
+        let app_name = Some(executable.clone());
         let role = string_attr(element.ax(), "AXRole")
             .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
         if !matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox") {
             return Err(FocusedOutputReasonCode::TargetNotEditable);
         }
+        let subrole = checked_security_metadata(
+            string_attr(element.ax(), "AXSubrole"),
+            bool_attr(element.ax(), "AXProtectedContent"),
+        )?;
         let identifier = string_attr(element.ax(), "AXIdentifier")
             .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
         if identifier.is_empty() {
@@ -893,11 +1128,7 @@ impl Native {
         {
             return Err(FocusedOutputReasonCode::TargetNotEditable);
         }
-        if string_attr(element.ax(), "AXSubrole").ok().as_deref() == Some("AXSecureTextField")
-            || bool_attr(element.ax(), "AXProtectedContent").unwrap_or(false)
-        {
-            return Err(FocusedOutputReasonCode::SecureField);
-        }
+
         let range = range_attr(element.ax(), "AXSelectedTextRange")
             .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
         if range.location < 0 || range.length != 0 {
@@ -909,7 +1140,7 @@ impl Native {
             caret: range.location,
             utf16: value.encode_utf16().count(),
         };
-        let provider = provider(app_name.as_deref().unwrap_or(""), &role);
+        let provider = provider(&executable);
         let submit = [
             AutoSubmitKey::Enter,
             AutoSubmitKey::CtrlEnter,
@@ -925,10 +1156,15 @@ impl Native {
             read_range(element.ax(), range).is_ok(),
         );
         let capability = capability(route, submit);
+        let session_marker =
+            secure_marker(&[]).ok_or(FocusedOutputReasonCode::MonitorUnavailable)?;
         let callback = Arc::new(CallbackState {
             ring: Ring::new(),
             terminal: AtomicU8::new(0),
             injection: AtomicU64::new(0),
+            session_marker,
+            active_marker: AtomicU64::new(0),
+            active_seen: AtomicU64::new(0),
             guard,
         });
         let identity = Identity {
@@ -937,6 +1173,7 @@ impl Native {
             window,
             pid,
             role,
+            subrole,
             identifier,
         };
         let subscription = subscribe(&identity, &callback)?;
@@ -958,7 +1195,9 @@ impl Native {
             invalid: false,
             last,
             last_injection: 0,
-            pending_external_key: false,
+            last_marker: session_marker,
+            pending_external_key: None,
+            allowed_external_selection: None,
         })
     }
     fn run(&mut self, rx: Receiver<Command>) {
@@ -1029,17 +1268,22 @@ impl Native {
         {
             return Err(FocusedOutputReasonCode::TargetChanged);
         }
-        if string_attr(element.ax(), "AXRole").ok().as_deref() != Some(self.identity.role.as_str())
-            || string_attr(element.ax(), "AXIdentifier").ok().as_deref()
-                != Some(self.identity.identifier.as_str())
+        let role = string_attr(element.ax(), "AXRole")
+            .map_err(|_| FocusedOutputReasonCode::TargetChanged)?;
+        let subrole = checked_security_metadata(
+            string_attr(element.ax(), "AXSubrole"),
+            bool_attr(element.ax(), "AXProtectedContent"),
+        )?;
+        if role != self.identity.role
+            || subrole != self.identity.subrole
+            || string_attr(element.ax(), "AXIdentifier")
+                .map_err(|_| FocusedOutputReasonCode::TargetChanged)?
+                != self.identity.identifier
         {
             return Err(FocusedOutputReasonCode::TargetChanged);
         }
         if !bool_attr(element.ax(), "AXEditable").unwrap_or(false) {
             return Err(FocusedOutputReasonCode::TargetNotEditable);
-        }
-        if bool_attr(element.ax(), "AXProtectedContent").unwrap_or(false) {
-            return Err(FocusedOutputReasonCode::SecureField);
         }
         let range = range_attr(element.ax(), "AXSelectedTextRange")
             .map_err(|_| FocusedOutputReasonCode::TargetChanged)?;
@@ -1059,134 +1303,423 @@ impl Native {
                 reason: FocusedOutputReasonCode::Cancelled,
             };
         }
+        if self.pending_external_key.is_some() {
+            return InsertOutcome::Rejected {
+                reason: FocusedOutputReasonCode::TargetChanged,
+            };
+        }
+        self.allowed_external_selection = None;
         let before = match self.validate() {
             Ok(v) => v,
             Err(e) => return InsertOutcome::Rejected { reason: e },
         };
         let injection = request.injection_id;
-        self.callback
-            .injection
-            .store(injection.0, Ordering::Release);
-        let result = if self.route == Route::Ax {
+        let (mut result, verified_after) = if self.route == Route::Ax {
             self.ax_insert(&request, before)
         } else {
             self.cg_insert(&request, before)
         };
         if matches!(result, InsertOutcome::Complete { .. }) {
-            if let Ok(after) = self.validate() {
-                self.last = after;
-                self.publish_handy(injection, after.caret as i64);
+            match verified_after {
+                Some(after) => {
+                    self.last = after;
+                    if self.callback.terminal.load(Ordering::Acquire) == TERMINAL_NONE {
+                        self.publish_handy(injection, after.caret as i64);
+                    }
+                }
+                None => {
+                    result = InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    };
+                }
             }
         }
+        self.callback.active_marker.store(0, Ordering::Release);
         self.callback.injection.store(0, Ordering::Release);
         result
     }
-    fn ax_insert(&self, request: &InsertionRequest, before: Snapshot) -> InsertOutcome {
+    fn fresh_secret(&mut self, extra_exclusion: u64) -> Option<u64> {
+        let secret = secure_marker(&[
+            self.callback.session_marker,
+            self.last_marker,
+            extra_exclusion,
+        ])?;
+        self.last_marker = secret;
+        Some(secret)
+    }
+    fn ax_insert(
+        &mut self,
+        request: &InsertionRequest,
+        before: Snapshot,
+    ) -> (InsertOutcome, Option<Snapshot>) {
         if self.cancellation.is_cancelled() {
-            return InsertOutcome::Rejected {
-                reason: FocusedOutputReasonCode::Cancelled,
-            };
+            return (
+                InsertOutcome::Rejected {
+                    reason: FocusedOutputReasonCode::Cancelled,
+                },
+                None,
+            );
         }
         let Some(text) = string_bytes(request.text.as_bytes()) else {
-            return InsertOutcome::Rejected {
-                reason: FocusedOutputReasonCode::InjectionFailed,
-            };
+            return (
+                InsertOutcome::Rejected {
+                    reason: FocusedOutputReasonCode::InjectionFailed,
+                },
+                None,
+            );
         };
+        let Some(correlation) = self.fresh_secret(0) else {
+            return (
+                InsertOutcome::Rejected {
+                    reason: FocusedOutputReasonCode::InjectionFailed,
+                },
+                None,
+            );
+        };
+        self.callback
+            .injection
+            .store(correlation, Ordering::Release);
+        let outcome = self.ax_insert_tagged(request, before, &text, correlation);
+        self.callback.injection.store(0, Ordering::Release);
+        outcome
+    }
+    fn ax_insert_tagged(
+        &mut self,
+        request: &InsertionRequest,
+        before: Snapshot,
+        text: &Owned,
+        correlation: u64,
+    ) -> (InsertOutcome, Option<Snapshot>) {
         let name = cfstr("AXSelectedText");
         let error = unsafe {
             AXUIElementSetAttributeValue(self.identity.element.ax(), name.0.cast(), text.0)
         };
         if error != AX_OK {
-            return classify_ax(&request.text, Some(error), None);
+            return (classify_ax(&request.text, Some(error), None), None);
+        }
+        let expected: Vec<_> = request.text.encode_utf16().collect();
+        let range = CFRange {
+            location: before.caret,
+            length: expected.len() as c_long,
+        };
+        let result = match read_range(self.identity.element.ax(), range) {
+            Ok(value) => classify_ax(&request.text, None, Some(&value)),
+            Err(_) => classify_ax(&request.text, None, None),
+        };
+        if !matches!(result, InsertOutcome::Complete { .. }) {
+            return self
+                .verified_ax_partial(before, &request.text)
+                .unwrap_or((result, None));
+        }
+        let Some(after) = self.matches_change(before, &expected) else {
+            return (
+                InsertOutcome::Ambiguous {
+                    reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                },
+                None,
+            );
+        };
+        let end = Instant::now() + self.deadlines.handy_receipt;
+        let mut value_count = 0u8;
+        let mut selection_count = 0u8;
+        let mut matched_at = None;
+        loop {
+            let run_status = unsafe {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, LOOP_SLICE.as_secs_f64(), true)
+            };
+            let (valid, values, selections) = self.drain_injection_callbacks(
+                correlation,
+                before,
+                &expected,
+                matched_at.is_some(),
+            );
+            value_count = value_count.saturating_add(values);
+            selection_count = selection_count.saturating_add(selections);
+            if !valid || value_count > 1 || selection_count > 1 {
+                self.callback.terminal(TERMINAL_TARGET);
+                return (
+                    InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    },
+                    None,
+                );
+            }
+            let now = Instant::now();
+            if value_count == 1 {
+                if matched_at.is_none() {
+                    matched_at = Some(now);
+                    self.callback.injection.store(0, Ordering::Release);
+                }
+                let matched = matched_at.expect("set above");
+                if now >= matched + DUPLICATE_GUARD && run_status != CF_RUN_LOOP_HANDLED_SOURCE {
+                    return (result, Some(after));
+                }
+                if now >= matched + self.deadlines.handy_receipt {
+                    self.callback.terminal(TERMINAL_MONITOR);
+                    return (
+                        InsertOutcome::Ambiguous {
+                            reason: FocusedOutputReasonCode::MonitorUnavailable,
+                        },
+                        None,
+                    );
+                }
+            } else if now >= end {
+                self.callback.terminal(TERMINAL_MONITOR);
+                return (
+                    InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::MonitorUnavailable,
+                    },
+                    None,
+                );
+            }
+            if self.cancellation.is_cancelled() {
+                self.callback.terminal(TERMINAL_TARGET);
+                return (
+                    InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    },
+                    None,
+                );
+            }
+        }
+    }
+    fn verified_ax_partial(
+        &self,
+        before: Snapshot,
+        request: &str,
+    ) -> Option<(InsertOutcome, Option<Snapshot>)> {
+        let after = self.validate().ok()?;
+        let caret_units = after.caret.checked_sub(before.caret)?;
+        if caret_units <= 0 {
+            return None;
         }
         let range = CFRange {
             location: before.caret,
-            length: request.text.encode_utf16().count() as c_long,
+            length: caret_units,
         };
-        match read_range(self.identity.element.ax(), range) {
-            Ok(value) => classify_ax(&request.text, None, Some(&value)),
-            Err(_) => classify_ax(&request.text, None, None),
-        }
+        let observed = read_range(self.identity.element.ax(), range).ok()?;
+        let accepted_bytes = verified_ax_partial_bytes(request, before, after, &observed)?;
+        Some((
+            InsertOutcome::Partial {
+                accepted_bytes,
+                receipt: ReceiptConfidence::Verified,
+                reason: FocusedOutputReasonCode::InjectionPartial,
+            },
+            Some(after),
+        ))
     }
-    fn cg_insert(&mut self, request: &InsertionRequest, mut before: Snapshot) -> InsertOutcome {
-        let mut posted = false;
-        for (unit, len) in scalars(&request.text) {
+    fn cg_insert(
+        &mut self,
+        request: &InsertionRequest,
+        mut before: Snapshot,
+    ) -> (InsertOutcome, Option<Snapshot>) {
+        let mut accepted_bytes = 0;
+        for (unit, len, utf8_len) in scalars(&request.text) {
             if self.cancellation.is_cancelled() {
-                return if posted {
-                    InsertOutcome::Ambiguous {
-                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
-                    }
+                return if accepted_bytes > 0 {
+                    (
+                        verified_cg_prefix(request.text.len(), accepted_bytes),
+                        Some(before),
+                    )
                 } else {
-                    InsertOutcome::Rejected {
-                        reason: FocusedOutputReasonCode::Cancelled,
-                    }
+                    (
+                        InsertOutcome::Rejected {
+                            reason: FocusedOutputReasonCode::Cancelled,
+                        },
+                        None,
+                    )
                 };
             }
             match self.validate() {
-                Ok(v) if v.caret == before.caret && v.utf16 == before.utf16 => {}
-                Ok(_) | Err(_) if posted => {
-                    return InsertOutcome::Ambiguous {
-                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
-                    }
+                Ok(v) if v == before => {}
+                Ok(_) | Err(_) if accepted_bytes > 0 => {
+                    self.callback.terminal(TERMINAL_TARGET);
+                    return (
+                        verified_cg_prefix(request.text.len(), accepted_bytes),
+                        Some(before),
+                    );
                 }
                 Ok(_) => {
-                    return InsertOutcome::Rejected {
-                        reason: FocusedOutputReasonCode::TargetChanged,
-                    }
+                    return (
+                        InsertOutcome::Rejected {
+                            reason: FocusedOutputReasonCode::TargetChanged,
+                        },
+                        None,
+                    );
                 }
-                Err(e) => return InsertOutcome::Rejected { reason: e },
+                Err(e) => return (InsertOutcome::Rejected { reason: e }, None),
             }
-            if !post_scalar(&unit, len) {
-                return if posted {
-                    InsertOutcome::Ambiguous {
-                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
-                    }
-                } else {
-                    InsertOutcome::Rejected {
-                        reason: FocusedOutputReasonCode::InjectionFailed,
-                    }
-                };
+            match self.cg_scalar(before, &unit[..len]) {
+                CgScalarOutcome::Observed(after) => {
+                    accepted_bytes += utf8_len;
+                    before = after;
+                }
+                CgScalarOutcome::VerifiedNoReceipt(after) => {
+                    accepted_bytes += utf8_len;
+                    return (
+                        verified_cg_prefix(request.text.len(), accepted_bytes),
+                        Some(after),
+                    );
+                }
+                CgScalarOutcome::Rejected if accepted_bytes > 0 => {
+                    return (
+                        verified_cg_prefix(request.text.len(), accepted_bytes),
+                        Some(before),
+                    );
+                }
+                CgScalarOutcome::Rejected => {
+                    return (
+                        InsertOutcome::Rejected {
+                            reason: FocusedOutputReasonCode::InjectionFailed,
+                        },
+                        None,
+                    );
+                }
+                CgScalarOutcome::Ambiguous => {
+                    return (
+                        InsertOutcome::Ambiguous {
+                            reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                        },
+                        None,
+                    );
+                }
             }
-            posted = true;
-            let end = Instant::now() + self.deadlines.input_effect;
+        }
+        (
+            InsertOutcome::Complete {
+                receipt: ReceiptConfidence::Posted,
+            },
+            Some(before),
+        )
+    }
+    fn cg_scalar(&mut self, before: Snapshot, expected: &[u16]) -> CgScalarOutcome {
+        if self.callback.ring.pop().is_some() {
+            self.callback.terminal(TERMINAL_TARGET);
+            return CgScalarOutcome::Ambiguous;
+        }
+        let Some(correlation) = self.fresh_secret(0) else {
+            return CgScalarOutcome::Rejected;
+        };
+        let Some(marker) = self.fresh_secret(correlation) else {
+            return CgScalarOutcome::Rejected;
+        };
+        self.callback
+            .injection
+            .store(correlation, Ordering::Release);
+        self.callback.active_seen.store(0, Ordering::Release);
+        self.callback.active_marker.store(marker, Ordering::Release);
+        let mut outcome = CgScalarOutcome::Rejected;
+        if post_scalar(
+            &[expected[0], expected.get(1).copied().unwrap_or(0)],
+            expected.len(),
+            marker,
+        ) {
+            let effect_deadline = Instant::now() + self.deadlines.input_effect;
+            let receipt_deadline = Instant::now() + self.deadlines.handy_receipt;
+            let mut exact_after = None;
+            let mut value_count = 0u8;
+            let mut selection_count = 0u8;
+            let mut matched_at = None;
             loop {
-                unsafe {
+                let run_status = unsafe {
                     CFRunLoopRunInMode(kCFRunLoopDefaultMode, LOOP_SLICE.as_secs_f64(), true)
                 };
-                self.drain_injection_callbacks();
-                match self.validate() {
-                    Ok(v)
-                        if v.caret == before.caret + len as c_long
-                            && v.utf16 >= before.utf16 + len =>
-                    {
-                        before = v;
+                let (valid, values, selections) = self.drain_injection_callbacks(
+                    correlation,
+                    before,
+                    expected,
+                    matched_at.is_some(),
+                );
+                value_count = value_count.saturating_add(values);
+                selection_count = selection_count.saturating_add(selections);
+                if !valid || value_count > 1 || selection_count > 1 {
+                    self.callback.terminal(TERMINAL_TARGET);
+                    outcome = CgScalarOutcome::Ambiguous;
+                    break;
+                }
+                if exact_after.is_none() {
+                    exact_after = self.matches_change(before, expected);
+                }
+                let marker_seen = self.callback.active_seen.load(Ordering::Acquire) == marker;
+                if let Some(after) = exact_after {
+                    let now = Instant::now();
+                    if value_count == 1 && marker_seen {
+                        if matched_at.is_none() {
+                            matched_at = Some(now);
+                            self.callback.injection.store(0, Ordering::Release);
+                        }
+                        let matched = matched_at.expect("set above");
+                        if now >= matched + DUPLICATE_GUARD
+                            && run_status != CF_RUN_LOOP_HANDLED_SOURCE
+                        {
+                            outcome = CgScalarOutcome::Observed(after);
+                            break;
+                        }
+                        if now >= matched + self.deadlines.handy_receipt {
+                            self.callback.terminal(TERMINAL_MONITOR);
+                            outcome = CgScalarOutcome::VerifiedNoReceipt(after);
+                            break;
+                        }
+                    } else if self.cancellation.is_cancelled() || now >= receipt_deadline {
+                        if marker_seen {
+                            self.callback.terminal(if self.cancellation.is_cancelled() {
+                                TERMINAL_TARGET
+                            } else {
+                                TERMINAL_MONITOR
+                            });
+                            outcome = CgScalarOutcome::VerifiedNoReceipt(after);
+                        } else {
+                            self.callback.terminal(TERMINAL_MONITOR);
+                            outcome = CgScalarOutcome::Ambiguous;
+                        }
                         break;
                     }
-                    _ if Instant::now() < end => {}
-                    _ => {
-                        return InsertOutcome::Ambiguous {
-                            reason: FocusedOutputReasonCode::InjectionAmbiguous,
-                        }
-                    }
+                } else if self.cancellation.is_cancelled() || Instant::now() >= effect_deadline {
+                    outcome = CgScalarOutcome::Ambiguous;
+                    break;
                 }
             }
         }
-        InsertOutcome::Complete {
-            receipt: ReceiptConfidence::Posted,
-        }
+        self.callback.active_marker.store(0, Ordering::Release);
+        self.callback.injection.store(0, Ordering::Release);
+        outcome
     }
-    fn submit(&self, key: AutoSubmitKey) -> SubmitOutcome {
+    fn submit(&mut self, key: AutoSubmitKey) -> SubmitOutcome {
         if !submit_supported(self.provider, &self.identity.role, key) {
             return SubmitOutcome::Rejected {
                 reason: FocusedOutputReasonCode::AutoSubmitUnsupported,
             };
         }
+        if self.pending_external_key.is_some() {
+            return SubmitOutcome::Rejected {
+                reason: FocusedOutputReasonCode::TargetChanged,
+            };
+        }
         if let Err(e) = self.validate() {
             return SubmitOutcome::Rejected { reason: e };
         }
-        if post_key(key) {
+        let Some(marker) = secure_marker(&[self.callback.session_marker, self.last_marker]) else {
+            return SubmitOutcome::Rejected {
+                reason: FocusedOutputReasonCode::InjectionFailed,
+            };
+        };
+        self.last_marker = marker;
+        self.callback.active_seen.store(0, Ordering::Release);
+        self.callback.active_marker.store(marker, Ordering::Release);
+        let posted = post_key(key, marker);
+        let observed = posted
+            && self.wait_for_marker(
+                marker,
+                self.deadlines.target_call.saturating_sub(LOOP_SLICE),
+            );
+        self.callback.active_marker.store(0, Ordering::Release);
+        if observed {
             SubmitOutcome::Complete {
                 receipt: ReceiptConfidence::Posted,
+            }
+        } else if posted {
+            SubmitOutcome::Ambiguous {
+                reason: FocusedOutputReasonCode::MonitorUnavailable,
             }
         } else {
             SubmitOutcome::Rejected {
@@ -1217,43 +1750,64 @@ impl Native {
             };
             self.sink.publish(self.id, event);
         }
-        while let Some(word) = self.callback.ring.pop() {
-            let kind = (word >> 56) as u8;
-            let data = word & 0x00ff_ffff_ffff_ffff;
-            if kind == EVENT_VALUE && data != 0 {
-                if let Ok(after) = self.validate() {
-                    self.publish_handy(InjectionId(data), after.caret as i64);
+        while let Some((kind, data)) = self.callback.ring.pop() {
+            match kind {
+                EVENT_KEY if data == KEY_INTENT_PRINTABLE => {
+                    if self.pending_external_key.is_some() {
+                        self.publish_unsafe(UnsafeEditKind::ImeComposition);
+                    } else {
+                        self.pending_external_key =
+                            Some(Instant::now() + self.deadlines.input_effect);
+                    }
                 }
-            } else if kind == EVENT_KEY {
-                let flags = data >> 16;
-                if flags & (FLAG_COMMAND | FLAG_CONTROL | FLAG_OPTION) != 0 {
-                    self.observation += 1;
-                    self.sink.publish(
-                        self.id,
-                        TargetInteractionEvent::UnsafeEdit {
-                            observation_id: ObservationId(self.observation),
-                            kind: UnsafeEditKind::CommandShortcut,
-                        },
-                    );
-                    self.invalid = true;
-                } else {
-                    self.pending_external_key = true;
+                EVENT_KEY => self.publish_unsafe(key_intent_kind(data)),
+                EVENT_VALUE if data == 0 && self.pending_external_key.take().is_some() => {
+                    self.classify_external();
                 }
-            } else if kind == EVENT_VALUE && self.pending_external_key {
-                self.pending_external_key = false;
-                self.classify_external();
-            } else if kind == EVENT_SELECTION && data == 0 && !self.pending_external_key {
-                self.observation += 1;
-                self.sink.publish(
-                    self.id,
-                    TargetInteractionEvent::UnsafeEdit {
-                        observation_id: ObservationId(self.observation),
-                        kind: UnsafeEditKind::SelectionChanged,
-                    },
-                );
-                self.invalid = true;
+                EVENT_VALUE => self.publish_unsafe(UnsafeEditKind::Unknown),
+                EVENT_SELECTION if data == 0 && self.pending_external_key.is_some() => {}
+                EVENT_SELECTION if data == 0 => {
+                    let allowed =
+                        self.allowed_external_selection
+                            .take()
+                            .is_some_and(|(expected, until)| {
+                                Instant::now() <= until && self.validate().ok() == Some(expected)
+                            });
+                    if !allowed {
+                        self.publish_unsafe(UnsafeEditKind::SelectionChanged);
+                    }
+                }
+                EVENT_TARGET_LOST | EVENT_POINTER | EVENT_TAP_LOST => {}
+                _ => self.publish_unsafe(UnsafeEditKind::Unknown),
             }
         }
+        if self
+            .pending_external_key
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.pending_external_key = None;
+            self.publish_unsafe(UnsafeEditKind::Unknown);
+        }
+        if self
+            .allowed_external_selection
+            .is_some_and(|(_, deadline)| Instant::now() >= deadline)
+        {
+            self.allowed_external_selection = None;
+        }
+    }
+    fn publish_unsafe(&mut self, kind: UnsafeEditKind) {
+        if self.invalid {
+            return;
+        }
+        self.observation += 1;
+        self.sink.publish(
+            self.id,
+            TargetInteractionEvent::UnsafeEdit {
+                observation_id: ObservationId(self.observation),
+                kind,
+            },
+        );
+        self.invalid = true;
     }
     fn publish_handy(&mut self, injection: InjectionId, caret: i64) {
         if injection.0 == 0 || self.last_injection == injection.0 {
@@ -1268,19 +1822,58 @@ impl Native {
             },
         );
     }
-    fn drain_injection_callbacks(&mut self) {
-        while let Some(word) = self.callback.ring.pop() {
-            if (word >> 56) as u8 == EVENT_KEY {
-                self.callback.terminal(TERMINAL_TARGET);
+    fn matches_change(&self, before: Snapshot, expected: &[u16]) -> Option<Snapshot> {
+        let after = self.validate().ok()?;
+        if after.caret != before.caret + expected.len() as c_long
+            || after.utf16 != before.utf16 + expected.len()
+        {
+            return None;
+        }
+        let range = CFRange {
+            location: before.caret,
+            length: expected.len() as c_long,
+        };
+        let observed = read_range(self.identity.element.ax(), range).ok()?;
+        observed
+            .encode_utf16()
+            .eq(expected.iter().copied())
+            .then_some(after)
+    }
+    fn drain_injection_callbacks(
+        &self,
+        correlation: u64,
+        before: Snapshot,
+        expected: &[u16],
+        allow_zero_selection: bool,
+    ) -> (bool, u8, u8) {
+        let mut valid = true;
+        let mut values = 0u8;
+        let mut selections = 0u8;
+        while let Some((kind, data)) = self.callback.ring.pop() {
+            let tag_matches = data == correlation
+                || (allow_zero_selection && kind == EVENT_SELECTION && data == 0);
+            if !matches!(kind, EVENT_VALUE | EVENT_SELECTION)
+                || !tag_matches
+                || self.matches_change(before, expected).is_none()
+            {
+                valid = false;
+            } else if kind == EVENT_VALUE {
+                values = values.saturating_add(1);
+            } else {
+                selections = selections.saturating_add(1);
             }
         }
+        if !valid {
+            self.callback.terminal(TERMINAL_TARGET);
+        }
+        (valid, values, selections)
     }
-    // AppKit/WebKit/Chromium often expose only value-change plus caret evidence. This
-    // guarded check distinguishes Handy's active marker, but provider-side autocorrect
-    // can remain hidden inside a coarse value notification; the capability says so.
+    // A printable key is only provisionally compatible. The following target-bound
+    // value growth must be a single collapsed-caret insertion; a residual selection
+    // notification is accepted only while it reads back that same exact snapshot.
     fn classify_external(&mut self) {
         let Ok(after) = self.validate() else {
-            self.invalid = true;
+            self.publish_unsafe(UnsafeEditKind::Unknown);
             return;
         };
         self.observation += 1;
@@ -1297,6 +1890,8 @@ impl Native {
                 },
             );
             self.last = after;
+            self.allowed_external_selection =
+                Some((after, Instant::now() + self.deadlines.input_effect));
         } else {
             self.sink.publish(
                 self.id,
@@ -1308,9 +1903,23 @@ impl Native {
             self.invalid = true;
         }
     }
+    fn wait_for_marker(&self, marker: u64, timeout: Duration) -> bool {
+        let end = Instant::now() + timeout;
+        loop {
+            if self.callback.active_seen.load(Ordering::Acquire) == marker {
+                return self.callback.terminal.load(Ordering::Acquire) == TERMINAL_NONE;
+            }
+            if self.cancellation.is_cancelled() || Instant::now() >= end {
+                return false;
+            }
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, LOOP_SLICE.as_secs_f64(), true) };
+        }
+    }
     fn teardown(&mut self) {
         self.cancellation.cancel();
         drop(self.subscription.take());
+        self.callback.active_marker.store(0, Ordering::Release);
+        self.callback.injection.store(0, Ordering::Release);
         drop(self.tap.take());
     }
 }
@@ -1430,6 +2039,45 @@ fn sanitize(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
+fn process_executable(pid: i32) -> Option<String> {
+    let mut buffer = [0u8; PROC_PIDPATHINFO_MAXSIZE];
+    let len = unsafe {
+        proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast(),
+            PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    if len <= 0 || len as usize > buffer.len() {
+        return None;
+    }
+    let bytes = &buffer[..len as usize];
+    let end = bytes
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(bytes.len());
+    let path = std::str::from_utf8(&bytes[..end]).ok()?;
+    let executable = Path::new(path).file_name()?.to_str()?;
+    sanitize(executable)
+}
+fn secure_marker(excluded: &[u64]) -> Option<u64> {
+    for _ in 0..4 {
+        let mut marker = 0u64;
+        if unsafe {
+            SecRandomCopyBytes(
+                kSecRandomDefault,
+                std::mem::size_of::<u64>(),
+                (&mut marker as *mut u64).cast(),
+            )
+        } == AX_OK
+            && marker != 0
+            && !excluded.contains(&marker)
+        {
+            return Some(marker);
+        }
+    }
+    None
+}
 fn subscribe(
     identity: &Identity,
     state: &Arc<CallbackState>,
@@ -1481,9 +2129,25 @@ fn subscribe(
     Ok(result)
 }
 fn install_tap(state: &Arc<CallbackState>) -> Result<Tap, FocusedOutputReasonCode> {
-    let mask = [LEFT_DOWN, RIGHT_DOWN, MOUSE_MOVED, KEY_DOWN, FLAGS_CHANGED]
-        .into_iter()
-        .fold(0, |a, v| a | 1u64 << v);
+    let mask = [
+        LEFT_DOWN,
+        RIGHT_DOWN,
+        LEFT_UP,
+        MOUSE_MOVED,
+        RIGHT_UP,
+        LEFT_DRAGGED,
+        RIGHT_DRAGGED,
+        SCROLL_WHEEL,
+        TABLET_POINTER,
+        TABLET_PROXIMITY,
+        OTHER_DOWN,
+        OTHER_DRAGGED,
+        OTHER_UP,
+        KEY_DOWN,
+        FLAGS_CHANGED,
+    ]
+    .into_iter()
+    .fold(0, |a, v| a | 1u64 << v);
     let context = Arc::into_raw(state.clone());
     let tap = unsafe { CGEventTapCreate(1, 0, 1, mask, tap_callback, context.cast_mut().cast()) };
     let Some(tap) = Owned::new(tap.cast()) else {
@@ -1520,20 +2184,20 @@ fn install_tap(state: &Arc<CallbackState>) -> Result<Tap, FocusedOutputReasonCod
         context,
     })
 }
-fn events(key: u16, flags: u64) -> Option<(Owned, Owned)> {
+fn events(key: u16, flags: u64, marker: u64) -> Option<(Owned, Owned)> {
     let source = Owned::new(unsafe { CGEventSourceCreate(0) })?;
     let down = Owned::new(unsafe { CGEventCreateKeyboardEvent(source.0, key, true) }.cast())?;
     let up = Owned::new(unsafe { CGEventCreateKeyboardEvent(source.0, key, false) }.cast())?;
     unsafe {
         CGEventSetFlags(down.0.cast_mut(), flags);
         CGEventSetFlags(up.0.cast_mut(), flags);
-        CGEventSetIntegerValueField(down.0.cast_mut(), EVENT_USER_DATA, MARKER);
-        CGEventSetIntegerValueField(up.0.cast_mut(), EVENT_USER_DATA, MARKER);
+        CGEventSetIntegerValueField(down.0.cast_mut(), EVENT_USER_DATA, marker as i64);
+        CGEventSetIntegerValueField(up.0.cast_mut(), EVENT_USER_DATA, marker as i64);
     }
     Some((down, up))
 }
-fn post_scalar(unit: &[u16; 2], len: usize) -> bool {
-    let Some((down, up)) = events(0, 0) else {
+fn post_scalar(unit: &[u16; 2], len: usize, marker: u64) -> bool {
+    let Some((down, up)) = events(0, 0, marker) else {
         return false;
     };
     unsafe {
@@ -1544,13 +2208,13 @@ fn post_scalar(unit: &[u16; 2], len: usize) -> bool {
     }
     true
 }
-fn post_key(key: AutoSubmitKey) -> bool {
+fn post_key(key: AutoSubmitKey, marker: u64) -> bool {
     let flags = match key {
         AutoSubmitKey::Enter => 0,
         AutoSubmitKey::CtrlEnter => FLAG_CONTROL,
         AutoSubmitKey::CmdEnter => FLAG_COMMAND,
     };
-    let Some((down, up)) = events(RETURN_KEY, flags) else {
+    let Some((down, up)) = events(RETURN_KEY, flags, marker) else {
         return false;
     };
     unsafe {
@@ -1586,10 +2250,7 @@ mod tests {
         );
         assert!(matches!(
             classify_ax("héllo", None, Some("hé")),
-            InsertOutcome::Partial {
-                accepted_bytes: 3,
-                ..
-            }
+            InsertOutcome::Ambiguous { .. }
         ));
         assert!(matches!(
             classify_ax("abc", None, Some("axc")),
@@ -1603,12 +2264,45 @@ mod tests {
             classify_ax("abc", Some(AX_CANNOT_COMPLETE), None),
             InsertOutcome::Ambiguous { .. }
         ));
+        let before = Snapshot {
+            caret: 4,
+            utf16: 10,
+        };
+        let after = Snapshot {
+            caret: 5,
+            utf16: 11,
+        };
+        assert_eq!(
+            verified_ax_partial_bytes("abcd", before, after, "a"),
+            Some(1)
+        );
+        assert_eq!(
+            verified_ax_partial_bytes("abcd", before, after, "abc"),
+            None
+        );
+        assert!(pointer_event(OTHER_DOWN));
+        assert!(pointer_event(SCROLL_WHEEL));
     }
     #[test]
     fn unicode_dispatch_is_scalar_guarded() {
         let units: Vec<_> = scalars("a😀é").collect();
         assert_eq!(units.len(), 3);
         assert_eq!([units[0].1, units[1].1, units[2].1], [1, 2, 1]);
+        assert_eq!([units[0].2, units[1].2, units[2].2], [1, 4, 2]);
+        assert!(matches!(
+            verified_cg_prefix("éx".len(), "é".len()),
+            InsertOutcome::Partial {
+                accepted_bytes: 2,
+                receipt: ReceiptConfidence::Verified,
+                ..
+            }
+        ));
+        assert_eq!(
+            verified_cg_prefix("éx".len(), "éx".len()),
+            InsertOutcome::Complete {
+                receipt: ReceiptConfidence::Verified
+            }
+        );
     }
     #[test]
     fn secure_and_selection_checks_reject() {
@@ -1649,11 +2343,33 @@ mod tests {
         );
     }
     #[test]
+    fn security_metadata_fails_closed() {
+        assert_eq!(
+            checked_security_metadata(Err(AX_CANNOT_COMPLETE), Ok(false)),
+            Err(FocusedOutputReasonCode::SecureField)
+        );
+        assert_eq!(
+            checked_security_metadata(Ok("AXStandard".into()), Err(AX_CANNOT_COMPLETE)),
+            Err(FocusedOutputReasonCode::SecureField)
+        );
+        assert_eq!(
+            checked_security_metadata(Ok("AXSecureTextField".into()), Ok(false)),
+            Err(FocusedOutputReasonCode::SecureField)
+        );
+        assert_eq!(
+            checked_security_metadata(Ok("AXStandard".into()), Ok(false)),
+            Ok("AXStandard".into())
+        );
+    }
+    #[test]
     fn callback_context_lives_until_teardown() {
         let state = Arc::new(CallbackState {
             ring: Ring::new(),
             terminal: AtomicU8::new(0),
             injection: AtomicU64::new(0),
+            session_marker: 11,
+            active_marker: AtomicU64::new(0),
+            active_seen: AtomicU64::new(0),
             guard: None,
         });
         let weak = Arc::downgrade(&state);
@@ -1667,22 +2383,22 @@ mod tests {
     fn callback_queue_is_bounded() {
         let ring = Ring::new();
         for i in 0..QUEUE_LEN as u64 {
-            assert!(ring.push(i));
+            assert!(ring.push(EVENT_VALUE, u64::MAX - i));
         }
-        assert!(!ring.push(99));
+        assert!(!ring.push(EVENT_VALUE, 99));
         for i in 0..QUEUE_LEN as u64 {
-            assert_eq!(ring.pop(), Some(i));
+            assert_eq!(ring.pop(), Some((EVENT_VALUE, u64::MAX - i)));
         }
     }
     #[test]
-    fn submit_support_has_known_coarse_evidence() {
-        for (app, p) in [
+    fn submit_support_is_single_line_and_provider_bound() {
+        for (app, expected) in [
             ("Notes", Provider::AppKit),
             ("Safari", Provider::WebKit),
             ("Google Chrome", Provider::Chromium),
         ] {
-            let found = provider(app, "AXTextField");
-            assert_eq!(found, p);
+            let found = provider(app);
+            assert_eq!(found, expected);
             for key in [
                 AutoSubmitKey::Enter,
                 AutoSubmitKey::CtrlEnter,
@@ -1690,12 +2406,78 @@ mod tests {
             ] {
                 assert!(submit_supported(found, "AXTextField", key));
             }
+            assert!(!submit_supported(found, "AXTextArea", AutoSubmitKey::Enter));
+            assert!(!submit_supported(found, "AXComboBox", AutoSubmitKey::Enter));
         }
         assert!(!submit_supported(
             Provider::Unknown,
             "AXWebArea",
             AutoSubmitKey::Enter
         ));
+        assert!(!submit_supported(
+            Provider::AppKit,
+            "AXTextArea",
+            AutoSubmitKey::Enter
+        ));
+        assert_eq!(
+            provider("Safari — attacker-controlled document"),
+            Provider::Unknown
+        );
+        assert_eq!(provider("attacker-app"), Provider::Unknown);
+    }
+    #[test]
+    fn marker_acceptance_is_active_and_exact() {
+        assert_eq!(marker_disposition(0, 7), MarkerDisposition::Physical);
+        assert_eq!(marker_disposition(7, 7), MarkerDisposition::Active);
+        assert_eq!(marker_disposition(7, 0), MarkerDisposition::Foreign);
+        assert_eq!(marker_disposition(6, 7), MarkerDisposition::Foreign);
+    }
+    #[test]
+    fn key_intent_is_fail_closed() {
+        assert_eq!(
+            key_intent_kind(classify_key_intent(RETURN_KEY, 0, &[b'\r' as u16], true)),
+            UnsafeEditKind::SubmitOrNewlineAmbiguous
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(51, 0, &[], true)),
+            UnsafeEditKind::Delete
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(123, 0, &[], true)),
+            UnsafeEditKind::CaretRepositioned
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(123, FLAG_SHIFT, &[], true)),
+            UnsafeEditKind::SelectionChanged
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(48, 0, &[b'\t' as u16], true)),
+            UnsafeEditKind::FocusTraversal
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(0, FLAG_COMMAND, &[b'a' as u16], true)),
+            UnsafeEditKind::CommandShortcut
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(0, FLAG_OPTION, &[], true)),
+            UnsafeEditKind::ImeComposition
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(0, 0, &[], true)),
+            UnsafeEditKind::ImeComposition
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(0, 0, &[b'a' as u16], false)),
+            UnsafeEditKind::ImeComposition
+        );
+        assert_eq!(
+            key_intent_kind(classify_key_intent(122, 0, &[], true)),
+            UnsafeEditKind::Unknown
+        );
+        assert_eq!(
+            classify_key_intent(0, 0, &[b'a' as u16], true),
+            KEY_INTENT_PRINTABLE
+        );
     }
     #[test]
     fn cancellation_and_guard_are_exact() {

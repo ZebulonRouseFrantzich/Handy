@@ -79,7 +79,6 @@ pub(crate) enum CoeditDecision {
     Terminal(TerminalReason),
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArmPendingResult {
     Armed,
@@ -122,19 +121,22 @@ impl CoeditingState {
         self.external_edit_epoch
     }
 
-    #[cfg(test)]
     pub(crate) fn terminal(&self) -> Option<TerminalReason> {
         self.terminal
     }
 
-    #[cfg(test)]
     pub(crate) fn pending_injection_id(&self) -> Option<InjectionId> {
         self.pending_injection
             .as_ref()
             .map(|pending| pending.injection_id)
     }
 
-    #[cfg(test)]
+    pub(crate) fn pending_deadline(&self) -> Option<Instant> {
+        self.pending_injection
+            .as_ref()
+            .map(|pending| pending.deadline)
+    }
+
     /// A second insertion cannot overtake an unacknowledged target effect.
     pub(super) fn arm_pending(&mut self, pending: PendingInjection) -> ArmPendingResult {
         if let Some(reason) = self.terminal {
@@ -149,9 +151,29 @@ impl CoeditingState {
         ArmPendingResult::Armed
     }
 
-    #[cfg(test)]
+    /// Starts the observation window only after the bounded transport call
+    /// returns, so helper/IPC time cannot consume receipt-attribution time.
+    pub(crate) fn start_receipt_deadline(
+        &mut self,
+        injection_id: InjectionId,
+        deadline: Instant,
+    ) -> CoeditDecision {
+        if let Some(reason) = self.terminal {
+            return CoeditDecision::Terminal(reason);
+        }
+        let Some(pending) = self.pending_injection.as_mut() else {
+            return CoeditDecision::Ignored;
+        };
+        if pending.injection_id != injection_id {
+            return self.set_terminal(TerminalReason::AmbiguousInsertion);
+        }
+        pending.deadline = deadline;
+        CoeditDecision::Continue
+    }
+
     /// A synchronous transport receipt does not replace its asynchronous,
-    /// exactly-attributed target acknowledgement.
+    /// exactly-attributed target acknowledgement unless the route proved an
+    /// exact target-bound readback synchronously.
     pub(crate) fn record_immediate_receipt(
         &mut self,
         injection_id: InjectionId,
@@ -168,6 +190,50 @@ impl CoeditingState {
         }
         pending.immediate_receipt = Some(receipt);
         CoeditDecision::Continue
+    }
+
+    /// Completes a pending insertion from a transport whose `Verified`
+    /// receipt is itself exact target-bound range readback.
+    pub(crate) fn acknowledge_verified_receipt(
+        &mut self,
+        injection_id: InjectionId,
+    ) -> CoeditDecision {
+        if let Some(reason) = self.terminal {
+            return CoeditDecision::Terminal(reason);
+        }
+        let Some(pending) = self.pending_injection.as_ref() else {
+            return CoeditDecision::Ignored;
+        };
+        if pending.injection_id != injection_id
+            || pending.immediate_receipt != Some(ReceiptConfidence::Verified)
+        {
+            return self.set_terminal(TerminalReason::AmbiguousInsertion);
+        }
+        self.pending_injection = None;
+        CoeditDecision::HandyAcknowledged { injection_id }
+    }
+
+    /// Platform event sinks publish this only after exact target-bound
+    /// attribution. Core still validates that the acknowledgement is for the
+    /// one currently pending insertion.
+    pub(crate) fn acknowledge_platform_observation(
+        &mut self,
+        injection_id: InjectionId,
+    ) -> CoeditDecision {
+        if let Some(reason) = self.terminal {
+            return CoeditDecision::Terminal(reason);
+        }
+        let Some(pending) = self.pending_injection.as_ref() else {
+            return CoeditDecision::Ignored;
+        };
+        if injection_id < pending.injection_id {
+            return CoeditDecision::Ignored;
+        }
+        if pending.injection_id != injection_id {
+            return self.set_terminal(TerminalReason::AmbiguousInsertion);
+        }
+        self.pending_injection = None;
+        CoeditDecision::HandyAcknowledged { injection_id }
     }
 
     pub(crate) fn check_deadline(&mut self, now: Instant) -> CoeditDecision {
@@ -798,6 +864,40 @@ mod tests {
             state.terminate(TerminalReason::StreamFailed),
             CoeditDecision::Terminal(TerminalReason::Cancelled)
         );
+    }
+
+    #[test]
+    fn exact_verified_receipt_can_acknowledge_synchronously() {
+        let now = Instant::now();
+        let mut state = state(MixedInputSupport::ObservedInsertionsOnly);
+        state.arm_pending(pending(1, 1, now, None));
+        assert_eq!(
+            state.record_immediate_receipt(InjectionId(1), ReceiptConfidence::Verified),
+            CoeditDecision::Continue
+        );
+        assert_eq!(
+            state.acknowledge_verified_receipt(InjectionId(1)),
+            CoeditDecision::HandyAcknowledged {
+                injection_id: InjectionId(1),
+            }
+        );
+        assert_eq!(state.pending_injection_id(), None);
+    }
+
+    #[test]
+    fn platform_acknowledgement_must_match_the_one_pending_id() {
+        let now = Instant::now();
+        let mut state = state(MixedInputSupport::GuardedKeyboardInsertionsOnly);
+        state.arm_pending(pending(2, 1, now, Some(ReceiptConfidence::Posted)));
+        assert_eq!(
+            state.acknowledge_platform_observation(InjectionId(1)),
+            CoeditDecision::Ignored
+        );
+        assert_eq!(
+            state.acknowledge_platform_observation(InjectionId(3)),
+            CoeditDecision::Terminal(TerminalReason::AmbiguousInsertion)
+        );
+        assert_eq!(state.pending_injection_id(), None);
     }
 
     #[test]

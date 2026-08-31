@@ -4,12 +4,13 @@ use crate::focused_output::types::{
     FocusedOutputPermission, FocusedOutputReasonCode, FocusedOutputSafetyLevel, InjectionId,
     InsertOutcome, InsertionKind, InsertionRequest, InsertionTransport, MixedInputSupport,
     ReceiptConfidence, ResolvedInsertionCapability, SessionCancellation, SubmitOutcome,
-    TargetInteractionEvent,
+    TargetInteractionEvent, HANDY_RECEIPT_DEADLINE,
 };
 use crate::settings::AutoSubmitKey;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const VERIFIED_ROUTE: ResolvedInsertionCapability = ResolvedInsertionCapability {
     insertion_transport: InsertionTransport::Test,
@@ -42,6 +43,16 @@ pub(crate) fn posted_capability(supports_auto_submit: bool) -> FocusedOutputCapa
 pub(crate) struct FakeSessionScript {
     insert_outcomes: VecDeque<InsertOutcome>,
     submit_outcomes: VecDeque<SubmitOutcome>,
+    acknowledgements: VecDeque<FakeAcknowledgement>,
+    insert_delays: VecDeque<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FakeAcknowledgement {
+    Matching,
+    Missing,
+    Mismatched,
+    DelayedMatching(Duration),
 }
 
 impl FakeSessionScript {
@@ -52,7 +63,22 @@ impl FakeSessionScript {
         Self {
             insert_outcomes: insert_outcomes.into_iter().collect(),
             submit_outcomes: submit_outcomes.into_iter().collect(),
+            acknowledgements: VecDeque::new(),
+            insert_delays: VecDeque::new(),
         }
+    }
+
+    pub(crate) fn with_acknowledgements(
+        mut self,
+        acknowledgements: impl IntoIterator<Item = FakeAcknowledgement>,
+    ) -> Self {
+        self.acknowledgements = acknowledgements.into_iter().collect();
+        self
+    }
+
+    pub(crate) fn with_insert_delays(mut self, delays: impl IntoIterator<Item = Duration>) -> Self {
+        self.insert_delays = delays.into_iter().collect();
+        self
     }
 
     fn complete() -> Self {
@@ -400,6 +426,9 @@ impl FocusedTargetSession for FakeTargetSession {
                 InsertionKind::Speech => FakeCallKind::InsertSpeech,
                 InsertionKind::TrailingSpace => FakeCallKind::InsertTrailingSpace,
             });
+        if let Some(delay) = self.script.insert_delays.pop_front() {
+            std::thread::sleep(delay);
+        }
         let outcome = self
             .script
             .insert_outcomes
@@ -415,13 +444,42 @@ impl FocusedTargetSession for FakeTargetSession {
             outcome,
             InsertOutcome::Complete { .. } | InsertOutcome::Partial { .. }
         ) {
-            self.event_sink.publish(
-                self.session_id,
-                TargetInteractionEvent::HandyInsertionObserved {
-                    injection_id,
-                    caret_after: None,
-                },
-            );
+            let acknowledgement = self
+                .script
+                .acknowledgements
+                .pop_front()
+                .unwrap_or(FakeAcknowledgement::Matching);
+            let acknowledged_id = match acknowledgement {
+                FakeAcknowledgement::Matching => Some(injection_id),
+                FakeAcknowledgement::Missing => None,
+                FakeAcknowledgement::Mismatched => {
+                    Some(InjectionId(injection_id.get().saturating_add(1)))
+                }
+                FakeAcknowledgement::DelayedMatching(delay) => {
+                    let event_sink = Arc::clone(&self.event_sink);
+                    let session_id = self.session_id;
+                    let _ = std::thread::spawn(move || {
+                        std::thread::sleep(delay);
+                        event_sink.publish(
+                            session_id,
+                            TargetInteractionEvent::HandyInsertionObserved {
+                                injection_id,
+                                caret_after: None,
+                            },
+                        );
+                    });
+                    None
+                }
+            };
+            if let Some(acknowledged_id) = acknowledged_id {
+                self.event_sink.publish(
+                    self.session_id,
+                    TargetInteractionEvent::HandyInsertionObserved {
+                        injection_id: acknowledged_id,
+                        caret_after: None,
+                    },
+                );
+            }
         }
         outcome
     }
@@ -751,6 +809,349 @@ mod tests {
             SubmitOutcome::Rejected { .. }
         ));
         assert_eq!(backend.session(session_id).submit_count(), 3);
+    }
+
+    #[test]
+    fn posted_insertion_without_acknowledgement_times_out_and_stops() {
+        let backend = FakeBackend::new(posted_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [InsertOutcome::Complete {
+                    receipt: ReceiptConfidence::Posted,
+                }],
+                [],
+            )
+            .with_acknowledgements([FakeAcknowledgement::Missing]),
+        );
+
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+
+        let disposition = manager.finalize(
+            session_id,
+            String::from("unacknowledged"),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::ReceiptTimeout,
+                speech_delivered_chars: 0,
+                ..
+            })
+        ));
+        assert_eq!(backend.session(session_id).insertion_count(), 1);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn posted_acknowledgement_is_required_before_dispatching_the_next_unit() {
+        let backend = FakeBackend::new(posted_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [
+                    InsertOutcome::Complete {
+                        receipt: ReceiptConfidence::Posted,
+                    },
+                    InsertOutcome::Complete {
+                        receipt: ReceiptConfidence::Posted,
+                    },
+                ],
+                [],
+            )
+            .with_acknowledgements([
+                FakeAcknowledgement::DelayedMatching(Duration::from_millis(100)),
+                FakeAcknowledgement::Matching,
+            ]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let started = Instant::now();
+
+        let disposition = manager.finalize(
+            session_id,
+            "abcdefghijklmnopq".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                receipt_confidence: ReceiptConfidence::Posted,
+                ..
+            })
+        ));
+        assert_eq!(backend.session(session_id).insertion_count(), 2);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn mismatched_posted_acknowledgement_is_terminal_before_another_unit() {
+        let backend = FakeBackend::new(posted_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [InsertOutcome::Complete {
+                    receipt: ReceiptConfidence::Posted,
+                }],
+                [],
+            )
+            .with_acknowledgements([FakeAcknowledgement::Mismatched]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+
+        let disposition = manager.finalize(
+            session_id,
+            "abcdefghijklmnopq".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::AmbiguousInsertion,
+                ..
+            })
+        ));
+        assert_eq!(backend.session(session_id).insertion_count(), 1);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn posted_receipt_window_starts_after_the_bounded_transport_returns() {
+        let backend = FakeBackend::new(posted_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [InsertOutcome::Complete {
+                    receipt: ReceiptConfidence::Posted,
+                }],
+                [],
+            )
+            .with_insert_delays([Duration::from_millis(750)])
+            .with_acknowledgements([FakeAcknowledgement::DelayedMatching(Duration::from_millis(
+                100,
+            ))]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let started = Instant::now();
+
+        let disposition = manager.finalize(
+            session_id,
+            "delayed posted".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(started.elapsed() >= Duration::from_millis(850));
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                receipt_confidence: ReceiptConfidence::Posted,
+                ..
+            })
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn acknowledgement_arriving_after_its_deadline_is_not_accepted() {
+        let backend = FakeBackend::new(posted_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [InsertOutcome::Complete {
+                    receipt: ReceiptConfidence::Posted,
+                }],
+                [],
+            )
+            .with_acknowledgements([FakeAcknowledgement::DelayedMatching(
+                HANDY_RECEIPT_DEADLINE + Duration::from_millis(20),
+            )]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+
+        let disposition = manager.finalize(
+            session_id,
+            String::from("late"),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::ReceiptTimeout,
+                ..
+            })
+        ));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn ambiguous_later_unit_does_not_become_a_precise_partial() {
+        let backend = FakeBackend::new(verified_capability(false));
+        backend.queue_script(FakeSessionScript::new(
+            [
+                InsertOutcome::Complete {
+                    receipt: ReceiptConfidence::Verified,
+                },
+                InsertOutcome::Ambiguous {
+                    reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                },
+            ],
+            [],
+        ));
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+
+        let disposition = manager.finalize(
+            session_id,
+            "abcdefghijklmnopq".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::AmbiguousInsertion,
+                speech_delivered_chars: 0,
+                ..
+            })
+        ));
+        assert_eq!(backend.session(session_id).insertion_count(), 2);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn finalization_wait_returns_the_actual_disposition_after_slow_bounded_units() {
+        let backend = FakeBackend::new(verified_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new(
+                [
+                    InsertOutcome::Complete {
+                        receipt: ReceiptConfidence::Verified,
+                    },
+                    InsertOutcome::Complete {
+                        receipt: ReceiptConfidence::Verified,
+                    },
+                    InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    },
+                ],
+                [],
+            )
+            .with_insert_delays([
+                Duration::from_millis(750),
+                Duration::from_millis(750),
+                Duration::from_millis(750),
+            ]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let started = std::time::Instant::now();
+
+        let disposition = manager.finalize(
+            session_id,
+            "abcdefghijklmnopqrstuvwxyzabcdefg".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::AmbiguousInsertion,
+                ..
+            })
+        ));
+        assert_eq!(backend.session(session_id).insertion_count(), 3);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn terminal_arriving_while_finalize_owns_the_plan_is_first_wins() {
+        let backend = FakeBackend::new(verified_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new([], []).with_insert_delays([Duration::from_millis(750)]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let finalizer = Arc::clone(&manager);
+        let handle = thread::spawn(move || {
+            finalizer.finalize(
+                session_id,
+                "slow finalization".to_owned(),
+                None,
+                finalize_options(false, false),
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        manager.terminate(session_id, TerminalReason::StreamFailed);
+
+        assert!(matches!(
+            handle.join().unwrap(),
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::StreamFailed,
+                ..
+            })
+        ));
+        let status = manager.latest_status().unwrap();
+        assert_eq!(
+            status.status,
+            crate::focused_output::types::FocusedOutputStatus::Faulted
+        );
+        assert_eq!(status.reason, Some(FocusedOutputReasonCode::StreamFailed));
+        manager.shutdown();
+    }
+
+    #[test]
+    fn replacement_admission_waits_until_old_finalize_seals_identity() {
+        let backend = FakeBackend::new(verified_capability(false));
+        backend.queue_script(
+            FakeSessionScript::new([], []).with_insert_delays([Duration::from_millis(750)]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let old_id = manager.allocate_session_id();
+        manager.begin(context(old_id, false)).unwrap();
+        let old_session = backend.session(old_id);
+        let finalizer = Arc::clone(&manager);
+        let handle = thread::spawn(move || {
+            finalizer.finalize(
+                old_id,
+                "slow old finalization".to_owned(),
+                None,
+                finalize_options(false, false),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while old_session.insertion_count() == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+
+        let new_id = manager.allocate_session_id();
+        assert_eq!(
+            manager.register_fallback(new_id),
+            Err(FocusedOutputReasonCode::AlreadyActive)
+        );
+        assert!(matches!(
+            handle.join().unwrap(),
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered { .. })
+        ));
+
+        manager.register_fallback(new_id).unwrap();
+        assert_eq!(manager.active_session_id(), Some(new_id));
+        manager.finish_no_text(new_id);
+        manager.shutdown();
     }
 
     #[test]
@@ -1182,6 +1583,50 @@ mod tests {
                 FakeCallKind::Close,
             ]
         );
+        let status = manager.latest_status().unwrap();
+        assert_eq!(
+            status.status,
+            crate::focused_output::types::FocusedOutputStatus::Faulted
+        );
+        assert_eq!(
+            status.reason,
+            Some(FocusedOutputReasonCode::InjectionAmbiguous)
+        );
+        assert_eq!(status.speech_delivered_chars, "speech".chars().count());
+
+        let submit_rejected_id = manager.allocate_session_id();
+        backend.queue_script(FakeSessionScript::new(
+            [],
+            [SubmitOutcome::Rejected {
+                reason: FocusedOutputReasonCode::InjectionDenied,
+            }],
+        ));
+        manager.begin(context(submit_rejected_id, true)).unwrap();
+        let submit_rejected = manager.finalize(
+            submit_rejected_id,
+            "speech".to_owned(),
+            None,
+            finalize_options(false, true),
+        );
+        assert!(matches!(
+            submit_rejected,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                submit: SubmitDisposition::Failed {
+                    reason: FocusedOutputReasonCode::InjectionDenied
+                },
+                ..
+            })
+        ));
+        let status = manager.latest_status().unwrap();
+        assert_eq!(
+            status.status,
+            crate::focused_output::types::FocusedOutputStatus::Invalidated
+        );
+        assert_eq!(
+            status.reason,
+            Some(FocusedOutputReasonCode::InjectionDenied)
+        );
+        assert_eq!(status.speech_delivered_chars, "speech".chars().count());
         manager.shutdown();
     }
 

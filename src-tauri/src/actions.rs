@@ -177,6 +177,16 @@ fn focused_backend_eligibility(
     }
 }
 
+fn focused_fallback_status_reason(
+    destination: ProgressiveOutputDestination,
+    eligibility: &Result<(), FocusedOutputReasonCode>,
+) -> Option<FocusedOutputReasonCode> {
+    if destination != ProgressiveOutputDestination::FocusedField {
+        return None;
+    }
+    eligibility.as_ref().err().copied()
+}
+
 enum DeliveryRoute {
     LegacyPaste(LegacyPasteAuthority),
     Focused { trailing_space_delivered: bool },
@@ -204,18 +214,17 @@ fn delivery_route(disposition: FinalDeliveryDisposition) -> DeliveryRoute {
 fn focused_start_context(
     session_id: DictationSessionId,
     binding_id: &str,
-    shortcut: &str,
+    _trigger_source: &str,
     settings: &AppSettings,
 ) -> BeginContext {
-    let control_shortcut = if shortcut.is_empty() {
-        settings
-            .bindings
-            .get(binding_id)
-            .map(|binding| binding.current_binding.clone())
-            .filter(|binding| !binding.is_empty())
-    } else {
-        Some(shortcut.to_owned())
-    };
+    // The coordinator's shortcut string names the external trigger for CLI and
+    // signal starts. Monitoring must instead exempt the configured binding the
+    // user can press while dictation is active.
+    let control_shortcut = settings
+        .bindings
+        .get(binding_id)
+        .map(|binding| binding.current_binding.clone())
+        .filter(|binding| !binding.is_empty());
     BeginContext {
         session_id,
         control_shortcut,
@@ -691,6 +700,12 @@ impl ShortcutAction for TranscribeAction {
             let capability = focused_manager.global_capability();
             focused_backend_eligibility(&capability)
         });
+
+        if let Some(reason) =
+            focused_fallback_status_reason(settings.progressive_output_destination, &eligibility)
+        {
+            focused_manager.publish_fallback_reason(session_id, reason);
+        }
 
         let output_kind = if eligibility.is_ok() {
             match focused_manager.begin(focused_start_context(
@@ -1203,8 +1218,9 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 mod tests {
     use super::{
         complete_unless_cancelled, delivery_route, focused_backend_eligibility,
-        focused_preflight_eligibility, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block, transcription_stream_context, DeliveryRoute, FocusedEligibilityInput,
+        focused_fallback_status_reason, focused_preflight_eligibility, focused_start_context,
+        is_blank_transcription, should_use_streaming_overlay, strip_think_block,
+        transcription_stream_context, DeliveryRoute, FocusedEligibilityInput,
     };
     use crate::focused_output::{
         DictationSessionId, FinalDeliveryDisposition, FocusedDeliveryDisposition,
@@ -1213,12 +1229,30 @@ mod tests {
         TerminalReason,
     };
     use crate::managers::transcription::StreamOutputTarget;
-    use crate::settings::{OverlayStyle, PasteMethod, ProgressiveOutputDestination};
+    use crate::settings::{
+        get_default_settings, OverlayStyle, PasteMethod, ProgressiveOutputDestination,
+    };
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn focused_context_uses_configured_chord_for_external_starts() {
+        let settings = get_default_settings();
+        let expected = settings
+            .bindings
+            .get("transcribe")
+            .unwrap()
+            .current_binding
+            .clone();
+
+        let context =
+            focused_start_context(DictationSessionId(1), "transcribe", "SIGUSR2", &settings);
+
+        assert_eq!(context.control_shortcut.as_deref(), Some(expected.as_str()));
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
@@ -1375,6 +1409,26 @@ mod tests {
         assert_eq!(
             focused_preflight_eligibility(input),
             Err(FocusedOutputReasonCode::ExternalScriptIncompatible)
+        );
+    }
+
+    #[test]
+    fn focused_preflight_fallback_has_a_reason_while_overlay_stays_silent() {
+        let eligibility = Err(FocusedOutputReasonCode::ModelDoesNotSupportStreaming);
+        assert_eq!(
+            focused_fallback_status_reason(
+                ProgressiveOutputDestination::FocusedField,
+                &eligibility,
+            ),
+            Some(FocusedOutputReasonCode::ModelDoesNotSupportStreaming)
+        );
+        assert_eq!(
+            focused_fallback_status_reason(ProgressiveOutputDestination::Overlay, &eligibility,),
+            None
+        );
+        assert_eq!(
+            focused_fallback_status_reason(ProgressiveOutputDestination::FocusedField, &Ok(()),),
+            None
         );
     }
 

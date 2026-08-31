@@ -9,7 +9,7 @@ use crate::{
     },
     settings::AutoSubmitKey,
 };
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use std::{
     ffi::c_void,
     mem::{size_of, zeroed},
@@ -25,7 +25,7 @@ use std::{
 use windows::{
     core::{implement, Interface, Ref, Result as WindowsResult},
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             Com::{
                 CoCancelCall, CoCreateInstance, CoDisableCallCancellation,
@@ -44,18 +44,20 @@ use windows::{
                 IUIAutomationPropertyChangedEventHandler,
                 IUIAutomationPropertyChangedEventHandler_Impl, IUIAutomationTextPattern,
                 IUIAutomationTextRange, IUIAutomationValuePattern, TextPatternRangeEndpoint_End,
-                TextPatternRangeEndpoint_Start, TreeScope_Element, UIA_IsReadOnlyAttributeId,
-                UIA_TextPatternId, UIA_Text_TextChangedEventId,
-                UIA_Text_TextSelectionChangedEventId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
-                UIA_CONTROLTYPE_ID, UIA_EVENT_ID, UIA_PROPERTY_ID,
+                TextPatternRangeEndpoint_Start, TreeScope_Element, UIA_EditControlTypeId,
+                UIA_IsMultilineAttributeId, UIA_IsReadOnlyAttributeId, UIA_TextPatternId,
+                UIA_Text_TextChangedEventId, UIA_Text_TextSelectionChangedEventId,
+                UIA_ValuePatternId, UIA_ValueValuePropertyId, UIA_CONTROLTYPE_ID, UIA_EVENT_ID,
+                UIA_PROPERTY_ID,
             },
             Input::KeyboardAndMouse::{
-                SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT,
-                KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT,
-                VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
-                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR,
-                VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
-                VK_TAB, VK_UP,
+                GetAsyncKeyState, GetKeyboardLayout, GetKeyboardState, SendInput, ToUnicodeEx, HKL,
+                INPUT, INPUT_0, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP,
+                KEYEVENTF_UNICODE, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, VIRTUAL_KEY,
+                VK_BACK, VK_CANCEL, VK_CLEAR, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+                VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+                VK_NEXT, VK_PACKET, VK_PAUSE, VK_PRIOR, VK_PROCESSKEY, VK_RCONTROL, VK_RETURN,
+                VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, GetAncestor, GetForegroundWindow, GetMessageW,
@@ -80,13 +82,33 @@ const MOD_CTRL: u8 = 1;
 const MOD_SHIFT: u8 = 2;
 const MOD_ALT: u8 = 4;
 const MOD_WIN: u8 = 8;
+const MOD_RALT: u8 = 16;
+const MOD_LALT: u8 = 32;
+const TO_UNICODE_NO_STATE_CHANGE: u32 = 4;
 const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 2;
+const MARKED_SEQUENCE_NONE: u8 = 0;
+const MARKED_SEQUENCE_UNICODE: u8 = 1;
+const MARKED_SEQUENCE_ENTER: u8 = 2;
+const MARKED_SEQUENCE_CTRL_ENTER: u8 = 3;
+const MARKED_SEQUENCE_WIN_ENTER: u8 = 4;
+const MARKED_STATUS_ACTIVE: u64 = 1;
+const MARKED_STATUS_COMPLETE: u64 = 2;
+const MARKED_STATUS_CLOSING: u64 = 3;
+const MARKED_STATUS_INVALID: u64 = 4;
+const MARKED_STATUS_MASK: u64 = 0x7;
+const MARKED_KIND_SHIFT: u32 = 3;
+const MARKED_EXPECTED_SHIFT: u32 = 6;
+const MARKED_SEEN_SHIFT: u32 = 22;
+const MARKED_GENERATION_SHIFT: u32 = 38;
+const MARKED_U16_MASK: u64 = 0xffff;
+const MARKED_GENERATION_MASK: u32 = (1 << 26) - 1;
+const MARKED_CALLBACKS_CLOSED: u32 = 1 << 31;
+const MARKED_CALLBACKS_COUNT_MASK: u32 = MARKED_CALLBACKS_CLOSED - 1;
 const TH32CS_SNAPPROCESS: u32 = 2;
 
 static HOOK_CONTEXT: AtomicPtr<HookContext> = AtomicPtr::new(ptr::null_mut());
 static NEXT_HOOK_GENERATION: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_HOOK_GENERATION: AtomicU64 = AtomicU64::new(0);
-static MARKER_FALLBACK: AtomicUsize = AtomicUsize::new(0x4841_4e45usize);
 
 #[link(name = "bcrypt")]
 unsafe extern "system" {
@@ -99,6 +121,11 @@ unsafe extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> HANDLE;
     fn Process32FirstW(snapshot: HANDLE, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: HANDLE, entry: *mut ProcessEntry32W) -> i32;
+}
+
+#[link(name = "imm32")]
+unsafe extern "system" {
+    fn ImmIsIME(layout: HKL) -> BOOL;
 }
 
 #[repr(C)]
@@ -184,12 +211,15 @@ impl FocusedFieldBackend for WindowsFocusedFieldBackend {
         }
 
         let stop_chord = StopChord::parse(context.control_shortcut.as_deref())?;
-        let marker = random_marker();
+        let marker = random_marker()?;
         let (native_tx, native_rx) = bounded(CALLBACK_QUEUE_CAPACITY);
         let signal = Arc::new(SessionSignal::new());
         let callback_state = Arc::new(CallbackState {
             terminal: AtomicU8::new(TERMINAL_NONE),
             active_marker: AtomicUsize::new(0),
+            marked_state: AtomicU64::new(0),
+            marked_generation: AtomicU32::new(0),
+            marked_callbacks: AtomicU32::new(0),
             modifiers: AtomicU8::new(0),
             hook_thread_id: AtomicU32::new(0),
             stop_chord,
@@ -469,9 +499,7 @@ impl FocusedTargetSession for WindowsTargetSession {
             return;
         }
         self.closed = true;
-        self.callback_state
-            .active_marker
-            .store(0, Ordering::Release);
+        self.callback_state.disarm_marked_sequence();
         self.signal.request_close();
 
         let deadline = Instant::now() + self.deadlines.thread_close;
@@ -637,12 +665,16 @@ enum NativeEvent {
     TextChanged,
     SelectionChanged,
     CompatibleKey { chars: usize },
+    MarkedSequenceComplete,
     Terminal { code: u8 },
 }
 
 struct CallbackState {
     terminal: AtomicU8,
     active_marker: AtomicUsize,
+    marked_state: AtomicU64,
+    marked_generation: AtomicU32,
+    marked_callbacks: AtomicU32,
     modifiers: AtomicU8,
     hook_thread_id: AtomicU32,
     stop_chord: StopChord,
@@ -653,7 +685,204 @@ struct HookContext {
     state: Weak<CallbackState>,
 }
 
+fn pack_marked_state(status: u64, kind: u8, expected: u16, seen: u16, generation: u32) -> u64 {
+    status
+        | (u64::from(kind) << MARKED_KIND_SHIFT)
+        | (u64::from(expected) << MARKED_EXPECTED_SHIFT)
+        | (u64::from(seen) << MARKED_SEEN_SHIFT)
+        | (u64::from(generation & MARKED_GENERATION_MASK) << MARKED_GENERATION_SHIFT)
+}
+
+fn marked_status(state: u64) -> u64 {
+    state & MARKED_STATUS_MASK
+}
+
+fn marked_kind(state: u64) -> u8 {
+    ((state >> MARKED_KIND_SHIFT) & 0x7) as u8
+}
+
+fn marked_expected(state: u64) -> u16 {
+    ((state >> MARKED_EXPECTED_SHIFT) & MARKED_U16_MASK) as u16
+}
+
+fn marked_seen(state: u64) -> u16 {
+    ((state >> MARKED_SEEN_SHIFT) & MARKED_U16_MASK) as u16
+}
+
+fn marked_generation(state: u64) -> u32 {
+    (state >> MARKED_GENERATION_SHIFT) as u32
+}
+
 impl CallbackState {
+    fn arm_marked_sequence(&self, marker: usize, kind: u8, expected: u32) -> bool {
+        let Ok(expected) = u16::try_from(expected) else {
+            return false;
+        };
+        if marker == 0 || kind == MARKED_SEQUENCE_NONE || expected == 0 {
+            return false;
+        }
+        let generation = self
+            .marked_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let generation = generation & MARKED_GENERATION_MASK;
+        let generation = if generation == 0 { 1 } else { generation };
+        let armed = pack_marked_state(MARKED_STATUS_ACTIVE, kind, expected, 0, generation);
+        if self.terminal.load(Ordering::Acquire) != TERMINAL_NONE
+            || self
+                .marked_state
+                .compare_exchange(0, armed, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        self.active_marker.store(marker, Ordering::Release);
+        if self.terminal.load(Ordering::Acquire) != TERMINAL_NONE {
+            self.disarm_marked_sequence();
+            return false;
+        }
+        true
+    }
+
+    fn observe_marked_event(&self, marker: usize, virtual_key: u32, is_down: bool, is_up: bool) {
+        loop {
+            let state = self.marked_state.load(Ordering::Acquire);
+            let status = marked_status(state);
+            let active = self.active_marker.load(Ordering::Acquire);
+            if status != MARKED_STATUS_ACTIVE || active == 0 || marker != active {
+                if status == 0 {
+                    self.terminate(TERMINAL_UNSAFE_KEY);
+                    return;
+                }
+                let invalid = (state & !MARKED_STATUS_MASK) | MARKED_STATUS_INVALID;
+                if self
+                    .marked_state
+                    .compare_exchange(state, invalid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.terminate(TERMINAL_UNSAFE_KEY);
+                    return;
+                }
+                continue;
+            }
+
+            let expected = marked_expected(state);
+            let seen = marked_seen(state);
+            let kind = marked_kind(state);
+            if seen >= expected
+                || !marked_event_matches(kind, u32::from(seen), virtual_key, is_down, is_up)
+            {
+                let invalid = (state & !MARKED_STATUS_MASK) | MARKED_STATUS_INVALID;
+                if self
+                    .marked_state
+                    .compare_exchange(state, invalid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.terminate(TERMINAL_UNSAFE_KEY);
+                    return;
+                }
+                continue;
+            }
+
+            let next_seen = seen + 1;
+            let next_status = if next_seen == expected {
+                MARKED_STATUS_COMPLETE
+            } else {
+                MARKED_STATUS_ACTIVE
+            };
+            let next = pack_marked_state(
+                next_status,
+                kind,
+                expected,
+                next_seen,
+                marked_generation(state),
+            );
+            if self
+                .marked_state
+                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if next_status == MARKED_STATUS_COMPLETE {
+                    self.publish(NativeEvent::MarkedSequenceComplete);
+                }
+                return;
+            }
+        }
+    }
+
+    fn claim_physical_during_marked_sequence(&self) -> bool {
+        loop {
+            let state = self.marked_state.load(Ordering::Acquire);
+            match marked_status(state) {
+                0 => return false,
+                MARKED_STATUS_INVALID => return true,
+                MARKED_STATUS_ACTIVE | MARKED_STATUS_COMPLETE | MARKED_STATUS_CLOSING => {
+                    let invalid = (state & !MARKED_STATUS_MASK) | MARKED_STATUS_INVALID;
+                    if self
+                        .marked_state
+                        .compare_exchange(state, invalid, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                _ => return true,
+            }
+        }
+    }
+
+    fn marked_sequence_complete(&self) -> bool {
+        matches!(
+            marked_status(self.marked_state.load(Ordering::Acquire)),
+            MARKED_STATUS_COMPLETE | MARKED_STATUS_CLOSING
+        )
+    }
+
+    fn finish_marked_sequence(&self) -> bool {
+        loop {
+            let state = self.marked_state.load(Ordering::Acquire);
+            match marked_status(state) {
+                MARKED_STATUS_COMPLETE => {
+                    let closing = (state & !MARKED_STATUS_MASK) | MARKED_STATUS_CLOSING;
+                    if self
+                        .marked_state
+                        .compare_exchange(state, closing, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    self.marked_callbacks
+                        .fetch_or(MARKED_CALLBACKS_CLOSED, Ordering::AcqRel);
+                }
+                MARKED_STATUS_CLOSING => {}
+                _ => return false,
+            }
+
+            if self.marked_callbacks.load(Ordering::Acquire) & MARKED_CALLBACKS_COUNT_MASK != 0 {
+                return false;
+            }
+            let closing = self.marked_state.load(Ordering::Acquire);
+            if marked_status(closing) != MARKED_STATUS_CLOSING {
+                return false;
+            }
+            if self
+                .marked_state
+                .compare_exchange(closing, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            self.active_marker.store(0, Ordering::Release);
+            self.marked_callbacks.store(0, Ordering::Release);
+            return self.terminal.load(Ordering::Acquire) == TERMINAL_NONE;
+        }
+    }
+
+    fn disarm_marked_sequence(&self) {
+        self.marked_state.store(0, Ordering::Release);
+        self.active_marker.store(0, Ordering::Release);
+    }
+
     fn publish(&self, event: NativeEvent) {
         if let Err(error) = self.events.try_send(event) {
             if matches!(error, TrySendError::Full(_) | TrySendError::Disconnected(_)) {
@@ -668,7 +897,7 @@ impl CallbackState {
             .compare_exchange(TERMINAL_NONE, code, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.active_marker.store(0, Ordering::Release);
+            self.disarm_marked_sequence();
             let _ = self.events.try_send(NativeEvent::Terminal { code });
             let hook_thread = self.hook_thread_id.load(Ordering::Acquire);
             if hook_thread != 0 {
@@ -678,6 +907,39 @@ impl CallbackState {
         } else {
             false
         }
+    }
+}
+
+struct MarkedCallbackGuard<'a>(&'a CallbackState);
+
+impl<'a> MarkedCallbackGuard<'a> {
+    fn enter(state: &'a CallbackState) -> Option<Self> {
+        loop {
+            let callbacks = state.marked_callbacks.load(Ordering::Acquire);
+            if callbacks & MARKED_CALLBACKS_CLOSED != 0
+                || callbacks & MARKED_CALLBACKS_COUNT_MASK == MARKED_CALLBACKS_COUNT_MASK
+            {
+                return None;
+            }
+            if state
+                .marked_callbacks
+                .compare_exchange(
+                    callbacks,
+                    callbacks + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(Self(state));
+            }
+        }
+    }
+}
+
+impl Drop for MarkedCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.0.marked_callbacks.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -763,12 +1025,16 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         if !is_down && !is_up {
             return;
         }
-
+        let Some(_marked_callback) = MarkedCallbackGuard::enter(&state) else {
+            state.terminate(TERMINAL_UNSAFE_KEY);
+            return;
+        };
         if input.flags.contains(LLKHF_INJECTED) {
-            let active = state.active_marker.load(Ordering::Acquire);
-            if active == 0 || input.dwExtraInfo != active {
-                state.terminate(TERMINAL_UNSAFE_KEY);
-            }
+            state.observe_marked_event(input.dwExtraInfo, input.vkCode, is_down, is_up);
+            return;
+        }
+        if state.claim_physical_during_marked_sequence() {
+            state.terminate(TERMINAL_UNSAFE_KEY);
             return;
         }
 
@@ -784,14 +1050,18 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             return;
         }
 
-        let modifiers = state.modifiers.load(Ordering::Acquire);
-        if state.stop_chord.matches(modifiers, input.vkCode) {
+        let modifiers = state.modifiers.load(Ordering::Acquire) | async_modifier_state();
+        if state
+            .stop_chord
+            .matches(modifiers & !(MOD_RALT | MOD_LALT), input.vkCode)
+        {
             return;
         }
-        if is_compatible_printable(input.vkCode, modifiers) {
-            state.publish(NativeEvent::CompatibleKey { chars: 1 });
-        } else {
-            state.terminate(TERMINAL_UNSAFE_KEY);
+        match classify_active_layout_key(input.vkCode, input.scanCode, modifiers) {
+            LayoutKeyClassification::Printable { chars } => {
+                state.publish(NativeEvent::CompatibleKey { chars });
+            }
+            LayoutKeyClassification::Terminal => state.terminate(TERMINAL_UNSAFE_KEY),
         }
     }));
 
@@ -880,6 +1150,12 @@ fn hook_thread(
             return;
         }
     };
+    // A modifier may already be held when monitoring begins. Seeding after
+    // installing the hooks closes that gap; subsequent transitions are tracked
+    // by the hook before any ordinary key is classified.
+    state
+        .modifiers
+        .store(async_modifier_state(), Ordering::Release);
 
     if ready.send(Ok(thread_id)).is_err() {
         let _ = unsafe { UnhookWindowsHookEx(mouse) };
@@ -925,19 +1201,216 @@ fn modifier_bit(virtual_key: u32) -> Option<u8> {
     match VIRTUAL_KEY(virtual_key as u16) {
         VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(MOD_CTRL),
         VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(MOD_SHIFT),
-        VK_MENU | VK_LMENU | VK_RMENU => Some(MOD_ALT),
+        VK_MENU => Some(MOD_ALT),
+        VK_LMENU => Some(MOD_ALT | MOD_LALT),
+        VK_RMENU => Some(MOD_ALT | MOD_RALT),
         VK_LWIN | VK_RWIN => Some(MOD_WIN),
         _ => None,
     }
 }
 
-fn is_compatible_printable(virtual_key: u32, modifiers: u8) -> bool {
-    if modifiers & (MOD_CTRL | MOD_ALT | MOD_WIN) != 0 {
-        return false;
+fn async_modifier_state() -> u8 {
+    fn down(key: VIRTUAL_KEY) -> bool {
+        (unsafe { GetAsyncKeyState(key.0 as i32) }) < 0
     }
-    virtual_key == VK_SPACE.0 as u32
-        || (b'A' as u32..=b'Z' as u32).contains(&virtual_key)
-        || (b'0' as u32..=b'9' as u32).contains(&virtual_key)
+
+    let mut modifiers = 0;
+    if down(VK_LCONTROL) || down(VK_RCONTROL) {
+        modifiers |= MOD_CTRL;
+    }
+    if down(VK_LSHIFT) || down(VK_RSHIFT) {
+        modifiers |= MOD_SHIFT;
+    }
+    if down(VK_LMENU) {
+        modifiers |= MOD_ALT | MOD_LALT;
+    }
+    if down(VK_RMENU) {
+        modifiers |= MOD_ALT | MOD_RALT;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        modifiers |= MOD_WIN;
+    }
+    modifiers
+}
+
+fn marked_event_matches(
+    kind: u8,
+    index: u32,
+    virtual_key: u32,
+    is_down: bool,
+    is_up: bool,
+) -> bool {
+    let edge_matches = |expected_down: bool| {
+        if expected_down {
+            is_down && !is_up
+        } else {
+            is_up && !is_down
+        }
+    };
+    match kind {
+        MARKED_SEQUENCE_UNICODE => {
+            virtual_key == VK_PACKET.0 as u32 && edge_matches(index % 2 == 0)
+        }
+        MARKED_SEQUENCE_ENTER => virtual_key == VK_RETURN.0 as u32 && edge_matches(index == 0),
+        MARKED_SEQUENCE_CTRL_ENTER => match index {
+            0 => virtual_key == VK_LCONTROL.0 as u32 && edge_matches(true),
+            1 => virtual_key == VK_RETURN.0 as u32 && edge_matches(true),
+            2 => virtual_key == VK_RETURN.0 as u32 && edge_matches(false),
+            3 => virtual_key == VK_LCONTROL.0 as u32 && edge_matches(false),
+            _ => false,
+        },
+        MARKED_SEQUENCE_WIN_ENTER => match index {
+            0 => virtual_key == VK_LWIN.0 as u32 && edge_matches(true),
+            1 => virtual_key == VK_RETURN.0 as u32 && edge_matches(true),
+            2 => virtual_key == VK_RETURN.0 as u32 && edge_matches(false),
+            3 => virtual_key == VK_LWIN.0 as u32 && edge_matches(false),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutKeyClassification {
+    Printable { chars: usize },
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveLayoutState {
+    Direct,
+    ImeOrComposition,
+    Uncertain,
+}
+
+fn classify_active_layout_key(
+    virtual_key: u32,
+    scan_code: u32,
+    modifiers: u8,
+) -> LayoutKeyClassification {
+    if !printable_modifiers(modifiers) {
+        return LayoutKeyClassification::Terminal;
+    }
+    if is_always_terminal_key(virtual_key) {
+        return LayoutKeyClassification::Terminal;
+    }
+
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return LayoutKeyClassification::Terminal;
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(foreground, None) };
+    if thread_id == 0 {
+        return LayoutKeyClassification::Terminal;
+    }
+    let layout = unsafe { GetKeyboardLayout(thread_id) };
+    if layout.0.is_null() {
+        return classify_layout_translation(modifiers, ActiveLayoutState::Uncertain, 0, &[]);
+    }
+    if unsafe { ImmIsIME(layout) }.as_bool() {
+        return classify_layout_translation(modifiers, ActiveLayoutState::ImeOrComposition, 0, &[]);
+    }
+
+    let mut keyboard_state = [0u8; 256];
+    if unsafe { GetKeyboardState(&mut keyboard_state) }.is_err() {
+        return LayoutKeyClassification::Terminal;
+    }
+    // Only lock toggles are relevant from this hook thread's snapshot. The
+    // physical modifier state comes from the hook plus GetAsyncKeyState above.
+    // Clearing all high bits also prevents unrelated pressed keys from
+    // influencing translation.
+    for state in &mut keyboard_state {
+        *state &= 1;
+    }
+    if modifiers & MOD_SHIFT != 0 {
+        keyboard_state[VK_SHIFT.0 as usize] |= 0x80;
+    }
+    if modifiers & MOD_CTRL != 0 {
+        keyboard_state[VK_CONTROL.0 as usize] |= 0x80;
+    }
+    if modifiers & MOD_ALT != 0 {
+        keyboard_state[VK_MENU.0 as usize] |= 0x80;
+    }
+    if modifiers & MOD_RALT != 0 {
+        keyboard_state[VK_RMENU.0 as usize] |= 0x80;
+    }
+
+    let mut translated = [0u16; 16];
+    let count = unsafe {
+        ToUnicodeEx(
+            virtual_key,
+            scan_code,
+            &keyboard_state,
+            &mut translated,
+            TO_UNICODE_NO_STATE_CHANGE,
+            Some(layout),
+        )
+    };
+    classify_layout_translation(modifiers, ActiveLayoutState::Direct, count, &translated)
+}
+
+fn printable_modifiers(modifiers: u8) -> bool {
+    let non_shift = modifiers & !MOD_SHIFT;
+    non_shift == 0 || non_shift == (MOD_CTRL | MOD_ALT | MOD_RALT)
+}
+
+fn is_always_terminal_key(virtual_key: u32) -> bool {
+    matches!(
+        VIRTUAL_KEY(virtual_key as u16),
+        VK_BACK
+            | VK_CANCEL
+            | VK_CLEAR
+            | VK_DELETE
+            | VK_DOWN
+            | VK_END
+            | VK_ESCAPE
+            | VK_HOME
+            | VK_INSERT
+            | VK_LEFT
+            | VK_NEXT
+            | VK_PACKET
+            | VK_PAUSE
+            | VK_PRIOR
+            | VK_PROCESSKEY
+            | VK_RETURN
+            | VK_RIGHT
+            | VK_TAB
+            | VK_UP
+    )
+}
+
+fn classify_layout_translation(
+    modifiers: u8,
+    layout_state: ActiveLayoutState,
+    translated: i32,
+    utf16: &[u16],
+) -> LayoutKeyClassification {
+    if layout_state != ActiveLayoutState::Direct
+        || !printable_modifiers(modifiers)
+        || translated <= 0
+    {
+        return LayoutKeyClassification::Terminal;
+    }
+    let Ok(unit_count) = usize::try_from(translated) else {
+        return LayoutKeyClassification::Terminal;
+    };
+    // Filling the whole buffer is indistinguishable from truncation.
+    if unit_count == 0 || unit_count >= utf16.len() {
+        return LayoutKeyClassification::Terminal;
+    }
+
+    let mut chars = 0usize;
+    for decoded in char::decode_utf16(utf16[..unit_count].iter().copied()) {
+        match decoded {
+            Ok(character) if !character.is_control() => chars += 1,
+            Ok(_) | Err(_) => return LayoutKeyClassification::Terminal,
+        }
+    }
+    if chars == 0 {
+        LayoutKeyClassification::Terminal
+    } else {
+        LayoutKeyClassification::Printable { chars }
+    }
 }
 
 fn uia_thread(
@@ -1019,7 +1492,7 @@ fn uia_thread(
         return;
     }
 
-    let capability = windows_route_capability(true);
+    let capability = windows_route_capability(target.supports_auto_submit());
     if begin_result
         .send(Ok(BeginInfo {
             capability: capability.clone(),
@@ -1089,10 +1562,7 @@ fn uia_thread(
         }
     }
     subscriptions.remove(&worker.automation, &worker.target.element);
-    worker
-        .callback_state
-        .active_marker
-        .store(0, Ordering::Release);
+    worker.callback_state.disarm_marked_sequence();
 }
 
 struct RuntimeId(*mut SAFEARRAY);
@@ -1246,6 +1716,18 @@ impl UiaTarget {
             return Err(FocusedOutputReasonCode::SelectionChanged);
         }
         Ok(range)
+    }
+
+    fn supports_auto_submit(&self) -> bool {
+        let is_multiline = unsafe {
+            self.element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        }
+        .and_then(|pattern| unsafe { pattern.DocumentRange() })
+        .and_then(|range| unsafe { range.GetAttributeValue(UIA_IsMultilineAttributeId) })
+        .ok()
+        .and_then(|value| bool::try_from(&value).ok());
+        auto_submit_supported_for_metadata(self.control_type, is_multiline)
     }
 }
 
@@ -1430,17 +1912,27 @@ impl UiaSubscriptions {
     }
 }
 
+fn receipt_deadline_from(dispatch_finished: Instant, receipt_window: Duration) -> Instant {
+    dispatch_finished + receipt_window
+}
+
 struct PendingEvidence {
     kind: PendingKind,
     selection_before: IUIAutomationTextRange,
     value_changed: bool,
     selection_changed: bool,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 enum PendingKind {
     Handy(InjectionId),
     External { chars: usize },
+}
+
+fn bounded_receipt_wait(deadline: Instant, now: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(now)
+        .min(Duration::from_millis(10))
 }
 
 struct UiaWorker {
@@ -1496,18 +1988,36 @@ impl UiaWorker {
                 return InsertOutcome::Rejected { reason };
             }
         };
+        let expected_events = request
+            .text
+            .encode_utf16()
+            .count()
+            .checked_mul(2)
+            .and_then(|count| u32::try_from(count).ok());
+        let Some(expected_events) = expected_events.filter(|count| *count != 0) else {
+            return InsertOutcome::Rejected {
+                reason: FocusedOutputReasonCode::InjectionDenied,
+            };
+        };
         let injection_marker = marker_for_injection(self.marker, request.injection_id);
         self.duplicate_effect_deadline = None;
+        if !self.callback_state.arm_marked_sequence(
+            injection_marker,
+            MARKED_SEQUENCE_UNICODE,
+            expected_events,
+        ) {
+            self.invalidate(TERMINAL_MONITOR_LOST);
+            return InsertOutcome::Rejected {
+                reason: FocusedOutputReasonCode::MonitorUnavailable,
+            };
+        }
         self.pending = Some(PendingEvidence {
             kind: PendingKind::Handy(request.injection_id),
             selection_before,
             value_changed: false,
             selection_changed: false,
-            deadline: Instant::now() + PlatformDeadlines::default().handy_receipt,
+            deadline: None,
         });
-        self.callback_state
-            .active_marker
-            .store(injection_marker, Ordering::Release);
 
         let mut posted_scalars = 0usize;
         for scalar in request.text.chars() {
@@ -1570,9 +2080,7 @@ impl UiaWorker {
                 SendClassification::Posted => posted_scalars += 1,
                 SendClassification::Rejected => {
                     self.pending = None;
-                    self.callback_state
-                        .active_marker
-                        .store(0, Ordering::Release);
+                    self.callback_state.disarm_marked_sequence();
                     return InsertOutcome::Rejected {
                         reason: FocusedOutputReasonCode::InjectionDenied,
                     };
@@ -1588,9 +2096,13 @@ impl UiaWorker {
 
         if posted_scalars == 0 {
             self.pending = None;
-            self.callback_state
-                .active_marker
-                .store(0, Ordering::Release);
+            self.callback_state.disarm_marked_sequence();
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.deadline = Some(receipt_deadline_from(
+                Instant::now(),
+                PlatformDeadlines::default().handy_receipt,
+            ));
         }
         InsertOutcome::Complete {
             receipt: ReceiptConfidence::Posted,
@@ -1625,6 +2137,11 @@ impl UiaWorker {
             self.invalidate(reason_to_terminal(reason));
             return SubmitOutcome::Rejected { reason };
         }
+        if !self.target.supports_auto_submit() {
+            return SubmitOutcome::Rejected {
+                reason: FocusedOutputReasonCode::AutoSubmitUnsupported,
+            };
+        }
         if self.cancellation.is_cancelled()
             || self.callback_state.terminal.load(Ordering::Acquire) != TERMINAL_NONE
         {
@@ -1634,24 +2151,33 @@ impl UiaWorker {
         }
 
         let submit_marker = (self.marker.rotate_left(17) ^ 0x5355_424dusize) | 1;
-        self.callback_state
-            .active_marker
-            .store(submit_marker, Ordering::Release);
         let (inputs, count) = submit_inputs(key, submit_marker);
+        let expected = u32::try_from(count).unwrap_or(0);
+        if !self.callback_state.arm_marked_sequence(
+            submit_marker,
+            submit_sequence_kind(key),
+            expected,
+        ) {
+            self.invalidate(TERMINAL_MONITOR_LOST);
+            return SubmitOutcome::Rejected {
+                reason: FocusedOutputReasonCode::MonitorUnavailable,
+            };
+        }
         let returned = unsafe { SendInput(&inputs[..count], size_of::<INPUT>() as i32) } as usize;
         match classify_send_input(count, returned, false) {
             SendClassification::Posted => {
-                // Submit is the final guarded unit. Monitoring stays armed until
-                // close, but no later insertion can overtake the chord.
                 self.submitted = true;
-                SubmitOutcome::Complete {
-                    receipt: ReceiptConfidence::Posted,
+                match self.await_submit_marker(events) {
+                    Ok(()) => SubmitOutcome::Complete {
+                        receipt: ReceiptConfidence::Posted,
+                    },
+                    Err(_) => SubmitOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    },
                 }
             }
             SendClassification::Rejected => {
-                self.callback_state
-                    .active_marker
-                    .store(0, Ordering::Release);
+                self.callback_state.disarm_marked_sequence();
                 SubmitOutcome::Rejected {
                     reason: FocusedOutputReasonCode::InjectionDenied,
                 }
@@ -1665,22 +2191,73 @@ impl UiaWorker {
         }
     }
 
+    fn await_submit_marker(
+        &mut self,
+        events: &Receiver<NativeEvent>,
+    ) -> Result<(), FocusedOutputReasonCode> {
+        let deadline = Instant::now() + PlatformDeadlines::default().handy_receipt;
+        loop {
+            if self.callback_state.marked_sequence_complete() {
+                if self.callback_state.finish_marked_sequence() {
+                    return Ok(());
+                }
+                if let Some(reason) =
+                    terminal_reason(self.callback_state.terminal.load(Ordering::Acquire))
+                {
+                    return Err(reason);
+                }
+            }
+            if self.cancellation.is_cancelled() {
+                self.invalidate(TERMINAL_CANCELLED);
+                return Err(FocusedOutputReasonCode::Cancelled);
+            }
+            if let Some(reason) =
+                terminal_reason(self.callback_state.terminal.load(Ordering::Acquire))
+            {
+                return Err(reason);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                self.invalidate(TERMINAL_RECEIPT_TIMEOUT);
+                return Err(FocusedOutputReasonCode::ReceiptTimeout);
+            }
+            let wait = bounded_receipt_wait(deadline, now);
+            if let Ok(event) = events.recv_timeout(wait) {
+                self.handle_native_event(event);
+            }
+        }
+    }
+
     fn await_pending(
         &mut self,
         events: &Receiver<NativeEvent>,
     ) -> Result<(), FocusedOutputReasonCode> {
-        while let Some(pending) = &self.pending {
+        while self.pending.is_some() {
+            let should_retry = self.pending.as_ref().is_some_and(|pending| {
+                pending.value_changed && self.callback_state.marked_sequence_complete()
+            });
+            if should_retry {
+                self.try_complete_evidence();
+                if self.pending.is_none() {
+                    break;
+                }
+            }
+            let Some(deadline) = self.pending.as_ref().and_then(|pending| pending.deadline) else {
+                self.invalidate(TERMINAL_MONITOR_LOST);
+                return Err(FocusedOutputReasonCode::MonitorUnavailable);
+            };
             let now = Instant::now();
-            if now >= pending.deadline {
+            if now >= deadline {
                 self.invalidate(TERMINAL_RECEIPT_TIMEOUT);
                 return Err(FocusedOutputReasonCode::ReceiptTimeout);
             }
-            let wait = pending.deadline.saturating_duration_since(now);
+            let wait = bounded_receipt_wait(deadline, now);
             match events.recv_timeout(wait) {
                 Ok(event) => self.handle_native_event(event),
-                Err(_) => {
-                    self.invalidate(TERMINAL_RECEIPT_TIMEOUT);
-                    return Err(FocusedOutputReasonCode::ReceiptTimeout);
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.invalidate(TERMINAL_MONITOR_LOST);
+                    return Err(FocusedOutputReasonCode::MonitorUnavailable);
                 }
             }
             if let Some(reason) =
@@ -1712,7 +2289,7 @@ impl UiaWorker {
                     selection_before: before,
                     value_changed: false,
                     selection_changed: false,
-                    deadline: Instant::now() + PlatformDeadlines::default().input_effect,
+                    deadline: Some(Instant::now() + PlatformDeadlines::default().input_effect),
                 });
             }
             NativeEvent::TextChanged => {
@@ -1739,6 +2316,7 @@ impl UiaWorker {
                     self.invalidate(TERMINAL_UNSAFE_KEY);
                 }
             }
+            NativeEvent::MarkedSequenceComplete => self.try_complete_evidence(),
             NativeEvent::Terminal { code: _ } => self.observe_terminal(),
         }
     }
@@ -1748,6 +2326,12 @@ impl UiaWorker {
             return;
         };
         if !pending.value_changed {
+            self.pending = Some(pending);
+            return;
+        }
+        if matches!(&pending.kind, PendingKind::Handy(_))
+            && !self.callback_state.marked_sequence_complete()
+        {
             self.pending = Some(pending);
             return;
         }
@@ -1771,12 +2355,17 @@ impl UiaWorker {
             self.invalidate(TERMINAL_UNSAFE_KEY);
             return;
         }
+        if matches!(&pending.kind, PendingKind::Handy(_))
+            && !self.callback_state.finish_marked_sequence()
+        {
+            if self.callback_state.terminal.load(Ordering::Acquire) == TERMINAL_NONE {
+                self.pending = Some(pending);
+            }
+            return;
+        }
         self.last_selection = after;
         match pending.kind {
             PendingKind::Handy(injection_id) => {
-                self.callback_state
-                    .active_marker
-                    .store(0, Ordering::Release);
                 self.event_sink.publish(
                     self.session_id,
                     TargetInteractionEvent::HandyInsertionObserved {
@@ -1801,11 +2390,17 @@ impl UiaWorker {
     }
 
     fn expire_pending(&mut self) {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| Instant::now() >= pending.deadline)
-        {
+        let should_retry = self.pending.as_ref().is_some_and(|pending| {
+            pending.value_changed && self.callback_state.marked_sequence_complete()
+        });
+        if should_retry {
+            self.try_complete_evidence();
+        }
+        if self.pending.as_ref().is_some_and(|pending| {
+            pending
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        }) {
             self.invalidate(TERMINAL_RECEIPT_TIMEOUT);
         }
     }
@@ -1818,9 +2413,7 @@ impl UiaWorker {
     fn invalidate(&mut self, code: u8) {
         self.callback_state.terminate(code);
         self.pending = None;
-        self.callback_state
-            .active_marker
-            .store(0, Ordering::Release);
+        self.callback_state.disarm_marked_sequence();
     }
     fn observe_terminal(&mut self) {
         let code = self.callback_state.terminal.load(Ordering::Acquire);
@@ -1935,13 +2528,27 @@ fn submit_inputs(key: AutoSubmitKey, marker: usize) -> ([INPUT; 4], usize) {
             (inputs, 2)
         }
         AutoSubmitKey::CtrlEnter => {
-            inputs[0] = keyboard_input(VK_CONTROL, 0, Default::default(), marker);
+            inputs[0] = keyboard_input(VK_LCONTROL, 0, Default::default(), marker);
             inputs[1] = keyboard_input(VK_RETURN, 0, Default::default(), marker);
             inputs[2] = keyboard_input(VK_RETURN, 0, KEYEVENTF_KEYUP, marker);
-            inputs[3] = keyboard_input(VK_CONTROL, 0, KEYEVENTF_KEYUP, marker);
+            inputs[3] = keyboard_input(VK_LCONTROL, 0, KEYEVENTF_KEYUP, marker);
             (inputs, 4)
         }
-        AutoSubmitKey::CmdEnter => (inputs, 0),
+        AutoSubmitKey::CmdEnter => {
+            inputs[0] = keyboard_input(VK_LWIN, 0, Default::default(), marker);
+            inputs[1] = keyboard_input(VK_RETURN, 0, Default::default(), marker);
+            inputs[2] = keyboard_input(VK_RETURN, 0, KEYEVENTF_KEYUP, marker);
+            inputs[3] = keyboard_input(VK_LWIN, 0, KEYEVENTF_KEYUP, marker);
+            (inputs, 4)
+        }
+    }
+}
+
+fn submit_sequence_kind(key: AutoSubmitKey) -> u8 {
+    match key {
+        AutoSubmitKey::Enter => MARKED_SEQUENCE_ENTER,
+        AutoSubmitKey::CtrlEnter => MARKED_SEQUENCE_CTRL_ENTER,
+        AutoSubmitKey::CmdEnter => MARKED_SEQUENCE_WIN_ENTER,
     }
 }
 
@@ -1966,7 +2573,10 @@ fn keyboard_input(
 }
 
 fn submit_key_supported(key: AutoSubmitKey) -> bool {
-    matches!(key, AutoSubmitKey::Enter | AutoSubmitKey::CtrlEnter)
+    matches!(
+        key,
+        AutoSubmitKey::Enter | AutoSubmitKey::CtrlEnter | AutoSubmitKey::CmdEnter
+    )
 }
 
 fn windows_route_capability(supports_auto_submit: bool) -> FocusedOutputCapability {
@@ -1981,6 +2591,12 @@ fn windows_route_capability(supports_auto_submit: bool) -> FocusedOutputCapabili
     )
 }
 
+fn auto_submit_supported_for_metadata(
+    control_type: UIA_CONTROLTYPE_ID,
+    is_multiline: Option<bool>,
+) -> bool {
+    control_type == UIA_EditControlTypeId && is_multiline == Some(false)
+}
 fn terminal_reason(code: u8) -> Option<FocusedOutputReasonCode> {
     match code {
         TERMINAL_NONE => None,
@@ -2004,7 +2620,7 @@ fn reason_to_terminal(reason: FocusedOutputReasonCode) -> u8 {
     }
 }
 
-fn random_marker() -> usize {
+fn random_marker() -> Result<usize, FocusedOutputReasonCode> {
     let mut marker = 0usize;
     let status = unsafe {
         BCryptGenRandom(
@@ -2014,10 +2630,15 @@ fn random_marker() -> usize {
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
     };
+    marker_from_entropy(status, marker)
+}
+
+fn marker_from_entropy(status: i32, marker: usize) -> Result<usize, FocusedOutputReasonCode> {
     if status != 0 || marker == 0 {
-        marker = MARKER_FALLBACK.fetch_add(0x9e37_79b9usize, Ordering::Relaxed);
+        Err(FocusedOutputReasonCode::MonitorUnavailable)
+    } else {
+        Ok(marker | 1)
     }
-    marker | 1
 }
 
 fn belongs_to_handy_process_tree(process_id: u32) -> Result<bool, FocusedOutputReasonCode> {
@@ -2092,6 +2713,24 @@ fn wait_and_join_failed(
 mod tests {
     use super::*;
 
+    fn test_callback_state(events: Sender<NativeEvent>) -> CallbackState {
+        CallbackState {
+            terminal: AtomicU8::new(TERMINAL_NONE),
+            active_marker: AtomicUsize::new(0),
+            marked_state: AtomicU64::new(0),
+            marked_generation: AtomicU32::new(0),
+            marked_callbacks: AtomicU32::new(0),
+            modifiers: AtomicU8::new(0),
+            hook_thread_id: AtomicU32::new(0),
+            stop_chord: StopChord {
+                modifiers: 0,
+                virtual_key: 0,
+                configured: false,
+            },
+            events,
+        }
+    }
+
     #[test]
     fn send_input_count_classification_is_strict() {
         assert_eq!(classify_send_input(2, 2, false), SendClassification::Posted);
@@ -2125,6 +2764,187 @@ mod tests {
         let first = unsafe { astral[0].Anonymous.ki };
         let second = unsafe { astral[2].Anonymous.ki };
         assert_eq!([first.wScan, second.wScan], [0xd83d, 0xde42]);
+    }
+
+    #[test]
+    fn submit_construction_marks_enter_ctrl_enter_and_win_enter() {
+        fn assert_submit(key: AutoSubmitKey, expected_keys: &[VIRTUAL_KEY], key_up_at: &[usize]) {
+            let marker = 0x5a5a;
+            let (inputs, count) = submit_inputs(key, marker);
+            assert_eq!(count, expected_keys.len());
+            for (index, expected_key) in expected_keys.iter().enumerate() {
+                let input = unsafe { inputs[index].Anonymous.ki };
+                assert_eq!(input.wVk, *expected_key);
+                assert_eq!(input.dwExtraInfo, marker);
+                assert_eq!(
+                    input.dwFlags.contains(KEYEVENTF_KEYUP),
+                    key_up_at.contains(&index)
+                );
+            }
+        }
+
+        assert_submit(AutoSubmitKey::Enter, &[VK_RETURN, VK_RETURN], &[1]);
+        assert_submit(
+            AutoSubmitKey::CtrlEnter,
+            &[VK_LCONTROL, VK_RETURN, VK_RETURN, VK_LCONTROL],
+            &[2, 3],
+        );
+        assert_submit(
+            AutoSubmitKey::CmdEnter,
+            &[VK_LWIN, VK_RETURN, VK_RETURN, VK_LWIN],
+            &[2, 3],
+        );
+    }
+
+    #[test]
+    fn marked_hook_sequence_requires_exact_count_and_shape() {
+        assert!(marked_event_matches(
+            MARKED_SEQUENCE_UNICODE,
+            0,
+            VK_PACKET.0 as u32,
+            true,
+            false,
+        ));
+        assert!(marked_event_matches(
+            MARKED_SEQUENCE_UNICODE,
+            1,
+            VK_PACKET.0 as u32,
+            false,
+            true,
+        ));
+        assert!(!marked_event_matches(
+            MARKED_SEQUENCE_UNICODE,
+            1,
+            VK_PACKET.0 as u32,
+            true,
+            false,
+        ));
+        for (kind, keys) in [
+            (
+                MARKED_SEQUENCE_CTRL_ENTER,
+                [VK_LCONTROL, VK_RETURN, VK_RETURN, VK_LCONTROL],
+            ),
+            (
+                MARKED_SEQUENCE_WIN_ENTER,
+                [VK_LWIN, VK_RETURN, VK_RETURN, VK_LWIN],
+            ),
+        ] {
+            for (index, key) in keys.into_iter().enumerate() {
+                assert!(marked_event_matches(
+                    kind,
+                    index as u32,
+                    key.0 as u32,
+                    index < 2,
+                    index >= 2,
+                ));
+            }
+        }
+
+        let (sender, receiver) = bounded(4);
+        let state = test_callback_state(sender);
+        assert!(state.arm_marked_sequence(77, MARKED_SEQUENCE_UNICODE, 2));
+        {
+            let _callback = MarkedCallbackGuard::enter(&state).unwrap();
+            state.observe_marked_event(77, VK_PACKET.0 as u32, true, false);
+        }
+        assert!(!state.marked_sequence_complete());
+        assert!(!state.finish_marked_sequence());
+        assert!(receiver.try_recv().is_err());
+        let callback = MarkedCallbackGuard::enter(&state).unwrap();
+        state.observe_marked_event(77, VK_PACKET.0 as u32, false, true);
+        assert!(state.marked_sequence_complete());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(NativeEvent::MarkedSequenceComplete)
+        ));
+        assert!(!state.finish_marked_sequence());
+        assert!(MarkedCallbackGuard::enter(&state).is_none());
+        drop(callback);
+        assert!(state.finish_marked_sequence());
+        assert_eq!(state.marked_state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn malformed_or_duplicate_marked_hook_event_is_terminal() {
+        let (sender, _receiver) = bounded(4);
+        let state = test_callback_state(sender);
+        assert!(state.arm_marked_sequence(91, MARKED_SEQUENCE_ENTER, 2));
+        state.observe_marked_event(91, VK_RETURN.0 as u32, true, false);
+        state.observe_marked_event(91, VK_RETURN.0 as u32, true, false);
+        assert_eq!(state.terminal.load(Ordering::Acquire), TERMINAL_UNSAFE_KEY);
+        assert!(!state.finish_marked_sequence());
+    }
+
+    #[test]
+    fn physical_and_stale_callbacks_cannot_race_sequence_finish() {
+        let (sender, _receiver) = bounded(8);
+        let state = test_callback_state(sender);
+        assert!(state.arm_marked_sequence(101, MARKED_SEQUENCE_ENTER, 2));
+        for (is_down, is_up) in [(true, false), (false, true)] {
+            let _callback = MarkedCallbackGuard::enter(&state).unwrap();
+            state.observe_marked_event(101, VK_RETURN.0 as u32, is_down, is_up);
+        }
+        assert!(state.marked_sequence_complete());
+        assert!(state.claim_physical_during_marked_sequence());
+        state.terminate(TERMINAL_UNSAFE_KEY);
+        assert!(!state.finish_marked_sequence());
+
+        let (sender, _receiver) = bounded(8);
+        let state = test_callback_state(sender);
+        assert!(state.arm_marked_sequence(111, MARKED_SEQUENCE_ENTER, 2));
+        for (is_down, is_up) in [(true, false), (false, true)] {
+            let _callback = MarkedCallbackGuard::enter(&state).unwrap();
+            state.observe_marked_event(111, VK_RETURN.0 as u32, is_down, is_up);
+        }
+        assert!(state.finish_marked_sequence());
+        assert!(state.arm_marked_sequence(113, MARKED_SEQUENCE_ENTER, 2));
+        let _callback = MarkedCallbackGuard::enter(&state).unwrap();
+        state.observe_marked_event(111, VK_RETURN.0 as u32, true, false);
+        assert_eq!(state.terminal.load(Ordering::Acquire), TERMINAL_UNSAFE_KEY);
+    }
+
+    #[test]
+    fn receipt_deadline_starts_after_delayed_dispatch() {
+        let dispatch_started = Instant::now();
+        let dispatch_finished = dispatch_started + Duration::from_secs(2);
+        let window = Duration::from_millis(500);
+        let deadline = receipt_deadline_from(dispatch_finished, window);
+        assert_eq!(deadline.duration_since(dispatch_finished), window);
+        assert_eq!(
+            bounded_receipt_wait(deadline, dispatch_finished),
+            Duration::from_millis(10)
+        );
+        assert!(deadline > dispatch_started + window);
+    }
+
+    #[test]
+    fn entropy_and_auto_submit_metadata_fail_closed() {
+        assert_eq!(marker_from_entropy(0, 10), Ok(11));
+        assert_eq!(
+            marker_from_entropy(1, 10),
+            Err(FocusedOutputReasonCode::MonitorUnavailable)
+        );
+        assert_eq!(
+            marker_from_entropy(0, 0),
+            Err(FocusedOutputReasonCode::MonitorUnavailable)
+        );
+
+        assert!(auto_submit_supported_for_metadata(
+            UIA_EditControlTypeId,
+            Some(false),
+        ));
+        assert!(!auto_submit_supported_for_metadata(
+            UIA_EditControlTypeId,
+            Some(true),
+        ));
+        assert!(!auto_submit_supported_for_metadata(
+            UIA_EditControlTypeId,
+            None,
+        ));
+        assert!(!auto_submit_supported_for_metadata(
+            UIA_CONTROLTYPE_ID(UIA_EditControlTypeId.0 + 1),
+            Some(false),
+        ));
     }
 
     #[derive(Clone, Copy)]
@@ -2247,18 +3067,7 @@ mod tests {
     #[test]
     fn terminal_compare_exchange_is_first_wins_and_self_disarms() {
         let (sender, receiver) = bounded(4);
-        let state = CallbackState {
-            terminal: AtomicU8::new(TERMINAL_NONE),
-            active_marker: AtomicUsize::new(0),
-            modifiers: AtomicU8::new(0),
-            hook_thread_id: AtomicU32::new(0),
-            stop_chord: StopChord {
-                modifiers: 0,
-                virtual_key: 0,
-                configured: false,
-            },
-            events: sender,
-        };
+        let state = test_callback_state(sender);
         assert!(state.terminate(TERMINAL_POINTER));
         assert!(!state.terminate(TERMINAL_TARGET_CHANGED));
         assert_eq!(state.terminal.load(Ordering::Acquire), TERMINAL_POINTER);
@@ -2282,9 +3091,10 @@ mod tests {
             })
         );
         assert!(capability.supports_auto_submit());
+        assert!(!windows_route_capability(false).supports_auto_submit());
         assert!(submit_key_supported(AutoSubmitKey::Enter));
         assert!(submit_key_supported(AutoSubmitKey::CtrlEnter));
-        assert!(!submit_key_supported(AutoSubmitKey::CmdEnter));
+        assert!(submit_key_supported(AutoSubmitKey::CmdEnter));
         assert_ne!(
             marker_for_injection(11, InjectionId(1)),
             marker_for_injection(11, InjectionId(2))
@@ -2299,40 +3109,99 @@ mod tests {
         assert!(signal.close_requested.load(Ordering::Acquire));
 
         let (sender, _receiver) = bounded(1);
-        let state = CallbackState {
-            terminal: AtomicU8::new(TERMINAL_NONE),
-            active_marker: AtomicUsize::new(42),
-            modifiers: AtomicU8::new(0),
-            hook_thread_id: AtomicU32::new(0),
-            stop_chord: StopChord {
-                modifiers: 0,
-                virtual_key: 0,
-                configured: false,
-            },
-            events: sender,
-        };
+        let state = test_callback_state(sender);
         assert!(state.terminate(TERMINAL_MONITOR_LOST));
         assert!(!state.terminate(TERMINAL_MONITOR_LOST));
         assert_eq!(state.active_marker.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn configured_stop_chord_is_neutral_but_other_commands_are_not_compatible() {
-        let chord = StopChord::parse(Some("Ctrl+Shift+Space")).unwrap();
-        assert!(chord.matches(MOD_CTRL | MOD_SHIFT, VK_SPACE.0 as u32));
-        assert!(!is_compatible_printable(VK_SPACE.0 as u32, MOD_CTRL));
-        assert!(is_compatible_printable(b'A' as u32, MOD_SHIFT));
-        assert!(!is_compatible_printable(VK_DELETE.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_TAB.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_ESCAPE.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_LEFT.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_RIGHT.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_UP.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_DOWN.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_HOME.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_END.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_PRIOR.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_NEXT.0 as u32, 0));
-        assert!(!is_compatible_printable(VK_INSERT.0 as u32, 0));
+    fn layout_classification_accepts_printable_unicode_without_retaining_it() {
+        let direct = ActiveLayoutState::Direct;
+        assert_eq!(
+            classify_layout_translation(0, direct, 1, &[',' as u16, 0]),
+            LayoutKeyClassification::Printable { chars: 1 }
+        );
+        assert_eq!(
+            classify_layout_translation(MOD_SHIFT, direct, 1, &['é' as u16, 0]),
+            LayoutKeyClassification::Printable { chars: 1 }
+        );
+        assert_eq!(
+            classify_layout_translation(0, direct, 1, &['文' as u16, 0]),
+            LayoutKeyClassification::Printable { chars: 1 }
+        );
+        assert_eq!(
+            classify_layout_translation(0, direct, 2, &[0xd83d, 0xde42, 0]),
+            LayoutKeyClassification::Printable { chars: 1 }
+        );
+        assert_eq!(
+            classify_layout_translation(MOD_CTRL | MOD_ALT | MOD_RALT, direct, 1, &[0x20ac, 0],),
+            LayoutKeyClassification::Printable { chars: 1 }
+        );
+        assert_eq!(
+            classify_layout_translation(0, direct, 2, &['a' as u16, 'e' as u16, 0]),
+            LayoutKeyClassification::Printable { chars: 2 }
+        );
+    }
+
+    #[test]
+    fn layout_classification_fails_closed_for_commands_and_uncertainty() {
+        let direct = ActiveLayoutState::Direct;
+        let printable = ['x' as u16, 0];
+        for modifiers in [
+            MOD_CTRL,
+            MOD_ALT,
+            MOD_ALT | MOD_LALT,
+            MOD_WIN,
+            MOD_CTRL | MOD_ALT | MOD_LALT,
+            MOD_RALT,
+            MOD_LALT,
+        ] {
+            assert_eq!(
+                classify_layout_translation(modifiers, direct, 1, &printable),
+                LayoutKeyClassification::Terminal
+            );
+        }
+        for key in [
+            VK_BACK,
+            VK_DELETE,
+            VK_LEFT,
+            VK_RIGHT,
+            VK_UP,
+            VK_DOWN,
+            VK_HOME,
+            VK_END,
+            VK_PRIOR,
+            VK_NEXT,
+            VK_INSERT,
+            VK_RETURN,
+            VK_TAB,
+            VK_ESCAPE,
+            VK_PROCESSKEY,
+            VK_PACKET,
+        ] {
+            assert!(is_always_terminal_key(key.0 as u32));
+        }
+        for layout_state in [
+            ActiveLayoutState::ImeOrComposition,
+            ActiveLayoutState::Uncertain,
+        ] {
+            assert_eq!(
+                classify_layout_translation(0, layout_state, 1, &printable),
+                LayoutKeyClassification::Terminal
+            );
+        }
+        for (translated, units) in [
+            (0, &[0u16, 0][..]),
+            (-1, &[0u16, 0][..]),
+            (1, &['\t' as u16, 0][..]),
+            (1, &[0xd800, 0][..]),
+            (2, &['x' as u16, 0][..]),
+        ] {
+            assert_eq!(
+                classify_layout_translation(0, direct, translated, units),
+                LayoutKeyClassification::Terminal
+            );
+        }
     }
 }

@@ -359,9 +359,16 @@ pub enum InsertOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitOutcome {
-    Complete { receipt: ReceiptConfidence },
-    Ambiguous { reason: FocusedOutputReasonCode },
-    Rejected { reason: FocusedOutputReasonCode },
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Complete {
+        receipt: ReceiptConfidence,
+    },
+    Ambiguous {
+        reason: FocusedOutputReasonCode,
+    },
+    Rejected {
+        reason: FocusedOutputReasonCode,
+    },
 }
 
 #[allow(dead_code)]

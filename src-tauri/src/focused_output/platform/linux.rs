@@ -1,4 +1,5 @@
 use super::{BeginSession, FocusedFieldBackend, FocusedTargetSession, SessionEventSink};
+use crate::clipboard::TrustedExecutable;
 use crate::focused_output::types::{
     BeginContext, BeginReceipt, DictationSessionId, FocusedOutputBackend, FocusedOutputCapability,
     FocusedOutputPermission, FocusedOutputReasonCode, InsertOutcome, InsertionRequest,
@@ -16,38 +17,48 @@ use atspi::events::{Event, FocusEvents, MouseEvents, ObjectEvents};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::cache::CacheProxy;
 use atspi::proxy::device_event_controller::{
-    DeviceEvent, DeviceEventControllerProxy, EventListenerMode, EventType,
+    DeviceEvent, DeviceEventControllerProxy, EventListenerMode, EventType, KeyDefinition,
 };
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::zbus;
-use atspi::{AccessibilityConnection, Interface, ObjectRefOwned, Operation, Role, State};
+use atspi::{
+    connection::{read_session_accessibility, set_session_accessibility},
+    AccessibilityConnection, CacheItem, Interface, ObjectRefOwned, Operation, Role, State,
+};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
 
 const COMMAND_CAPACITY: usize = 16;
 const MONITOR_CAPACITY: usize = 64;
 const LISTENER_ROOT: &str = "/com/pais/handy/focused_output/linux";
 const REGISTRY: &str = "org.a11y.atspi.Registry";
+const DEVICE_EVENT_CONTROLLER_PATH: &str = "/org/a11y/atspi/registry/deviceeventcontroller";
+const DEVICE_EVENT_CONTROLLER_INTERFACE: &str = "org.a11y.atspi.DeviceEventController";
+// AT-SPI 2.46+ defines this argument as a u32 bitmask. atspi-proxies
+// 0.14.0 still emits the obsolete `au` signature, so keystroke registration
+// and deregistration use a raw zbus proxy.
+const KEY_EVENT_TYPES: u32 =
+    (1 << EventType::KeyPressed as u32) | (1 << EventType::KeyReleased as u32);
 const CACHE_PATH: &str = "/org/a11y/atspi/cache";
+const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const MAX_SCALARS: usize = 16;
 const MAX_ANCESTORS: usize = 128;
 const POLL: Duration = Duration::from_millis(5);
+const T_SECURE: u8 = 11;
 
 const T_NONE: u8 = 0;
 const T_TARGET: u8 = 1;
@@ -375,6 +386,7 @@ fn unavailable(reason: FocusedOutputReasonCode) -> FocusedOutputCapability {
 fn platform_thread(rx: Receiver<LoopCommand>, ready: Sender<bool>, controller: Arc<Controller>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
+        .enable_io()
         .build()
     {
         Ok(runtime) => runtime,
@@ -402,8 +414,8 @@ async fn disconnected_loop(commands: Receiver<LoopCommand>) {
                 let _ = reply.try_send(());
                 return;
             }
-            LoopCommand::Probe(reply) => match connect().await {
-                Ok(connection) => {
+            LoopCommand::Probe(reply) => match connect_for_probe().await {
+                Ok(Some(connection)) => {
                     let _ = reply.try_send(FocusedOutputCapability::global_ready(
                         FocusedOutputBackend::LinuxAtSpi,
                     ));
@@ -411,11 +423,16 @@ async fn disconnected_loop(commands: Receiver<LoopCommand>) {
                         return;
                     }
                 }
+                Ok(None) => {
+                    let _ = reply.try_send(FocusedOutputCapability::global_ready(
+                        FocusedOutputBackend::LinuxAtSpi,
+                    ));
+                }
                 Err(()) => {
                     let _ = reply.try_send(unavailable(FocusedOutputReasonCode::AtSpiUnavailable));
                 }
             },
-            begin @ LoopCommand::Begin { .. } => match connect().await {
+            begin @ LoopCommand::Begin { .. } => match connect_for_begin().await {
                 Ok(connection) => {
                     if !connected_loop(&commands, connection, Some(begin), &mut generation).await {
                         return;
@@ -425,6 +442,21 @@ async fn disconnected_loop(commands: Receiver<LoopCommand>) {
             },
             other => reject(other, FocusedOutputReasonCode::BackendDisconnected),
         }
+    }
+}
+
+async fn connect_for_probe() -> Result<Option<AccessibilityConnection>, ()> {
+    match timeout(TARGET_CALL_DEADLINE, read_session_accessibility()).await {
+        Ok(Ok(true)) => connect().await.map(Some),
+        Ok(Ok(false)) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+async fn connect_for_begin() -> Result<AccessibilityConnection, ()> {
+    match timeout(TARGET_CALL_DEADLINE, set_session_accessibility(true)).await {
+        Ok(Ok(())) => connect().await,
+        _ => Err(()),
     }
 }
 
@@ -599,7 +631,6 @@ struct SessionRecord {
     session_id: DictationSessionId,
     target: Target,
     route: Route,
-    submit_tool: Option<PinnedTool>,
     sink: Arc<dyn SessionEventSink>,
     cancellation: SessionCancellation,
     monitor: Arc<MonitorShared>,
@@ -630,8 +661,7 @@ enum Route {
 
 #[derive(Clone)]
 struct PinnedTool {
-    path: PathBuf,
-    fingerprint: Fingerprint,
+    executable: TrustedExecutable,
     kind: ToolKind,
 }
 
@@ -639,14 +669,6 @@ struct PinnedTool {
 enum ToolKind {
     Wtype,
     Ydotool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Fingerprint {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    modified: u128,
 }
 
 struct Capture {
@@ -668,21 +690,15 @@ async fn begin_session(
         return Err(FocusedOutputReasonCode::Cancelled);
     }
     let captured = capture_target(connection, generation).await?;
-    let tool = match tool_request(context.typing_tool) {
-        Ok(request) => probe_tool(request).await,
-        Err(_) if captured.direct && !context.auto_submit_requested => None,
-        Err(_) if captured.direct => {
-            return Err(FocusedOutputReasonCode::AutoSubmitUnsupported);
-        }
-        Err(reason) => return Err(reason),
-    };
-    let (route, submit_tool, capability) = if captured.direct {
-        if context.auto_submit_requested && tool.is_none() {
-            return Err(FocusedOutputReasonCode::AutoSubmitUnsupported);
-        }
+    if context.auto_submit_requested {
+        // Linux helpers can post key events, but this backend has no established
+        // target/provider submit acknowledgement. Fail before arming rather than
+        // advertising submit support from executable presence alone.
+        return Err(FocusedOutputReasonCode::AutoSubmitUnsupported);
+    }
+    let (route, capability) = if captured.direct {
         (
             Route::Direct,
-            tool.clone(),
             FocusedOutputCapability::verified_control(
                 FocusedOutputBackend::LinuxAtSpi,
                 ResolvedInsertionCapability {
@@ -690,14 +706,16 @@ async fn begin_session(
                     receipt_confidence: ReceiptConfidence::Verified,
                 },
                 MixedInputSupport::ObservedInsertionsOnly,
-                tool.is_some(),
+                false,
             ),
         )
     } else {
-        let tool = tool.ok_or(FocusedOutputReasonCode::TypingToolUnavailable)?;
+        let request = tool_request(context.typing_tool)?;
+        let tool = probe_tool(request)
+            .await
+            .ok_or(FocusedOutputReasonCode::TypingToolUnavailable)?;
         (
-            Route::Guarded(tool.clone()),
-            Some(tool),
+            Route::Guarded(tool),
             FocusedOutputCapability::guarded_focused_control(
                 FocusedOutputBackend::LinuxAtSpi,
                 ResolvedInsertionCapability {
@@ -705,7 +723,7 @@ async fn begin_session(
                     receipt_confidence: ReceiptConfidence::Posted,
                 },
                 MixedInputSupport::ObservedInsertionsOnly,
-                true,
+                false,
             ),
         )
     };
@@ -722,10 +740,15 @@ async fn begin_session(
         terminal: AtomicU8::new(T_NONE),
         published: AtomicBool::new(false),
         dispatch: AtomicBool::new(false),
+        dispatch_direct: AtomicBool::new(false),
         dispatch_text: AtomicBool::new(false),
+        intent_epoch: AtomicU64::new(0),
         tool_key_presses: AtomicU64::new(0),
+        expected_tool_key_presses: AtomicU64::new(0),
+        physical_callbacks: AtomicU64::new(0),
         tx: monitor_tx,
         stop_chord,
+        cancellation: cancellation.clone(),
     });
     let listener_path = format!("{LISTENER_ROOT}/{generation}");
     if register_device_listener(connection, &listener_path, monitor.clone())
@@ -744,7 +767,6 @@ async fn begin_session(
         session_id: context.session_id,
         target: captured.target,
         route,
-        submit_tool,
         sink,
         cancellation,
         monitor,
@@ -779,31 +801,113 @@ async fn begin_session(
     })
 }
 
-async fn capture_target(
+async fn application_cache_items(
     connection: &AccessibilityConnection,
-    owner_generation: u64,
-) -> Result<Capture, FocusedOutputReasonCode> {
-    let cache = CacheProxy::builder(connection.connection())
+) -> Result<Vec<CacheItem>, FocusedOutputReasonCode> {
+    let root = AccessibleProxy::builder(connection.connection())
         .destination(REGISTRY)
         .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)?
-        .path(CACHE_PATH)
+        .path(ROOT_PATH)
         .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)?
         .build()
         .await
         .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)?;
-    let items = bounded_call(cache.get_items())
+    let applications = root
+        .get_children()
         .await
         .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)?;
-    let mut candidates = items.into_iter().filter(|item| {
-        item.states.contains(State::Focused)
-            && item.states.contains(State::Enabled)
-            && item.states.contains(State::Sensitive)
-            && item.states.contains(State::Editable)
+    let mut items = Vec::new();
+    let mut successful_caches = 0usize;
+    for application in applications {
+        let Some(bus) = application.name_as_str() else {
+            continue;
+        };
+        let Ok(cache) = CacheProxy::builder(connection.connection())
+            .destination(bus)
+            .and_then(|builder| builder.path(CACHE_PATH))
+        else {
+            continue;
+        };
+        let Ok(cache) = cache.build().await else {
+            continue;
+        };
+        let Ok(mut application_items) = cache.get_items().await else {
+            continue;
+        };
+        successful_caches = successful_caches.saturating_add(1);
+        items.append(&mut application_items);
+    }
+    if successful_caches == 0 {
+        Err(FocusedOutputReasonCode::AtSpiUnavailable)
+    } else {
+        Ok(items)
+    }
+}
+
+async fn live_focused_candidates(
+    connection: &AccessibilityConnection,
+    items: Vec<CacheItem>,
+) -> Result<Vec<CacheItem>, FocusedOutputReasonCode> {
+    let mut candidates = Vec::new();
+    for item in items.into_iter().filter(|item| {
+        item.states.contains(State::Editable)
             && !item.states.contains(State::Defunct)
             && item.ifaces.contains(Interface::Accessible)
             && item.ifaces.contains(Interface::Text)
-            && item.role != Role::PasswordText
-    });
+    }) {
+        let Some(bus) = item.object.name_as_str() else {
+            continue;
+        };
+        let path = item.object.path_as_str();
+        let Ok(target) = accessible(connection, bus, path).await else {
+            continue;
+        };
+        let Ok(states) = target.get_state().await else {
+            continue;
+        };
+        let Ok(role) = target.get_role().await else {
+            continue;
+        };
+        let Ok(interfaces) = target.get_interfaces().await else {
+            continue;
+        };
+        let Ok(attributes) = target.get_attributes().await else {
+            continue;
+        };
+        if !states.contains(State::Focused) {
+            continue;
+        }
+        if !states.contains(State::Enabled)
+            || !states.contains(State::Sensitive)
+            || !states.contains(State::Editable)
+            || states.contains(State::Defunct)
+            || !interfaces.contains(Interface::Accessible)
+            || !interfaces.contains(Interface::Text)
+        {
+            continue;
+        }
+        if role == Role::PasswordText || secure_metadata(role, &attributes) {
+            return Err(FocusedOutputReasonCode::SecureField);
+        }
+        candidates.push(item);
+    }
+    Ok(candidates)
+}
+
+async fn capture_target(
+    connection: &AccessibilityConnection,
+    owner_generation: u64,
+) -> Result<Capture, FocusedOutputReasonCode> {
+    let items = timeout(TARGET_CALL_DEADLINE, application_cache_items(connection))
+        .await
+        .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)??;
+    let candidates = timeout(
+        TARGET_CALL_DEADLINE,
+        live_focused_candidates(connection, items),
+    )
+    .await
+    .map_err(|_| FocusedOutputReasonCode::AtSpiUnavailable)??;
+    let mut candidates = candidates.into_iter();
     let item = candidates
         .next()
         .ok_or(FocusedOutputReasonCode::NoFocusedTarget)?;
@@ -838,22 +942,37 @@ async fn capture_target(
     let process = process_identity(pid).map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
     reject_own_process_tree(pid)?;
     let target_accessible = accessible(connection, &bus, &path).await?;
+    let live_states = bounded_call(target_accessible.get_state())
+        .await
+        .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
+    let live_role = bounded_call(target_accessible.get_role())
+        .await
+        .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
+    let live_interfaces = bounded_call(target_accessible.get_interfaces())
+        .await
+        .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
     let attributes = bounded_call(target_accessible.get_attributes())
         .await
         .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)?;
-    if protected_attributes(&attributes) {
+    if secure_metadata(live_role, &attributes) {
         return Err(FocusedOutputReasonCode::SecureField);
     }
-    drop(attributes);
+    if !live_states.contains(State::Focused)
+        || !live_states.contains(State::Enabled)
+        || !live_states.contains(State::Sensitive)
+        || !live_states.contains(State::Editable)
+        || live_states.contains(State::Defunct)
+        || !live_interfaces.contains(Interface::Accessible)
+        || !live_interfaces.contains(Interface::Text)
+    {
+        return Err(FocusedOutputReasonCode::TargetUnsupported);
+    }
+    let direct = live_interfaces.contains(Interface::EditableText);
     let text = text(connection, &bus, &path).await?;
     let caret = collapsed_caret(&text).await?;
-    let app = accessible(connection, &app_bus, &app_path).await?;
-    let application = bounded_call(app.name())
-        .await
-        .ok()
-        .and_then(sanitize_application);
-    let direct = item.ifaces.contains(Interface::EditableText);
-    drop(app);
+    // AT-SPI Accessible.name is target-controlled and may contain a document
+    // title or URL. Do not carry it across the focused-output trust boundary.
+    let application = None;
     drop(text);
     drop(target_accessible);
     Ok(Capture {
@@ -874,11 +993,27 @@ async fn capture_target(
 
 async fn bounded_call<F, T, E>(future: F) -> Result<T, ()>
 where
-    F: std::future::Future<Output = Result<T, E>>,
+    F: Future<Output = Result<T, E>>,
 {
     match timeout(TARGET_CALL_DEADLINE, future).await {
         Ok(Ok(value)) => Ok(value),
         _ => Err(()),
+    }
+}
+
+async fn target_metadata_call<F, T, E>(
+    session: &SessionRecord,
+    future: F,
+) -> Result<T, FocusedOutputReasonCode>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    match bounded_call(future).await {
+        Ok(value) => Ok(value),
+        Err(()) => {
+            session.monitor.terminal(T_TARGET);
+            Err(FocusedOutputReasonCode::TargetChanged)
+        }
     }
 }
 
@@ -948,6 +1083,10 @@ async fn collapsed_caret(proxy: &TextProxy<'_>) -> Result<i32, FocusedOutputReas
     Ok(caret)
 }
 
+fn secure_metadata(role: Role, attributes: &HashMap<String, String>) -> bool {
+    role == Role::PasswordText || protected_attributes(attributes)
+}
+
 fn protected_attributes(attributes: &HashMap<String, String>) -> bool {
     attributes.iter().any(|(key, value)| {
         contains_ascii(key.as_bytes(), b"password")
@@ -964,19 +1103,6 @@ fn contains_ascii(value: &[u8], needle: &[u8]) -> bool {
     value
         .windows(needle.len())
         .any(|part| part.eq_ignore_ascii_case(needle))
-}
-
-fn sanitize_application(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 128 || trimmed.chars().any(char::is_control)
-    {
-        return None;
-    }
-    if trimmed.len() == value.len() {
-        Some(value)
-    } else {
-        Some(trimmed.to_owned())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1065,28 +1191,52 @@ async fn validate_target(
         &session.target.app_bus,
         &session.target.app_path,
     )
-    .await?;
-    if bounded_call(application.get_role()).await != Ok(Role::Application) {
+    .await
+    .map_err(|_| {
+        session.monitor.terminal(T_TARGET);
+        FocusedOutputReasonCode::TargetChanged
+    })?;
+    if target_metadata_call(session, application.get_role()).await? != Role::Application {
         session.monitor.terminal(T_TARGET);
         return Err(FocusedOutputReasonCode::TargetChanged);
     }
-    let accessible = accessible(connection, &session.target.bus, &session.target.path).await?;
-    let states = bounded_call(accessible.get_state())
+    let accessible = accessible(connection, &session.target.bus, &session.target.path)
         .await
-        .map_err(|_| FocusedOutputReasonCode::TargetChanged)?;
+        .map_err(|_| {
+            session.monitor.terminal(T_TARGET);
+            FocusedOutputReasonCode::TargetChanged
+        })?;
+    let states = target_metadata_call(session, accessible.get_state()).await?;
+    let role = target_metadata_call(session, accessible.get_role()).await?;
+    let interfaces = target_metadata_call(session, accessible.get_interfaces()).await?;
+    let attributes = target_metadata_call(session, accessible.get_attributes()).await?;
+    if secure_metadata(role, &attributes) {
+        session.monitor.terminal(T_SECURE);
+        return Err(FocusedOutputReasonCode::SecureField);
+    }
     if !states.contains(State::Focused)
         || !states.contains(State::Enabled)
         || !states.contains(State::Sensitive)
         || !states.contains(State::Editable)
         || states.contains(State::Defunct)
+        || !interfaces.contains(Interface::Accessible)
+        || !interfaces.contains(Interface::Text)
+        || (matches!(&session.route, Route::Direct)
+            && !interfaces.contains(Interface::EditableText))
     {
         session.monitor.terminal(T_TARGET);
         return Err(FocusedOutputReasonCode::TargetChanged);
     }
-    let proxy = text(connection, &session.target.bus, &session.target.path).await?;
-    collapsed_caret(&proxy)
+    let proxy = text(connection, &session.target.bus, &session.target.path)
         .await
-        .map_err(|_| FocusedOutputReasonCode::TargetChanged)
+        .map_err(|_| {
+            session.monitor.terminal(T_TARGET);
+            FocusedOutputReasonCode::TargetChanged
+        })?;
+    collapsed_caret(&proxy).await.map_err(|_| {
+        session.monitor.terminal(T_TARGET);
+        FocusedOutputReasonCode::TargetChanged
+    })
 }
 
 async fn insert<S>(
@@ -1103,13 +1253,6 @@ where
             reason: FocusedOutputReasonCode::TargetChanged,
         };
     }
-    if !finish_external_caret(events, session).await {
-        session.monitor.terminal(T_MONITOR);
-        publish_terminal(session);
-        return InsertOutcome::Rejected {
-            reason: FocusedOutputReasonCode::MonitorUnavailable,
-        };
-    }
     if request.text.is_empty() {
         return InsertOutcome::Complete {
             receipt: if matches!(&session.route, Route::Direct) {
@@ -1118,6 +1261,54 @@ where
                 ReceiptConfidence::Posted
             },
         };
+    }
+
+    loop {
+        let intent_epoch = session.monitor.intent_epoch.load(Ordering::Acquire);
+        if !finish_external_caret(events, session).await {
+            session.monitor.terminal(T_MONITOR);
+            publish_terminal(session);
+            return InsertOutcome::Rejected {
+                reason: FocusedOutputReasonCode::MonitorUnavailable,
+            };
+        }
+        let direct = matches!(&session.route, Route::Direct);
+        session
+            .monitor
+            .dispatch_direct
+            .store(direct, Ordering::Release);
+        session
+            .monitor
+            .dispatch_text
+            .store(!direct, Ordering::Release);
+        session.monitor.dispatch.store(true, Ordering::Release);
+        let terminal = session.monitor.terminal.load(Ordering::Acquire);
+        if session.monitor.intent_epoch.load(Ordering::Acquire) == intent_epoch
+            && session.monitor.physical_callbacks.load(Ordering::Acquire) == 0
+            && terminal == T_NONE
+            && !session.cancellation.is_cancelled()
+        {
+            break;
+        }
+        session.monitor.dispatch.store(false, Ordering::Release);
+        session
+            .monitor
+            .dispatch_direct
+            .store(false, Ordering::Release);
+        session
+            .monitor
+            .dispatch_text
+            .store(false, Ordering::Release);
+        if terminal != T_NONE || session.cancellation.is_cancelled() {
+            publish_terminal(session);
+            return InsertOutcome::Rejected {
+                reason: if terminal == T_NONE {
+                    FocusedOutputReasonCode::Cancelled
+                } else {
+                    reason_for_terminal(terminal)
+                },
+            };
+        }
     }
     let outcome = if matches!(&session.route, Route::Direct) {
         insert_direct(connection, events, session, request).await
@@ -1128,6 +1319,19 @@ where
         };
         insert_guarded(connection, events, session, request, tool).await
     };
+    session.monitor.dispatch.store(false, Ordering::Release);
+    session
+        .monitor
+        .dispatch_direct
+        .store(false, Ordering::Release);
+    session
+        .monitor
+        .dispatch_text
+        .store(false, Ordering::Release);
+    session
+        .monitor
+        .expected_tool_key_presses
+        .store(0, Ordering::Release);
     publish_terminal(session);
     outcome
 }
@@ -1164,6 +1368,17 @@ where
             Ok(proxy) => proxy,
             Err(reason) => return verified_prefix(accepted, reason),
         };
+        let terminal = session.monitor.terminal.load(Ordering::Acquire);
+        if terminal != T_NONE || session.cancellation.is_cancelled() {
+            return verified_prefix(
+                accepted,
+                if terminal == T_NONE {
+                    FocusedOutputReasonCode::Cancelled
+                } else {
+                    reason_for_terminal(terminal)
+                },
+            );
+        }
         match timeout(TARGET_CALL_DEADLINE, proxy.insert_text(caret, chunk, bytes)).await {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
@@ -1281,7 +1496,8 @@ where
                 reason: FocusedOutputReasonCode::TypingToolUnavailable,
             };
         }
-        let chars = match i32::try_from(chunk.chars().count()) {
+        let char_count = chunk.chars().count();
+        let chars = match i32::try_from(char_count) {
             Ok(value) => value,
             Err(_) => {
                 return InsertOutcome::Rejected {
@@ -1289,15 +1505,41 @@ where
                 }
             }
         };
+        let expected_presses = match u64::try_from(char_count) {
+            Ok(value) => value,
+            Err(_) => {
+                return InsertOutcome::Rejected {
+                    reason: FocusedOutputReasonCode::InjectionDenied,
+                }
+            }
+        };
+        let terminal = session.monitor.terminal.load(Ordering::Acquire);
+        if terminal != T_NONE || session.cancellation.is_cancelled() {
+            return InsertOutcome::Rejected {
+                reason: if terminal == T_NONE {
+                    FocusedOutputReasonCode::Cancelled
+                } else {
+                    reason_for_terminal(terminal)
+                },
+            };
+        }
         session.monitor.tool_key_presses.store(0, Ordering::Release);
-        session.monitor.dispatch_text.store(true, Ordering::Release);
-        session.monitor.dispatch.store(true, Ordering::Release);
-        let child = typing_child(&tool, chunk, &session.cancellation).await;
-        session.monitor.dispatch.store(false, Ordering::Release);
         session
             .monitor
-            .dispatch_text
-            .store(false, Ordering::Release);
+            .expected_tool_key_presses
+            .store(expected_presses, Ordering::Release);
+        let child = typing_child(&tool, chunk, &session.cancellation).await;
+        let terminal = session.monitor.terminal.load(Ordering::Acquire);
+        if terminal != T_NONE {
+            return match child {
+                ChildResult::NotStarted => InsertOutcome::Rejected {
+                    reason: reason_for_terminal(terminal),
+                },
+                ChildResult::Complete | ChildResult::PossiblyPosted => InsertOutcome::Ambiguous {
+                    reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                },
+            };
+        }
         match child {
             ChildResult::Complete => {}
             ChildResult::NotStarted => {
@@ -1348,6 +1590,10 @@ where
                 reason: FocusedOutputReasonCode::InjectionAmbiguous,
             };
         }
+        session
+            .monitor
+            .expected_tool_key_presses
+            .store(0, Ordering::Release);
         session.caret = caret + chars;
     }
     session.sink.publish(
@@ -1443,11 +1689,14 @@ async fn finish_external_caret<S>(events: &mut Pin<Box<S>>, session: &mut Sessio
 where
     S: Stream<Item = Result<Event, atspi::AtspiError>>,
 {
-    if session.external_caret.is_none() {
+    drain_one_monitor(session);
+    if !session.user_intent && session.external_caret.is_none() {
         return true;
     }
     let deadline = tokio::time::Instant::now() + HANDY_RECEIPT_DEADLINE;
-    while session.external_caret.is_some() && tokio::time::Instant::now() < deadline {
+    while (session.user_intent || session.external_caret.is_some())
+        && tokio::time::Instant::now() < deadline
+    {
         drain_one_monitor(session);
         if session.monitor.terminal.load(Ordering::Acquire) != T_NONE {
             return false;
@@ -1480,7 +1729,12 @@ where
             }
         }
     }
-    session.external_caret.is_none()
+    if session.user_intent && session.external_caret.is_none() {
+        session.user_intent = false;
+        true
+    } else {
+        !session.user_intent && session.external_caret.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1698,21 +1952,46 @@ struct MonitorShared {
     published: AtomicBool,
     dispatch: AtomicBool,
     dispatch_text: AtomicBool,
+    dispatch_direct: AtomicBool,
     tool_key_presses: AtomicU64,
+    expected_tool_key_presses: AtomicU64,
+    intent_epoch: AtomicU64,
     tx: Sender<MonitorSignal>,
     stop_chord: Option<StopChord>,
+    physical_callbacks: AtomicU64,
+    cancellation: SessionCancellation,
 }
 
 impl MonitorShared {
     fn terminal(&self, code: u8) {
-        let _ = self
+        if self
             .terminal
-            .compare_exchange(T_NONE, code, Ordering::AcqRel, Ordering::Acquire);
+            .compare_exchange(T_NONE, code, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.cancellation.cancel();
+        }
+    }
+    fn observe_tool_key(&self) {
+        let observed = self
+            .tool_key_presses
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if observed > self.expected_tool_key_presses.load(Ordering::Acquire) {
+            self.terminal(T_EDIT);
+        }
     }
 
     fn callback(&self, signal: MonitorSignal) {
         if let Err(TrySendError::Full(_)) = self.tx.try_send(signal) {
             self.terminal(T_MONITOR);
+        }
+    }
+
+    fn publish_signal(&self, signal: MonitorSignal) {
+        self.callback(signal);
+        if matches!(signal, MonitorSignal::SafeIntent) && self.dispatch.load(Ordering::Acquire) {
+            self.terminal(T_EDIT);
         }
     }
 }
@@ -1726,40 +2005,165 @@ enum MonitorSignal {
     ToolKey,
 }
 
+struct CallbackActivity<'a> {
+    shared: &'a MonitorShared,
+    active: bool,
+}
+
+impl<'a> CallbackActivity<'a> {
+    fn begin(shared: &'a MonitorShared) -> Self {
+        let active = shared
+            .physical_callbacks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .is_ok();
+        if !active {
+            shared.terminal(T_MONITOR);
+        }
+        Self { shared, active }
+    }
+}
+
+impl Drop for CallbackActivity<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.shared
+                .physical_callbacks
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControllerIdentity {
+    sender: String,
+    pid: u32,
+    uid: u32,
+}
+
 struct DeviceListener {
     shared: Arc<MonitorShared>,
+    controller: ControllerIdentity,
 }
 
 #[zbus::interface(name = "org.a11y.atspi.DeviceEventListener", crate = "atspi::zbus")]
 impl DeviceListener {
-    fn notify_event(&self, event: DeviceEvent<'_>) -> bool {
-        catch_unwind(AssertUnwindSafe(|| {
+    fn notify_event(
+        &self,
+        event: DeviceEvent<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> bool {
+        match catch_unwind(AssertUnwindSafe(|| {
+            let _activity = CallbackActivity::begin(&self.shared);
+            if !sender_is_controller(&self.controller, header.sender().map(|name| name.as_str())) {
+                self.shared.terminal(T_MONITOR);
+                return false;
+            }
             if let Some(signal) = device_signal(&self.shared, &event) {
                 match signal {
                     MonitorSignal::Command => self.shared.terminal(T_COMMAND),
                     MonitorSignal::Ime => self.shared.terminal(T_IME),
                     MonitorSignal::Pointer => self.shared.terminal(T_POINTER),
-                    MonitorSignal::ToolKey => {
-                        self.shared.tool_key_presses.fetch_add(1, Ordering::AcqRel);
-                    }
+                    MonitorSignal::ToolKey => self.shared.observe_tool_key(),
                     MonitorSignal::SafeIntent => {}
                 }
-                self.shared.callback(signal);
+                self.shared.publish_signal(signal);
             }
             false
-        }))
-        .unwrap_or(false)
+        })) {
+            Ok(value) => value,
+            Err(_) => {
+                self.shared.terminal(T_MONITOR);
+                false
+            }
+        }
     }
+}
+
+fn sender_is_controller(controller: &ControllerIdentity, sender: Option<&str>) -> bool {
+    sender == Some(controller.sender.as_str())
+}
+
+async fn controller_identity(
+    connection: &AccessibilityConnection,
+) -> Result<ControllerIdentity, ()> {
+    let dbus = zbus::fdo::DBusProxy::new(connection.connection())
+        .await
+        .map_err(|_| ())?;
+    let registry: zbus::names::BusName<'_> = REGISTRY.try_into().map_err(|_| ())?;
+    let owner = bounded_call(dbus.get_name_owner(registry)).await?;
+    let owner_name = owner.as_str().to_owned();
+    let pid_name: zbus::names::BusName<'_> = owner_name.as_str().try_into().map_err(|_| ())?;
+    let pid = bounded_call(dbus.get_connection_unix_process_id(pid_name)).await?;
+    let uid_name: zbus::names::BusName<'_> = owner_name.as_str().try_into().map_err(|_| ())?;
+    let uid = bounded_call(dbus.get_connection_unix_user(uid_name)).await?;
+    Ok(ControllerIdentity {
+        sender: owner_name,
+        pid,
+        uid,
+    })
+}
+
+fn is_modifier_key(value: &str) -> bool {
+    matches_key(
+        value,
+        &[
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+            "Alt_L",
+            "Alt_R",
+            "Meta_L",
+            "Meta_R",
+            "Super_L",
+            "Super_R",
+            "Hyper_L",
+            "Hyper_R",
+            "ISO_Level3_Shift",
+        ],
+    )
 }
 
 fn device_signal(shared: &MonitorShared, event: &DeviceEvent<'_>) -> Option<MonitorSignal> {
     match event.event_type {
-        EventType::ButtonPressed | EventType::ButtonReleased => Some(MonitorSignal::Pointer),
+        EventType::ButtonPressed | EventType::ButtonReleased => {
+            if !shared.dispatch.load(Ordering::Acquire) {
+                shared.intent_epoch.fetch_add(1, Ordering::AcqRel);
+                if shared.dispatch.load(Ordering::Acquire) {
+                    shared.terminal(T_EDIT);
+                    return None;
+                }
+            }
+            Some(MonitorSignal::Pointer)
+        }
         EventType::KeyReleased => None,
         EventType::KeyPressed => {
-            if shared.dispatch.load(Ordering::Acquire) {
-                if shared.dispatch_text.load(Ordering::Acquire) && !event.is_text {
+            let dispatch = shared.dispatch.load(Ordering::Acquire);
+            if !dispatch {
+                shared.intent_epoch.fetch_add(1, Ordering::AcqRel);
+                if shared.dispatch.load(Ordering::Acquire) {
+                    shared.terminal(T_EDIT);
                     return None;
+                }
+            }
+            if dispatch || shared.dispatch.load(Ordering::Acquire) {
+                if shared.dispatch_direct.load(Ordering::Acquire) {
+                    shared.terminal(T_EDIT);
+                    return None;
+                }
+                if shared.dispatch_text.load(Ordering::Acquire) && !event.is_text {
+                    if is_modifier_key(event.event_string) {
+                        return None;
+                    }
+                    return Some(
+                        if matches_key(event.event_string, &["Multi_key", "Compose"]) {
+                            MonitorSignal::Ime
+                        } else {
+                            MonitorSignal::Command
+                        },
+                    );
                 }
                 return Some(MonitorSignal::ToolKey);
             }
@@ -1944,39 +2348,93 @@ async fn register_device_listener(
     listener_path: &str,
     shared: Arc<MonitorShared>,
 ) -> Result<(), ()> {
+    let controller = controller_identity(connection).await?;
     connection
         .connection()
         .object_server()
-        .at(listener_path, DeviceListener { shared })
+        .at(
+            listener_path,
+            DeviceListener {
+                shared,
+                controller: controller.clone(),
+            },
+        )
         .await
         .map_err(|_| ())?;
-    let proxy = DeviceEventControllerProxy::new(connection.connection())
-        .await
-        .map_err(|_| ())?;
-    let path: zbus::zvariant::ObjectPath<'_> = listener_path.try_into().map_err(|_| ())?;
+    let proxy = match DeviceEventControllerProxy::new(connection.connection()).await {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
+    let path: zbus::zvariant::ObjectPath<'_> = match listener_path.try_into() {
+        Ok(path) => path,
+        Err(_) => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
     let mode = EventListenerMode {
         synchronous: false,
         preemptive: false,
         global: true,
     };
-    if !bounded_call(proxy.register_keystroke_listener(
-        &path,
-        &[],
-        0,
-        &[EventType::KeyPressed, EventType::KeyReleased],
-        &mode,
-    ))
-    .await?
+    let raw_proxy = match zbus::Proxy::new(
+        connection.connection(),
+        REGISTRY,
+        DEVICE_EVENT_CONTROLLER_PATH,
+        DEVICE_EVENT_CONTROLLER_INTERFACE,
+    )
+    .await
     {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
+    let keys: [KeyDefinition<'_>; 0] = [];
+    let keystrokes: bool = match timeout(
+        TARGET_CALL_DEADLINE,
+        raw_proxy.call(
+            "RegisterKeystrokeListener",
+            &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(registered)) => registered,
+        _ => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
+    if !keystrokes {
         remove_listener(connection, listener_path).await;
         return Err(());
     }
     let pressed =
-        bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonPressed)).await?;
+        match bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonPressed))
+            .await
+        {
+            Ok(registered) => registered,
+            Err(()) => {
+                deregister_device_listener(connection, listener_path).await;
+                return Err(());
+            }
+        };
     let released =
-        bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonReleased))
-            .await?;
-    if !pressed || !released {
+        match bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonReleased))
+            .await
+        {
+            Ok(registered) => registered,
+            Err(()) => {
+                deregister_device_listener(connection, listener_path).await;
+                return Err(());
+            }
+        };
+    if !pressed || !released || controller_identity(connection).await.as_ref() != Ok(&controller) {
         deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
@@ -1986,10 +2444,21 @@ async fn register_device_listener(
 async fn deregister_device_listener(connection: &AccessibilityConnection, listener_path: &str) {
     if let Ok(proxy) = DeviceEventControllerProxy::new(connection.connection()).await {
         if let Ok(path) = zbus::zvariant::ObjectPath::try_from(listener_path) {
-            for event_type in [EventType::KeyPressed, EventType::KeyReleased] {
+            if let Ok(raw_proxy) = zbus::Proxy::new(
+                connection.connection(),
+                REGISTRY,
+                DEVICE_EVENT_CONTROLLER_PATH,
+                DEVICE_EVENT_CONTROLLER_INTERFACE,
+            )
+            .await
+            {
+                let keys: [KeyDefinition<'_>; 0] = [];
                 let _ = timeout(
                     TARGET_CALL_DEADLINE,
-                    proxy.deregister_keystroke_listener(&path, &[], 0, event_type),
+                    raw_proxy.call::<_, _, ()>(
+                        "DeregisterKeystrokeListener",
+                        &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES),
+                    ),
                 )
                 .await;
             }
@@ -2092,6 +2561,10 @@ fn publish_terminal(session: &mut SessionRecord) {
             observation_id: id,
             reason: FocusedOutputReasonCode::Cancelled,
         },
+        T_SECURE => TargetInteractionEvent::TargetInvalidated {
+            observation_id: id,
+            reason: FocusedOutputReasonCode::SecureField,
+        },
         _ => TargetInteractionEvent::TargetInvalidated {
             observation_id: id,
             reason: FocusedOutputReasonCode::TargetChanged,
@@ -2111,6 +2584,7 @@ fn reason_for_terminal(code: u8) -> FocusedOutputReasonCode {
         T_MONITOR => FocusedOutputReasonCode::MonitorUnavailable,
         T_CLOSED => FocusedOutputReasonCode::TargetClosed,
         T_CANCELLED => FocusedOutputReasonCode::Cancelled,
+        T_SECURE => FocusedOutputReasonCode::SecureField,
         _ => FocusedOutputReasonCode::TargetChanged,
     }
 }
@@ -2125,6 +2599,10 @@ fn invalidate_bus(state: &mut ConnectedState) {
 async fn cleanup(connection: &AccessibilityConnection, session: &mut SessionRecord) {
     session.monitor.terminal(T_CANCELLED);
     session.monitor.dispatch.store(false, Ordering::Release);
+    session
+        .monitor
+        .dispatch_direct
+        .store(false, Ordering::Release);
     session
         .monitor
         .dispatch_text
@@ -2184,75 +2662,22 @@ async fn probe_tool(request: ToolRequest) -> Option<PinnedTool> {
 
 impl PinnedTool {
     fn resolve(kind: ToolKind) -> Option<Self> {
-        let path = resolve_executable(match kind {
+        let executable = TrustedExecutable::resolve(match kind {
             ToolKind::Wtype => "wtype",
             ToolKind::Ydotool => "ydotool",
         })?;
-        Some(Self {
-            fingerprint: fingerprint(&path)?,
-            path,
-            kind,
-        })
+        Some(Self { executable, kind })
     }
 
     fn still_pinned(&self) -> bool {
-        fingerprint(&self.path) == Some(self.fingerprint)
+        self.executable.is_unchanged()
     }
-}
-
-fn resolve_executable(name: &str) -> Option<PathBuf> {
-    for directory in std::env::split_paths(&std::env::var_os("PATH")?) {
-        if !directory.is_absolute() {
-            continue;
-        }
-        let Ok(path) = fs::canonicalize(directory.join(name)) else {
-            continue;
-        };
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn fingerprint(path: &Path) -> Option<Fingerprint> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return None;
-    }
-    Some(Fingerprint {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        size: metadata.size(),
-        modified: metadata
-            .modified()
-            .ok()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()?
-            .as_nanos(),
-    })
 }
 
 fn typing_args(kind: ToolKind) -> &'static [&'static str] {
     match kind {
         ToolKind::Wtype => &["-"],
         ToolKind::Ydotool => &["type", "--file=-"],
-    }
-}
-
-fn submit_args(kind: ToolKind, key: AutoSubmitKey) -> &'static [&'static str] {
-    match (kind, key) {
-        (ToolKind::Wtype, AutoSubmitKey::Enter) => &["-k", "Return"],
-        (ToolKind::Wtype, AutoSubmitKey::CtrlEnter) => {
-            &["-M", "ctrl", "-k", "Return", "-m", "ctrl"]
-        }
-        (ToolKind::Wtype, AutoSubmitKey::CmdEnter) => &["-M", "logo", "-k", "Return", "-m", "logo"],
-        (ToolKind::Ydotool, AutoSubmitKey::Enter) => &["key", "28:1", "28:0"],
-        (ToolKind::Ydotool, AutoSubmitKey::CtrlEnter) => &["key", "29:1", "28:1", "28:0", "29:0"],
-        (ToolKind::Ydotool, AutoSubmitKey::CmdEnter) => &["key", "125:1", "28:1", "28:0", "125:0"],
     }
 }
 
@@ -2264,80 +2689,19 @@ async fn typing_child(
     if cancellation.is_cancelled() {
         return ChildResult::NotStarted;
     }
-    match ChildGuard::spawn(&tool.path, typing_args(tool.kind)) {
+    match ChildGuard::spawn(&tool.executable, typing_args(tool.kind)) {
         Ok(child) => child.run(text.as_bytes(), cancellation).await,
         Err(_) => ChildResult::NotStarted,
     }
 }
 
 async fn submit(
-    connection: &AccessibilityConnection,
-    session: &mut SessionRecord,
-    key: AutoSubmitKey,
+    _connection: &AccessibilityConnection,
+    _session: &mut SessionRecord,
+    _key: AutoSubmitKey,
 ) -> SubmitOutcome {
-    if let Err(reason) = validate_target(connection, session).await {
-        return SubmitOutcome::Rejected { reason };
-    }
-    let Some(tool) = session.submit_tool.as_ref() else {
-        return SubmitOutcome::Rejected {
-            reason: FocusedOutputReasonCode::AutoSubmitUnsupported,
-        };
-    };
-    if !tool.still_pinned() {
-        return SubmitOutcome::Rejected {
-            reason: FocusedOutputReasonCode::TypingToolUnavailable,
-        };
-    }
-    let args = submit_args(tool.kind, key);
-    if session.cancellation.is_cancelled()
-        || session.monitor.terminal.load(Ordering::Acquire) != T_NONE
-    {
-        return SubmitOutcome::Rejected {
-            reason: FocusedOutputReasonCode::Cancelled,
-        };
-    }
-    let child = match ChildGuard::spawn(&tool.path, args) {
-        Ok(child) => child,
-        Err(_) => {
-            return SubmitOutcome::Rejected {
-                reason: FocusedOutputReasonCode::InjectionDenied,
-            }
-        }
-    };
-    session.monitor.tool_key_presses.store(0, Ordering::Release);
-    session
-        .monitor
-        .dispatch_text
-        .store(false, Ordering::Release);
-    session.monitor.dispatch.store(true, Ordering::Release);
-    let result = child.run(&[], &session.cancellation).await;
-    session.monitor.dispatch.store(false, Ordering::Release);
-    if result == ChildResult::Complete {
-        let expected_presses = match key {
-            AutoSubmitKey::Enter => 1,
-            AutoSubmitKey::CtrlEnter | AutoSubmitKey::CmdEnter => 2,
-        };
-        let deadline = Instant::now() + HANDY_RECEIPT_DEADLINE;
-        loop {
-            let observed = session.monitor.tool_key_presses.load(Ordering::Acquire);
-            if observed == expected_presses {
-                break;
-            }
-            if observed > expected_presses || Instant::now() >= deadline {
-                return SubmitOutcome::Ambiguous {
-                    reason: FocusedOutputReasonCode::InjectionAmbiguous,
-                };
-            }
-            sleep(POLL).await;
-        }
-    }
-    match result {
-        ChildResult::Complete => SubmitOutcome::Complete {
-            receipt: ReceiptConfidence::Posted,
-        },
-        ChildResult::NotStarted | ChildResult::PossiblyPosted => SubmitOutcome::Ambiguous {
-            reason: FocusedOutputReasonCode::InjectionAmbiguous,
-        },
+    SubmitOutcome::Rejected {
+        reason: FocusedOutputReasonCode::AutoSubmitUnsupported,
     }
 }
 
@@ -2371,26 +2735,21 @@ enum ChildResult {
 }
 
 impl ChildGuard {
-    fn spawn(path: &Path, args: &[&str]) -> io::Result<Self> {
-        Self::spawn_with_limits(path, args, ChildLimits::default())
+    fn spawn(executable: &TrustedExecutable, args: &[&str]) -> io::Result<Self> {
+        Self::spawn_with_limits(executable, args, ChildLimits::default())
     }
 
-    fn spawn_with_limits(path: &Path, args: &[&str], limits: ChildLimits) -> io::Result<Self> {
-        let mut command = Command::new(path);
+    fn spawn_with_limits(
+        executable: &TrustedExecutable,
+        args: &[&str],
+        limits: ChildLimits,
+    ) -> io::Result<Self> {
+        let mut command = executable.command()?;
         command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
         let mut child = command.spawn()?;
         let process_group = match i32::try_from(child.id()) {
             Ok(pid) => pid,
@@ -2420,7 +2779,9 @@ impl ChildGuard {
     }
 
     async fn run(mut self, input: &[u8], cancellation: &SessionCancellation) -> ChildResult {
-        let deadline = Instant::now() + self.limits.ipc;
+        let started = Instant::now();
+        let ipc_deadline = started + self.limits.ipc;
+        let process_deadline = started + self.limits.process;
         let mut written = 0;
         while written < input.len() {
             if cancellation.is_cancelled() {
@@ -2431,7 +2792,7 @@ impl ChildGuard {
                     ChildResult::PossiblyPosted
                 };
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= ipc_deadline || Instant::now() >= process_deadline {
                 self.kill_reap().await;
                 return ChildResult::PossiblyPosted;
             }
@@ -2458,7 +2819,6 @@ impl ChildGuard {
             }
         }
         self.stdin.take();
-        let deadline = Instant::now() + self.limits.process;
         loop {
             if cancellation.is_cancelled() {
                 self.kill_reap().await;
@@ -2470,10 +2830,13 @@ impl ChildGuard {
             };
             match wait_result {
                 Ok(Some(status)) => {
+                    unsafe {
+                        libc::kill(-self.process_group, libc::SIGKILL);
+                    }
                     self.child.take();
                     return classify_exit(status, written);
                 }
-                Ok(None) if Instant::now() < deadline => sleep(POLL).await,
+                Ok(None) if Instant::now() < process_deadline => sleep(POLL).await,
                 Ok(None) | Err(_) => {
                     self.kill_reap().await;
                     return ChildResult::PossiblyPosted;
@@ -2493,7 +2856,7 @@ impl ChildGuard {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
         }
-        let deadline = Instant::now() + self.limits.process;
+        let deadline = Instant::now() + Duration::from_millis(100);
         loop {
             let reaped = match self.child.as_mut() {
                 Some(child) => matches!(child.try_wait(), Ok(Some(_))),
@@ -2504,12 +2867,8 @@ impl ChildGuard {
                 return;
             }
             if Instant::now() >= deadline {
-                if let Some(mut child) = self.child.take() {
-                    let _ = thread::Builder::new()
-                        .name("focused-output-child-reaper".to_owned())
-                        .spawn(move || {
-                            let _ = child.wait();
-                        });
+                if let Some(child) = self.child.take() {
+                    crate::clipboard::reap_child_later(child);
                 }
                 return;
             }
@@ -2524,11 +2883,7 @@ fn terminate_spawned(mut child: Child, process_group: i32) {
         }
     }
     let _ = child.kill();
-    let _ = thread::Builder::new()
-        .name("focused-output-child-reaper".to_owned())
-        .spawn(move || {
-            let _ = child.wait();
-        });
+    crate::clipboard::reap_child_later(child);
 }
 
 impl Drop for ChildGuard {
@@ -2541,11 +2896,7 @@ impl Drop for ChildGuard {
             libc::kill(-self.process_group, libc::SIGKILL);
         }
         let _ = child.kill();
-        let _ = thread::Builder::new()
-            .name("focused-output-child-reaper".to_owned())
-            .spawn(move || {
-                let _ = child.wait();
-            });
+        crate::clipboard::reap_child_later(child);
     }
 }
 
@@ -2574,6 +2925,7 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     #[test]
     fn allowlist_rejects_unreviewed_and_argv_transports() {
@@ -2588,14 +2940,6 @@ mod tests {
         }
         assert_eq!(typing_args(ToolKind::Wtype), ["-"]);
         assert_eq!(typing_args(ToolKind::Ydotool), ["type", "--file=-"]);
-        assert_eq!(
-            submit_args(ToolKind::Wtype, AutoSubmitKey::CtrlEnter),
-            ["-M", "ctrl", "-k", "Return", "-m", "ctrl"]
-        );
-        assert_eq!(
-            submit_args(ToolKind::Ydotool, AutoSubmitKey::CmdEnter),
-            ["key", "125:1", "28:1", "28:0", "125:0"]
-        );
     }
 
     #[test]
@@ -2657,22 +3001,47 @@ mod tests {
     }
 
     #[test]
-    fn executable_replacement_breaks_route_pin() {
-        let directory = std::env::temp_dir().join(format!(
-            "handy-focused-pin-{}-{:?}",
-            std::process::id(),
-            Instant::now()
+    fn secure_role_transition_fails_closed() {
+        let attributes = HashMap::new();
+        assert!(!secure_metadata(Role::Text, &attributes));
+        assert!(secure_metadata(Role::PasswordText, &attributes));
+        assert!(secure_metadata(
+            Role::Text,
+            &HashMap::from([("protected".to_owned(), "true".to_owned())])
         ));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("tool");
-        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).unwrap();
-        let first = fingerprint(&path).unwrap();
-        fs::write(&path, b"#!/bin/sh\nexit 1\n").unwrap();
-        assert_ne!(fingerprint(&path), Some(first));
-        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn device_listener_requires_exact_controller_sender() {
+        let controller = ControllerIdentity {
+            sender: ":1.42".to_owned(),
+            pid: 123,
+            uid: 456,
+        };
+        assert!(sender_is_controller(&controller, Some(":1.42")));
+        assert!(!sender_is_controller(&controller, None));
+        assert!(!sender_is_controller(&controller, Some(":1.43")));
+        assert!(!sender_is_controller(
+            &controller,
+            Some("org.a11y.atspi.Registry")
+        ));
+    }
+    #[test]
+    fn keystroke_listener_uses_current_at_spi_bitmask_signature() {
+        use zbus::zvariant::DynamicType;
+
+        let path = zbus::zvariant::ObjectPath::try_from("/com/pais/handy/test").unwrap();
+        let keys: [KeyDefinition<'_>; 0] = [];
+        let mode = EventListenerMode {
+            synchronous: false,
+            preemptive: false,
+            global: true,
+        };
+        let register = (&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode);
+        let deregister = (&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES);
+
+        assert_eq!(register.signature().to_string(), "(oa(iisi)uu(bbb))");
+        assert_eq!(deregister.signature().to_string(), "(oa(iisi)uu)");
     }
 
     #[test]
@@ -2694,6 +3063,79 @@ mod tests {
         assert_ne!(expected.hash, text_hash(4 ^ 8, "ab🦀"));
     }
 
+    fn key_event(event_string: &str, is_text: bool) -> DeviceEvent<'_> {
+        DeviceEvent {
+            event_type: EventType::KeyPressed,
+            id: 0,
+            hw_code: 0,
+            modifiers: 0,
+            timestamp: 0,
+            event_string,
+            is_text,
+        }
+    }
+
+    #[test]
+    fn guarded_dispatch_allows_modifiers_but_cancels_unknown_and_excess_keys() {
+        let (tx, _rx) = bounded(4);
+        let shared = MonitorShared {
+            terminal: AtomicU8::new(T_NONE),
+            published: AtomicBool::new(false),
+            dispatch: AtomicBool::new(true),
+            dispatch_direct: AtomicBool::new(false),
+            dispatch_text: AtomicBool::new(true),
+            intent_epoch: AtomicU64::new(0),
+            physical_callbacks: AtomicU64::new(0),
+            tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(1),
+            tx,
+            stop_chord: None,
+            cancellation: SessionCancellation::default(),
+        };
+
+        assert!(device_signal(&shared, &key_event("Shift_L", false)).is_none());
+        assert!(matches!(
+            device_signal(&shared, &key_event("BackSpace", false)),
+            Some(MonitorSignal::Command)
+        ));
+        assert!(matches!(
+            device_signal(&shared, &key_event("a", true)),
+            Some(MonitorSignal::ToolKey)
+        ));
+        shared.observe_tool_key();
+        assert_eq!(shared.terminal.load(Ordering::Acquire), T_NONE);
+        shared.observe_tool_key();
+        assert_eq!(shared.terminal.load(Ordering::Acquire), T_EDIT);
+        assert!(shared.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn intent_publication_racing_dispatch_cancels_before_injection() {
+        let (tx, _rx) = bounded(2);
+        let shared = MonitorShared {
+            terminal: AtomicU8::new(T_NONE),
+            published: AtomicBool::new(false),
+            dispatch: AtomicBool::new(false),
+            dispatch_direct: AtomicBool::new(false),
+            dispatch_text: AtomicBool::new(false),
+            intent_epoch: AtomicU64::new(0),
+            physical_callbacks: AtomicU64::new(0),
+            tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(0),
+            tx,
+            stop_chord: None,
+            cancellation: SessionCancellation::default(),
+        };
+
+        let signal = device_signal(&shared, &key_event("a", true)).unwrap();
+        assert!(matches!(signal, MonitorSignal::SafeIntent));
+        assert_eq!(shared.intent_epoch.load(Ordering::Acquire), 1);
+        shared.dispatch.store(true, Ordering::Release);
+        shared.publish_signal(signal);
+        assert_eq!(shared.terminal.load(Ordering::Acquire), T_EDIT);
+        assert!(shared.cancellation.is_cancelled());
+    }
+
     #[test]
     fn stop_chord_is_neutral_only_on_exact_match() {
         let chord = StopChord::parse(Some("Ctrl+Shift+Space")).unwrap();
@@ -2709,24 +3151,30 @@ mod tests {
             terminal: AtomicU8::new(T_NONE),
             published: AtomicBool::new(false),
             dispatch: AtomicBool::new(false),
+            dispatch_direct: AtomicBool::new(false),
             dispatch_text: AtomicBool::new(false),
+            physical_callbacks: AtomicU64::new(0),
+            intent_epoch: AtomicU64::new(0),
             tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(0),
             tx,
             stop_chord: None,
+            cancellation: SessionCancellation::default(),
         };
         shared.callback(MonitorSignal::SafeIntent);
         shared.callback(MonitorSignal::SafeIntent);
         assert_eq!(shared.terminal.load(Ordering::Acquire), T_MONITOR);
+        assert!(shared.cancellation.is_cancelled());
         shared.terminal(T_POINTER);
         assert_eq!(shared.terminal.load(Ordering::Acquire), T_MONITOR);
     }
 
     #[test]
-    fn cancellation_and_submit_capability_are_explicit() {
+    fn cancellation_and_absent_submit_capability_are_explicit() {
         let cancellation = SessionCancellation::default();
         cancellation.cancel();
         assert!(cancellation.is_cancelled());
-        let capability = FocusedOutputCapability::verified_control(
+        let direct = FocusedOutputCapability::verified_control(
             FocusedOutputBackend::LinuxAtSpi,
             ResolvedInsertionCapability {
                 insertion_transport: InsertionTransport::AtSpiEditableText,
@@ -2735,24 +3183,25 @@ mod tests {
             MixedInputSupport::ObservedInsertionsOnly,
             false,
         );
-        assert!(!capability.supports_auto_submit());
-        let capable = FocusedOutputCapability::verified_control(
+        let guarded = FocusedOutputCapability::guarded_focused_control(
             FocusedOutputBackend::LinuxAtSpi,
             ResolvedInsertionCapability {
-                insertion_transport: InsertionTransport::AtSpiEditableText,
-                receipt_confidence: ReceiptConfidence::Verified,
+                insertion_transport: InsertionTransport::LinuxFocusedKeyboard,
+                receipt_confidence: ReceiptConfidence::Posted,
             },
             MixedInputSupport::ObservedInsertionsOnly,
-            true,
+            false,
         );
-        assert!(capable.supports_auto_submit());
+        assert!(!direct.supports_auto_submit());
+        assert!(!guarded.supports_auto_submit());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn child_timeout_kills_and_reaps_without_transcript_channels() {
         let cancellation = SessionCancellation::default();
+        let shell = TrustedExecutable::open(Path::new("/usr/bin/bash")).unwrap();
         let guard = ChildGuard::spawn_with_limits(
-            Path::new("/bin/sh"),
+            &shell,
             &["-c", "trap '' TERM; sleep 30"],
             ChildLimits {
                 ipc: Duration::from_millis(50),
@@ -2776,8 +3225,9 @@ mod tests {
     async fn cancellation_before_write_is_not_posted() {
         let cancellation = SessionCancellation::default();
         cancellation.cancel();
+        let shell = TrustedExecutable::open(Path::new("/usr/bin/bash")).unwrap();
         let guard = ChildGuard::spawn_with_limits(
-            Path::new("/bin/sh"),
+            &shell,
             &["-c", "sleep 30"],
             ChildLimits {
                 ipc: Duration::from_millis(50),

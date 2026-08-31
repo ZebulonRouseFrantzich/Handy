@@ -1,4 +1,6 @@
-use super::coediting::{AttributionScope, CoeditDecision, CoeditingState, InteractionEvidence};
+use super::coediting::{
+    ArmPendingResult, AttributionScope, CoeditDecision, CoeditingState, InteractionEvidence,
+};
 use super::metrics::SessionMetrics;
 use super::observer::{StreamLifecycleEvent, StreamObserverError};
 use super::platform::{BeginSession, FocusedFieldBackend, FocusedTargetSession, SessionEventSink};
@@ -16,6 +18,7 @@ const TERMINAL_QUEUE_CAPACITY: usize = 16;
 const CONTROL_QUEUE_CAPACITY: usize = 4;
 const MAX_INSERTION_SCALARS: usize = 16;
 const MANAGER_WAIT: Duration = Duration::from_secs(2);
+const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 
 /// Tauri-free destination for content-free lifecycle transitions.
 pub trait FocusedOutputStatusSink: Send + Sync {
@@ -42,6 +45,18 @@ struct TerminalEnvelope {
     reason: TerminalReason,
 }
 
+const TERMINAL_LATCH_STATE_BITS: u32 = 4;
+const TERMINAL_LATCH_STATE_MASK: u64 = (1 << TERMINAL_LATCH_STATE_BITS) - 1;
+const TERMINAL_LATCH_CLOSED: u64 = TERMINAL_LATCH_STATE_MASK;
+const TERMINAL_LATCH_MAX_SESSION: u64 = u64::MAX >> TERMINAL_LATCH_STATE_BITS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatchPublish {
+    First,
+    Existing,
+    StaleOrClosed,
+}
+
 enum ControlMessage {
     Finalize {
         session_id: DictationSessionId,
@@ -52,6 +67,7 @@ enum ControlMessage {
     },
     FinishNoText {
         session_id: DictationSessionId,
+        reason: Option<TerminalReason>,
         response: Sender<()>,
     },
     Shutdown {
@@ -255,12 +271,14 @@ pub struct FocusedOutputManager {
     backend: Arc<dyn FocusedFieldBackend>,
     state: Arc<Mutex<ManagerState>>,
     latest_snapshot: Arc<Mutex<Option<TranscriptSnapshot>>>,
+    active_snapshot_scalars: Arc<AtomicU64>,
     event_tx: Sender<SessionEventEnvelope>,
     lifecycle_tx: Sender<StreamLifecycleEvent>,
     terminal_tx: Sender<TerminalEnvelope>,
     wake_tx: Sender<()>,
     control_tx: Sender<ControlMessage>,
     active_session: Arc<AtomicU64>,
+    terminal_latch: Arc<AtomicU64>,
     active_cancellation: Arc<Mutex<Option<(DictationSessionId, SessionCancellation)>>>,
     next_session_id: AtomicU64,
     closed: Arc<AtomicBool>,
@@ -285,15 +303,19 @@ impl FocusedOutputManager {
         let (control_tx, control_rx) = bounded(CONTROL_QUEUE_CAPACITY);
         let state = Arc::new(Mutex::new(ManagerState::new(status_sink)));
         let latest_snapshot = Arc::new(Mutex::new(None));
+        let active_snapshot_scalars = Arc::new(AtomicU64::new(0));
         let active_session = Arc::new(AtomicU64::new(0));
         let active_cancellation = Arc::new(Mutex::new(None));
+        let terminal_latch = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let overflow_session = Arc::new(AtomicU64::new(0));
 
         let worker_state = Arc::clone(&state);
         let worker_latest = Arc::clone(&latest_snapshot);
+        let worker_snapshot_scalars = Arc::clone(&active_snapshot_scalars);
         let worker_active = Arc::clone(&active_session);
         let worker_cancellation = Arc::clone(&active_cancellation);
+        let worker_terminal_latch = Arc::clone(&terminal_latch);
         let worker_overflow = Arc::clone(&overflow_session);
         let worker_backend = Arc::clone(&backend);
         let worker = thread::Builder::new()
@@ -303,6 +325,7 @@ impl FocusedOutputManager {
                     worker_backend,
                     worker_state,
                     worker_latest,
+                    worker_snapshot_scalars,
                     event_rx,
                     lifecycle_rx,
                     terminal_rx,
@@ -310,6 +333,7 @@ impl FocusedOutputManager {
                     control_rx,
                     worker_active,
                     worker_cancellation,
+                    worker_terminal_latch,
                     worker_overflow,
                 );
             })
@@ -323,10 +347,12 @@ impl FocusedOutputManager {
             backend,
             state,
             latest_snapshot,
+            active_snapshot_scalars,
             event_tx,
             lifecycle_tx,
             terminal_tx,
             wake_tx,
+            terminal_latch,
             control_tx,
             active_session,
             active_cancellation,
@@ -349,8 +375,14 @@ impl FocusedOutputManager {
             return Err(FocusedOutputReasonCode::BackendDisconnected);
         }
         let mut state = lock_recover(&self.state);
-        if state.plan.is_some() || state.beginning.is_some() {
+        if state.plan.is_some()
+            || state.beginning.is_some()
+            || self.active_session.load(Ordering::Acquire) != 0
+        {
             return Err(FocusedOutputReasonCode::AlreadyActive);
+        }
+        if !arm_terminal_latch(&self.terminal_latch, session_id) {
+            return Err(FocusedOutputReasonCode::BackendDisconnected);
         }
         state.plan = Some(OutputPlan::Fallback {
             session_id,
@@ -371,6 +403,35 @@ impl FocusedOutputManager {
         Ok(())
     }
 
+    /// Adds the concrete preflight reason to a still-active fallback plan.
+    /// Overlay requests never call this method and therefore remain silent.
+    pub fn publish_fallback_reason(
+        &self,
+        session_id: DictationSessionId,
+        reason: FocusedOutputReasonCode,
+    ) {
+        let mut state = lock_recover(&self.state);
+        if !matches!(
+            state.plan.as_ref(),
+            Some(OutputPlan::Fallback {
+                session_id: active,
+                ..
+            }) if *active == session_id
+        ) {
+            return;
+        }
+        state.set_status(FocusedOutputStatusEvent {
+            session_id,
+            status: FocusedOutputStatus::Fallback,
+            reason: Some(reason),
+            capability: None,
+            target_application: None,
+            speech_delivered_chars: 0,
+            external_edit_epoch: 0,
+            history_available: false,
+        });
+    }
+
     pub fn begin(&self, context: BeginContext) -> Result<BeginReceipt, FocusedOutputReasonCode> {
         if self.closed.load(Ordering::Acquire) {
             return Err(FocusedOutputReasonCode::BackendDisconnected);
@@ -382,17 +443,24 @@ impl FocusedOutputManager {
             if state.beginning.is_some() {
                 return Err(FocusedOutputReasonCode::AlreadyActive);
             }
+            let active_session = self.active_session.load(Ordering::Acquire);
             let upgrading = match state.plan.as_ref() {
-                None => false,
+                None if active_session == 0 => false,
                 Some(OutputPlan::Fallback {
                     session_id: fallback_id,
                     ..
-                }) if *fallback_id == session_id => true,
-                Some(_) => return Err(FocusedOutputReasonCode::AlreadyActive),
+                }) if *fallback_id == session_id && active_session == session_id.get() => true,
+                None | Some(_) => return Err(FocusedOutputReasonCode::AlreadyActive),
             };
+            if !upgrading && !arm_terminal_latch(&self.terminal_latch, session_id) {
+                return Err(FocusedOutputReasonCode::BackendDisconnected);
+            }
             state.beginning = Some(session_id);
             upgrading
         };
+        if !upgrading_fallback {
+            debug_assert_eq!(self.active_session.load(Ordering::Acquire), 0);
+        }
         self.active_session
             .store(session_id.get(), Ordering::Release);
         let cancellation = SessionCancellation::default();
@@ -582,6 +650,10 @@ impl FocusedOutputManager {
     /// Processing runs on the manager worker so any already-published terminal
     /// transition wins before the plan is consumed.
     pub fn finish_no_text(&self, session_id: DictationSessionId) {
+        self.consume_no_text(session_id, None);
+    }
+
+    fn consume_no_text(&self, session_id: DictationSessionId, reason: Option<TerminalReason>) {
         if self.active_session.load(Ordering::Acquire) != session_id.get() {
             return;
         }
@@ -592,6 +664,7 @@ impl FocusedOutputManager {
             .send_timeout(
                 ControlMessage::FinishNoText {
                     session_id,
+                    reason,
                     response: response_tx,
                 },
                 MANAGER_WAIT,
@@ -638,38 +711,39 @@ impl FocusedOutputManager {
     /// First-wins tagged terminal publication. Cancellation is flipped before
     /// the bounded cleanup notification is attempted.
     pub fn terminate(&self, session_id: DictationSessionId, reason: TerminalReason) {
-        if self.active_session.load(Ordering::Acquire) != session_id.get() {
+        let published = publish_terminal_latch(&self.terminal_latch, session_id, reason);
+        if published == LatchPublish::StaleOrClosed {
             return;
         }
         self.cancel_token_if_active(session_id);
-        let _ = self
-            .terminal_tx
-            .try_send(TerminalEnvelope { session_id, reason });
+        if published == LatchPublish::First {
+            let _ = self
+                .terminal_tx
+                .try_send(TerminalEnvelope { session_id, reason });
+        }
         let _ = self.wake_tx.try_send(());
     }
 
     pub fn cancel(&self, session_id: DictationSessionId) {
-        if self.active_session.load(Ordering::Acquire) != session_id.get() {
+        let published =
+            publish_terminal_latch(&self.terminal_latch, session_id, TerminalReason::Cancelled);
+        if published == LatchPublish::StaleOrClosed {
             return;
         }
         self.cancel_token_if_active(session_id);
-        if self
-            .active_session
-            .compare_exchange(session_id.get(), 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
+        if published == LatchPublish::First {
+            let _ = self.terminal_tx.try_send(TerminalEnvelope {
+                session_id,
+                reason: TerminalReason::Cancelled,
+            });
         }
-        if let Ok(mut active) = self.active_cancellation.try_lock() {
-            if active.as_ref().is_some_and(|(id, _)| *id == session_id) {
-                *active = None;
-            }
-        }
-        let _ = self.terminal_tx.try_send(TerminalEnvelope {
-            session_id,
-            reason: TerminalReason::Cancelled,
-        });
         let _ = self.wake_tx.try_send(());
+
+        // The worker observes the first terminal transition, consumes the
+        // exact plan, and only then clears the active identity. A later finish
+        // guard is consequently a harmless stale no-op, while a new session
+        // can never be stranded behind a cancelled plan.
+        self.consume_no_text(session_id, Some(TerminalReason::Cancelled));
     }
 
     fn cancel_token_if_active(&self, session_id: DictationSessionId) {
@@ -692,6 +766,23 @@ impl FocusedOutputManager {
         barrier_revision: Option<u64>,
         options: FinalizeOptions,
     ) -> FinalDeliveryDisposition {
+        let outstanding_snapshot_scalars = {
+            let latest = lock_recover(&self.latest_snapshot);
+            let queued = latest
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .committed
+                        .chars()
+                        .count()
+                        .saturating_add(snapshot.tentative.chars().count())
+                })
+                .unwrap_or(0);
+            let active = usize::try_from(self.active_snapshot_scalars.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX);
+            queued.saturating_add(active)
+        };
+        let wait = finalization_wait_bound(&final_text, options, outstanding_snapshot_scalars);
         let (response_tx, response_rx) = bounded(1);
         let message = ControlMessage::Finalize {
             session_id,
@@ -704,10 +795,13 @@ impl FocusedOutputManager {
             self.cancel_token_if_active(session_id);
             return FinalDeliveryDisposition::NoText;
         }
-        match response_rx.recv_timeout(MANAGER_WAIT) {
+        match response_rx.recv_timeout(wait) {
             Ok(disposition) => disposition,
             Err(_) => {
                 self.cancel_token_if_active(session_id);
+                // Every target operation and receipt wait is bounded inside
+                // `wait`; reaching this branch means the backend violated its
+                // contract and no precise disposition can be recovered.
                 FinalDeliveryDisposition::NoText
             }
         }
@@ -782,6 +876,7 @@ fn worker_loop(
     backend: Arc<dyn FocusedFieldBackend>,
     state: Arc<Mutex<ManagerState>>,
     latest_snapshot: Arc<Mutex<Option<TranscriptSnapshot>>>,
+    active_snapshot_scalars: Arc<AtomicU64>,
     event_rx: Receiver<SessionEventEnvelope>,
     lifecycle_rx: Receiver<StreamLifecycleEvent>,
     terminal_rx: Receiver<TerminalEnvelope>,
@@ -789,25 +884,51 @@ fn worker_loop(
     control_rx: Receiver<ControlMessage>,
     active_session: Arc<AtomicU64>,
     active_cancellation: Arc<Mutex<Option<(DictationSessionId, SessionCancellation)>>>,
+    terminal_latch: Arc<AtomicU64>,
     overflow_session: Arc<AtomicU64>,
 ) {
     loop {
         crossbeam_channel::select! {
             recv(control_rx) -> message => match message {
                 Ok(ControlMessage::Finalize { session_id, final_text, barrier_revision, options, response }) => {
+                    apply_latched_terminal(&state, &active_session, &terminal_latch);
                     drain_terminals(&state, &terminal_rx);
                     drain_lifecycle(&state, &lifecycle_rx);
                     drain_events(&state, &event_rx, &overflow_session);
-                    process_latest_snapshot(&state, &latest_snapshot, barrier_revision);
+                    process_latest_snapshot(
+                        &state,
+                        &latest_snapshot,
+                        barrier_revision,
+                        &event_rx,
+                        &terminal_rx,
+                        &overflow_session,
+                        &active_snapshot_scalars,
+                    );
                     drain_events(&state, &event_rx, &overflow_session);
-                    let disposition = finalize_plan(&state, session_id, &final_text, options, &event_rx, &overflow_session);
+                    let disposition = finalize_plan(
+                        &state,
+                        session_id,
+                        &final_text,
+                        options,
+                        &event_rx,
+                        &terminal_rx,
+                        &overflow_session,
+                        &terminal_latch,
+                    );
                     clear_worker_identity(session_id, &active_session, &active_cancellation);
                     let _ = response.try_send(disposition);
                 }
-                Ok(ControlMessage::FinishNoText { session_id, response }) => {
+                Ok(ControlMessage::FinishNoText { session_id, reason, response }) => {
                     drain_terminals(&state, &terminal_rx);
+                    apply_latched_terminal(&state, &active_session, &terminal_latch);
                     drain_lifecycle(&state, &lifecycle_rx);
                     drain_events(&state, &event_rx, &overflow_session);
+                    if let Some(reason) = reason {
+                        apply_terminal(&state, session_id, reason);
+                    }
+                    if let Some(reason) = close_terminal_latch(&terminal_latch, session_id) {
+                        apply_terminal(&state, session_id, reason);
+                    }
                     finish_no_text_plan(&state, session_id);
                     clear_worker_identity(session_id, &active_session, &active_cancellation);
                     let _ = response.try_send(());
@@ -825,9 +946,18 @@ fn worker_loop(
             },
             recv(wake_rx) -> _ => {
                 drain_terminals(&state, &terminal_rx);
+                apply_latched_terminal(&state, &active_session, &terminal_latch);
                 drain_lifecycle(&state, &lifecycle_rx);
                 drain_events(&state, &event_rx, &overflow_session);
-                process_latest_snapshot(&state, &latest_snapshot, None);
+                process_latest_snapshot(
+                    &state,
+                    &latest_snapshot,
+                    None,
+                    &event_rx,
+                    &terminal_rx,
+                    &overflow_session,
+                    &active_snapshot_scalars,
+                );
                 drain_events(&state, &event_rx, &overflow_session);
             }
         }
@@ -837,6 +967,21 @@ fn worker_loop(
 fn drain_terminals(state: &Mutex<ManagerState>, receiver: &Receiver<TerminalEnvelope>) {
     while let Ok(envelope) = receiver.try_recv() {
         apply_terminal(state, envelope.session_id, envelope.reason);
+    }
+}
+
+fn apply_latched_terminal(
+    state: &Mutex<ManagerState>,
+    active_session: &AtomicU64,
+    terminal_latch: &AtomicU64,
+) {
+    let session_id = active_session.load(Ordering::Acquire);
+    if session_id == 0 {
+        return;
+    }
+    let session_id = DictationSessionId(session_id);
+    if let Some(reason) = latched_terminal_reason(terminal_latch, session_id) {
+        apply_terminal(state, session_id, reason);
     }
 }
 
@@ -913,9 +1058,16 @@ fn apply_interaction(armed: &mut ArmedSession, event: TargetInteractionEvent) {
     if armed.terminal_reason.is_some() {
         return;
     }
-    if matches!(event, TargetInteractionEvent::HandyInsertionObserved { .. }) {
+    if let TargetInteractionEvent::HandyInsertionObserved { injection_id, .. } = event {
+        if let CoeditDecision::Terminal(reason) = armed
+            .coediting
+            .acknowledge_platform_observation(injection_id)
+        {
+            armed.set_terminal(reason, reason_code(reason));
+        }
         return;
     }
+
     let event_code = interaction_reason_code(event);
     let (observation_id, effect) = match event {
         TargetInteractionEvent::CompatibleExternalInsertion {
@@ -943,7 +1095,7 @@ fn apply_interaction(armed: &mut ArmedSession, event: TargetInteractionEvent) {
         TargetInteractionEvent::UnsafeEdit { observation_id, .. }
         | TargetInteractionEvent::TargetInvalidated { observation_id, .. }
         | TargetInteractionEvent::MonitorUnavailable { observation_id } => (observation_id, None),
-        TargetInteractionEvent::HandyInsertionObserved { .. } => return,
+        TargetInteractionEvent::HandyInsertionObserved { .. } => unreachable!(),
     };
     let scope = AttributionScope {
         session_id: armed.session_id,
@@ -961,38 +1113,68 @@ fn process_latest_snapshot(
     state: &Mutex<ManagerState>,
     latest_snapshot: &Mutex<Option<TranscriptSnapshot>>,
     barrier_revision: Option<u64>,
+    event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
+    overflow_session: &AtomicU64,
+    active_snapshot_scalars: &AtomicU64,
 ) {
     let snapshot = {
         let mut latest = lock_recover(latest_snapshot);
         let should_take = latest.as_ref().is_some_and(|snapshot| {
             barrier_revision.is_none_or(|barrier| snapshot.revision <= barrier)
         });
-        should_take.then(|| latest.take()).flatten()
+        let snapshot = should_take.then(|| latest.take()).flatten();
+        if let Some(snapshot) = snapshot.as_ref() {
+            let scalars = snapshot
+                .committed
+                .chars()
+                .count()
+                .saturating_add(snapshot.tentative.chars().count());
+            active_snapshot_scalars.store(
+                u64::try_from(scalars).unwrap_or(u64::MAX),
+                Ordering::Release,
+            );
+        }
+        snapshot
     };
     let Some(snapshot) = snapshot else {
         return;
     };
-    let mut state = lock_recover(state);
-    let Some(OutputPlan::Armed(armed)) = state.plan.as_mut() else {
-        return;
-    };
-    if snapshot.session_id != armed.session_id {
-        return;
+    {
+        let mut state = lock_recover(state);
+        if let Some(OutputPlan::Armed(armed)) = state.plan.as_mut() {
+            if snapshot.session_id == armed.session_id {
+                process_snapshot(armed, &snapshot, event_rx, terminal_rx, overflow_session);
+                let status = armed
+                    .terminal_reason
+                    .map(status_for_terminal)
+                    .unwrap_or(FocusedOutputStatus::Streaming);
+                let event = armed.status(status, false);
+                state.set_status(event);
+            }
+        }
     }
-    process_snapshot(armed, &snapshot);
-    let status = armed
-        .terminal_reason
-        .map(status_for_terminal)
-        .unwrap_or(FocusedOutputStatus::Streaming);
-    let event = armed.status(status, false);
-    state.set_status(event);
+    active_snapshot_scalars.store(0, Ordering::Release);
 }
 
-fn process_snapshot(armed: &mut ArmedSession, snapshot: &TranscriptSnapshot) {
+fn process_snapshot(
+    armed: &mut ArmedSession,
+    snapshot: &TranscriptSnapshot,
+    event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
+    overflow_session: &AtomicU64,
+) {
     match armed.ledger.reconcile_snapshot(snapshot) {
         SnapshotDecision::Append(suffix) => {
             armed.metrics.record_snapshot(false);
-            let outcome = insert_in_units(armed, &suffix, InsertionKind::Speech);
+            let outcome = insert_in_units(
+                armed,
+                &suffix,
+                InsertionKind::Speech,
+                event_rx,
+                terminal_rx,
+                overflow_session,
+            );
             let code = outcome_reason(outcome);
             if let ApplyDecision::Terminal(reason) =
                 armed.ledger.apply_insert_outcome(&suffix, outcome)
@@ -1014,7 +1196,14 @@ fn process_snapshot(armed: &mut ArmedSession, snapshot: &TranscriptSnapshot) {
     }
 }
 
-fn insert_in_units(armed: &mut ArmedSession, text: &str, kind: InsertionKind) -> InsertOutcome {
+fn insert_in_units(
+    armed: &mut ArmedSession,
+    text: &str,
+    kind: InsertionKind,
+    event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
+    overflow_session: &AtomicU64,
+) -> InsertOutcome {
     let mut accepted_bytes = 0usize;
     let mut aggregate_receipt = ReceiptConfidence::Verified;
     for unit in scalar_units(text, MAX_INSERTION_SCALARS) {
@@ -1026,14 +1215,116 @@ fn insert_in_units(armed: &mut ArmedSession, text: &str, kind: InsertionKind) ->
             );
         }
         let injection_id = armed.next_injection_id();
+        let pending = PendingInjection {
+            injection_id,
+            random_marker: armed.session_id.get() ^ injection_id.get(),
+            expected_text: unit.to_owned(),
+            caret_before: None,
+            // Armed before dispatch; the receipt window starts only once the
+            // bounded transport call below returns.
+            deadline: Instant::now(),
+            immediate_receipt: None,
+        };
+        match armed.coediting.arm_pending(pending) {
+            ArmPendingResult::Armed => {}
+            ArmPendingResult::AlreadyPending { .. } => {
+                armed.set_terminal(
+                    TerminalReason::AmbiguousInsertion,
+                    FocusedOutputReasonCode::InjectionAmbiguous,
+                );
+                return InsertOutcome::Ambiguous {
+                    reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                };
+            }
+            ArmPendingResult::Terminal(reason) => {
+                armed.set_terminal(reason, reason_code(reason));
+                return InsertOutcome::Rejected {
+                    reason: reason_code(reason),
+                };
+            }
+        }
+
         let outcome = armed.target.insert_if_valid(InsertionRequest {
             session_id: armed.session_id,
             injection_id,
             text: unit.to_owned(),
             kind,
         });
+        drain_terminals_for_armed(armed, terminal_rx);
+        if let Some(reason) = armed.terminal_reason {
+            return InsertOutcome::Ambiguous {
+                reason: reason_code(reason),
+            };
+        }
         match outcome {
             InsertOutcome::Complete { receipt } => {
+                if receipt == ReceiptConfidence::Posted {
+                    if let CoeditDecision::Terminal(reason) =
+                        armed.coediting.start_receipt_deadline(
+                            injection_id,
+                            Instant::now() + HANDY_RECEIPT_DEADLINE,
+                        )
+                    {
+                        armed.set_terminal(reason, reason_code(reason));
+                        return InsertOutcome::Ambiguous {
+                            reason: reason_code(reason),
+                        };
+                    }
+                }
+                if let CoeditDecision::Terminal(reason) = armed
+                    .coediting
+                    .record_immediate_receipt(injection_id, receipt)
+                {
+                    armed.set_terminal(reason, reason_code(reason));
+                    return InsertOutcome::Ambiguous {
+                        reason: reason_code(reason),
+                    };
+                }
+                let route_is_verified = armed
+                    .capability
+                    .route()
+                    .is_some_and(|route| route.receipt_confidence == ReceiptConfidence::Verified);
+                let acknowledged = match receipt {
+                    ReceiptConfidence::Verified if route_is_verified => {
+                        armed.coediting.acknowledge_verified_receipt(injection_id)
+                    }
+                    ReceiptConfidence::Posted => wait_for_posted_ack(
+                        armed,
+                        injection_id,
+                        event_rx,
+                        terminal_rx,
+                        overflow_session,
+                    ),
+                    ReceiptConfidence::Verified => {
+                        CoeditDecision::Terminal(TerminalReason::AmbiguousInsertion)
+                    }
+                };
+                if let CoeditDecision::Terminal(reason) = acknowledged {
+                    let code = reason_code(reason);
+                    armed.set_terminal(reason, code);
+                    return InsertOutcome::Ambiguous { reason: code };
+                }
+                if !matches!(
+                    acknowledged,
+                    CoeditDecision::HandyAcknowledged {
+                        injection_id: acknowledged_id
+                    } if acknowledged_id == injection_id
+                ) {
+                    armed.set_terminal(
+                        TerminalReason::AmbiguousInsertion,
+                        FocusedOutputReasonCode::InjectionAmbiguous,
+                    );
+                    return InsertOutcome::Ambiguous {
+                        reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    };
+                }
+                drain_terminals_for_armed(armed, terminal_rx);
+                drain_events_for_armed(armed, event_rx, overflow_session);
+                if let Some(reason) = armed.terminal_reason {
+                    return InsertOutcome::Ambiguous {
+                        reason: reason_code(reason),
+                    };
+                }
                 aggregate_receipt = weakest_receipt(aggregate_receipt, receipt);
                 armed.receipt_confidence = weakest_receipt(armed.receipt_confidence, receipt);
                 accepted_bytes = accepted_bytes.saturating_add(unit.len());
@@ -1046,10 +1337,25 @@ fn insert_in_units(armed: &mut ArmedSession, text: &str, kind: InsertionKind) ->
                 receipt,
                 reason,
             } => {
-                let valid = unit.get(..unit_bytes).is_some();
+                let valid = receipt == ReceiptConfidence::Verified
+                    && armed.capability.route().is_some_and(|route| {
+                        route.receipt_confidence == ReceiptConfidence::Verified
+                    })
+                    && unit.get(..unit_bytes).is_some();
                 if !valid {
                     return InsertOutcome::Ambiguous {
                         reason: FocusedOutputReasonCode::InjectionAmbiguous,
+                    };
+                }
+                let _ = armed
+                    .coediting
+                    .record_immediate_receipt(injection_id, receipt);
+                let _ = armed.coediting.acknowledge_verified_receipt(injection_id);
+                drain_terminals_for_armed(armed, terminal_rx);
+                drain_events_for_armed(armed, event_rx, overflow_session);
+                if let Some(terminal) = armed.terminal_reason {
+                    return InsertOutcome::Ambiguous {
+                        reason: reason_code(terminal),
                     };
                 }
                 aggregate_receipt = weakest_receipt(aggregate_receipt, receipt);
@@ -1065,15 +1371,7 @@ fn insert_in_units(armed: &mut ArmedSession, text: &str, kind: InsertionKind) ->
                 };
             }
             InsertOutcome::Ambiguous { reason } => {
-                return if accepted_bytes == 0 {
-                    InsertOutcome::Ambiguous { reason }
-                } else {
-                    InsertOutcome::Partial {
-                        accepted_bytes,
-                        receipt: aggregate_receipt,
-                        reason,
-                    }
-                };
+                return InsertOutcome::Ambiguous { reason };
             }
             InsertOutcome::Rejected { reason } => {
                 return if accepted_bytes == 0 {
@@ -1090,6 +1388,61 @@ fn insert_in_units(armed: &mut ArmedSession, text: &str, kind: InsertionKind) ->
     }
     InsertOutcome::Complete {
         receipt: aggregate_receipt,
+    }
+}
+
+fn wait_for_posted_ack(
+    armed: &mut ArmedSession,
+    injection_id: InjectionId,
+    event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
+    overflow_session: &AtomicU64,
+) -> CoeditDecision {
+    loop {
+        drain_terminals_for_armed(armed, terminal_rx);
+        if let Some(reason) = armed.terminal_reason {
+            return CoeditDecision::Terminal(reason);
+        }
+        if overflow_session.swap(0, Ordering::AcqRel) == armed.session_id.get() {
+            return CoeditDecision::Terminal(TerminalReason::MonitorUnavailable);
+        }
+        if armed.coediting.pending_injection_id() != Some(injection_id) {
+            return armed
+                .coediting
+                .terminal()
+                .map(CoeditDecision::Terminal)
+                .unwrap_or(CoeditDecision::HandyAcknowledged { injection_id });
+        }
+        let Some(deadline) = armed.coediting.pending_deadline() else {
+            return CoeditDecision::Terminal(TerminalReason::AmbiguousInsertion);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return armed.coediting.check_deadline(now);
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(CANCELLATION_POLL);
+        match event_rx.recv_timeout(wait) {
+            Ok(envelope) if envelope.session_id == armed.session_id => {
+                if let CoeditDecision::Terminal(reason) =
+                    armed.coediting.check_deadline(Instant::now())
+                {
+                    return CoeditDecision::Terminal(reason);
+                }
+                apply_interaction(armed, envelope.event);
+                if let Some(reason) = armed.terminal_reason {
+                    return CoeditDecision::Terminal(reason);
+                }
+            }
+            Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return CoeditDecision::Terminal(TerminalReason::MonitorUnavailable);
+            }
+        }
+        if armed.cancellation.is_cancelled() {
+            return CoeditDecision::Terminal(TerminalReason::Cancelled);
+        }
     }
 }
 
@@ -1123,6 +1476,31 @@ fn scalar_units(text: &str, max_scalars: usize) -> impl Iterator<Item = &str> {
         start = end;
         Some(unit)
     })
+}
+
+fn finalization_wait_bound(
+    final_text: &str,
+    options: FinalizeOptions,
+    outstanding_snapshot_scalars: usize,
+) -> Duration {
+    let final_units = final_text.chars().count().div_ceil(MAX_INSERTION_SCALARS);
+    let outstanding_units = outstanding_snapshot_scalars.div_ceil(MAX_INSERTION_SCALARS);
+    let insertion_units = final_units
+        .saturating_add(outstanding_units)
+        .saturating_add(usize::from(options.append_trailing_space));
+    let bounded_units = u32::try_from(insertion_units).unwrap_or(u32::MAX);
+    let per_unit = TARGET_CALL_DEADLINE
+        .saturating_add(CHILD_PROCESS_DEADLINE)
+        .saturating_add(HANDY_RECEIPT_DEADLINE);
+    let mut wait = MANAGER_WAIT
+        .saturating_add(THREAD_CLOSE_DEADLINE)
+        .saturating_add(per_unit.saturating_mul(bounded_units));
+    if options.auto_submit {
+        wait = wait
+            .saturating_add(TARGET_CALL_DEADLINE)
+            .saturating_add(CHILD_PROCESS_DEADLINE);
+    }
+    wait
 }
 
 fn weakest_receipt(left: ReceiptConfidence, right: ReceiptConfidence) -> ReceiptConfidence {
@@ -1196,13 +1574,16 @@ fn outcome_reason(outcome: InsertOutcome) -> Option<FocusedOutputReasonCode> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_plan(
     state: &Mutex<ManagerState>,
     session_id: DictationSessionId,
     final_text: &str,
     options: FinalizeOptions,
     event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
     overflow_session: &AtomicU64,
+    terminal_latch: &AtomicU64,
 ) -> FinalDeliveryDisposition {
     let plan = {
         let mut state = lock_recover(state);
@@ -1216,39 +1597,69 @@ fn finalize_plan(
     };
     match plan {
         OutputPlan::Fallback { authority, .. } => {
+            let terminal = close_terminal_latch(terminal_latch, session_id);
             let mut state = lock_recover(state);
             state.set_status(FocusedOutputStatusEvent {
                 session_id,
-                status: FocusedOutputStatus::Completed,
-                reason: None,
+                status: terminal
+                    .map(status_for_terminal)
+                    .unwrap_or(FocusedOutputStatus::Completed),
+                reason: terminal.map(reason_code),
                 capability: None,
                 target_application: None,
                 speech_delivered_chars: 0,
                 external_edit_epoch: 0,
                 history_available: options.history_available,
             });
-            if final_text.is_empty() {
+            if terminal.is_some() || final_text.is_empty() {
                 FinalDeliveryDisposition::NoText
             } else {
                 FinalDeliveryDisposition::LegacyPaste(authority.into_legacy_paste())
             }
         }
         OutputPlan::Armed(mut armed) => {
+            if let Some(reason) = latched_terminal_reason(terminal_latch, session_id) {
+                armed.set_terminal(reason, reason_code(reason));
+            }
+            drain_terminals_for_armed(&mut armed, terminal_rx);
             drain_events_for_armed(&mut armed, event_rx, overflow_session);
-            let disposition =
-                finalize_armed(&mut armed, final_text, options, event_rx, overflow_session);
-            armed.metrics.complete();
+            let mut disposition = finalize_armed(
+                &mut armed,
+                final_text,
+                options,
+                event_rx,
+                terminal_rx,
+                overflow_session,
+            );
+            let terminal_before_final_drain = armed.terminal_reason;
+            // Closing quiesces target callbacks before the terminal latch is
+            // sealed. A concurrent tagged terminal either wins the latch and
+            // is observed below, or sees CLOSED and is a stale no-op.
             armed.close();
-            let status = match disposition {
-                FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
-                    ..
-                })
-                | FinalDeliveryDisposition::NoText => FocusedOutputStatus::Completed,
-                FinalDeliveryDisposition::Focused(
-                    FocusedDeliveryDisposition::PreservePartial { reason, .. },
-                ) => status_for_terminal(reason),
-                FinalDeliveryDisposition::LegacyPaste(_) => unreachable!(),
-            };
+            if let Some(reason) = close_terminal_latch(terminal_latch, session_id) {
+                armed.set_terminal(reason, reason_code(reason));
+            }
+            drain_terminals_for_armed(&mut armed, terminal_rx);
+            drain_events_for_armed(&mut armed, event_rx, overflow_session);
+            if terminal_before_final_drain.is_none() {
+                if let Some(reason) = armed.terminal_reason {
+                    disposition = preserve(&armed, reason);
+                }
+            }
+            armed.metrics.complete();
+            let status = armed
+                .terminal_reason
+                .map(status_for_terminal)
+                .unwrap_or_else(|| match disposition {
+                    FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                        ..
+                    })
+                    | FinalDeliveryDisposition::NoText => FocusedOutputStatus::Completed,
+                    FinalDeliveryDisposition::Focused(
+                        FocusedDeliveryDisposition::PreservePartial { reason, .. },
+                    ) => status_for_terminal(reason),
+                    FinalDeliveryDisposition::LegacyPaste(_) => unreachable!(),
+                });
             let event = armed.status(status, options.history_available);
             let mut state = lock_recover(state);
             state.set_status(event);
@@ -1275,11 +1686,20 @@ fn drain_events_for_armed(
     }
 }
 
+fn drain_terminals_for_armed(armed: &mut ArmedSession, receiver: &Receiver<TerminalEnvelope>) {
+    while let Ok(envelope) = receiver.try_recv() {
+        if envelope.session_id == armed.session_id {
+            armed.set_terminal(envelope.reason, reason_code(envelope.reason));
+        }
+    }
+}
+
 fn finalize_armed(
     armed: &mut ArmedSession,
     final_text: &str,
     options: FinalizeOptions,
     event_rx: &Receiver<SessionEventEnvelope>,
+    terminal_rx: &Receiver<TerminalEnvelope>,
     overflow_session: &AtomicU64,
 ) -> FinalDeliveryDisposition {
     if let Some(reason) = armed.terminal_reason {
@@ -1287,13 +1707,20 @@ fn finalize_armed(
     }
     match armed.ledger.reconcile_final(final_text) {
         FinalDecision::AppendTail(tail) => {
-            let outcome = insert_in_units(armed, &tail, InsertionKind::Speech);
+            let outcome = insert_in_units(
+                armed,
+                &tail,
+                InsertionKind::Speech,
+                event_rx,
+                terminal_rx,
+                overflow_session,
+            );
             let code = outcome_reason(outcome);
             if let ApplyDecision::Terminal(reason) =
                 armed.ledger.apply_insert_outcome(&tail, outcome)
             {
                 armed.set_terminal(reason, code.unwrap_or_else(|| reason_code(reason)));
-                return preserve(armed, reason);
+                return preserve(armed, armed.terminal_reason.unwrap_or(reason));
             }
         }
         FinalDecision::Complete => {}
@@ -1315,6 +1742,7 @@ fn finalize_armed(
         FinalDecision::AlreadyFinalized => {}
     }
 
+    drain_terminals_for_armed(armed, terminal_rx);
     drain_events_for_armed(armed, event_rx, overflow_session);
     if let Some(reason) = armed.terminal_reason {
         return preserve(armed, reason);
@@ -1325,24 +1753,47 @@ fn finalize_armed(
 
     let mut trailing_space_delivered = false;
     if options.append_trailing_space {
-        let outcome = insert_in_units(armed, " ", InsertionKind::TrailingSpace);
+        let outcome = insert_in_units(
+            armed,
+            " ",
+            InsertionKind::TrailingSpace,
+            event_rx,
+            terminal_rx,
+            overflow_session,
+        );
         match outcome {
             InsertOutcome::Complete { .. } => trailing_space_delivered = true,
             InsertOutcome::Partial { reason, .. } => {
                 armed.set_terminal(TerminalReason::PartialInsertion, reason);
-                return preserve(armed, TerminalReason::PartialInsertion);
+                return preserve(
+                    armed,
+                    armed
+                        .terminal_reason
+                        .unwrap_or(TerminalReason::PartialInsertion),
+                );
             }
             InsertOutcome::Ambiguous { reason } => {
                 armed.set_terminal(TerminalReason::AmbiguousInsertion, reason);
-                return preserve(armed, TerminalReason::AmbiguousInsertion);
+                return preserve(
+                    armed,
+                    armed
+                        .terminal_reason
+                        .unwrap_or(TerminalReason::AmbiguousInsertion),
+                );
             }
             InsertOutcome::Rejected { reason } => {
                 armed.set_terminal(TerminalReason::TargetInvalidated, reason);
-                return preserve(armed, TerminalReason::TargetInvalidated);
+                return preserve(
+                    armed,
+                    armed
+                        .terminal_reason
+                        .unwrap_or(TerminalReason::TargetInvalidated),
+                );
             }
         }
     }
 
+    drain_terminals_for_armed(armed, terminal_rx);
     drain_events_for_armed(armed, event_rx, overflow_session);
     if let Some(reason) = armed.terminal_reason {
         return preserve(armed, reason);
@@ -1354,9 +1805,20 @@ fn finalize_armed(
             reason: FocusedOutputReasonCode::AutoSubmitUnsupported,
         }
     } else {
-        match armed.target.submit_if_valid(options.auto_submit_key) {
+        let outcome = armed.target.submit_if_valid(options.auto_submit_key);
+        drain_terminals_for_armed(armed, terminal_rx);
+        drain_events_for_armed(armed, event_rx, overflow_session);
+        if let Some(reason) = armed.terminal_reason {
+            return preserve(armed, reason);
+        }
+        match outcome {
             SubmitOutcome::Complete { receipt } => SubmitDisposition::Submitted { receipt },
-            SubmitOutcome::Ambiguous { reason } | SubmitOutcome::Rejected { reason } => {
+            SubmitOutcome::Ambiguous { reason } => {
+                armed.set_terminal(TerminalReason::AmbiguousInsertion, reason);
+                SubmitDisposition::Failed { reason }
+            }
+            SubmitOutcome::Rejected { reason } => {
+                armed.set_terminal(TerminalReason::TargetInvalidated, reason);
                 SubmitDisposition::Failed { reason }
             }
         }
@@ -1446,6 +1908,101 @@ fn interaction_reason_code(event: TargetInteractionEvent) -> Option<FocusedOutpu
         }
         TargetInteractionEvent::HandyInsertionObserved { .. }
         | TargetInteractionEvent::CompatibleExternalInsertion { .. } => None,
+    }
+}
+
+fn encode_terminal_reason(reason: TerminalReason) -> u64 {
+    match reason {
+        TerminalReason::PartialInsertion => 1,
+        TerminalReason::AmbiguousInsertion => 2,
+        TerminalReason::TargetInvalidated => 3,
+        TerminalReason::UnsafeUserEdit => 4,
+        TerminalReason::MonitorUnavailable => 5,
+        TerminalReason::ReceiptTimeout => 6,
+        TerminalReason::FinalConflict => 7,
+        TerminalReason::StreamFailed => 8,
+        TerminalReason::Cancelled => 9,
+    }
+}
+
+fn decode_terminal_reason(encoded: u64) -> Option<TerminalReason> {
+    match encoded {
+        1 => Some(TerminalReason::PartialInsertion),
+        2 => Some(TerminalReason::AmbiguousInsertion),
+        3 => Some(TerminalReason::TargetInvalidated),
+        4 => Some(TerminalReason::UnsafeUserEdit),
+        5 => Some(TerminalReason::MonitorUnavailable),
+        6 => Some(TerminalReason::ReceiptTimeout),
+        7 => Some(TerminalReason::FinalConflict),
+        8 => Some(TerminalReason::StreamFailed),
+        9 => Some(TerminalReason::Cancelled),
+        _ => None,
+    }
+}
+
+fn terminal_latch_word(session_id: DictationSessionId, state: u64) -> Option<u64> {
+    let session_id = session_id.get();
+    (session_id != 0 && session_id <= TERMINAL_LATCH_MAX_SESSION)
+        .then_some((session_id << TERMINAL_LATCH_STATE_BITS) | state)
+}
+
+fn arm_terminal_latch(terminal_latch: &AtomicU64, session_id: DictationSessionId) -> bool {
+    let Some(word) = terminal_latch_word(session_id, 0) else {
+        return false;
+    };
+    terminal_latch.store(word, Ordering::Release);
+    true
+}
+
+fn publish_terminal_latch(
+    terminal_latch: &AtomicU64,
+    session_id: DictationSessionId,
+    reason: TerminalReason,
+) -> LatchPublish {
+    let Some(expected) = terminal_latch_word(session_id, 0) else {
+        return LatchPublish::StaleOrClosed;
+    };
+    let desired = expected | encode_terminal_reason(reason);
+    match terminal_latch.compare_exchange(expected, desired, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => LatchPublish::First,
+        Err(actual)
+            if actual >> TERMINAL_LATCH_STATE_BITS == session_id.get()
+                && actual & TERMINAL_LATCH_STATE_MASK != TERMINAL_LATCH_CLOSED =>
+        {
+            LatchPublish::Existing
+        }
+        Err(_) => LatchPublish::StaleOrClosed,
+    }
+}
+
+fn latched_terminal_reason(
+    terminal_latch: &AtomicU64,
+    session_id: DictationSessionId,
+) -> Option<TerminalReason> {
+    let word = terminal_latch.load(Ordering::Acquire);
+    (word >> TERMINAL_LATCH_STATE_BITS == session_id.get())
+        .then(|| decode_terminal_reason(word & TERMINAL_LATCH_STATE_MASK))
+        .flatten()
+}
+
+fn close_terminal_latch(
+    terminal_latch: &AtomicU64,
+    session_id: DictationSessionId,
+) -> Option<TerminalReason> {
+    loop {
+        let current = terminal_latch.load(Ordering::Acquire);
+        if current >> TERMINAL_LATCH_STATE_BITS != session_id.get()
+            || current & TERMINAL_LATCH_STATE_MASK == TERMINAL_LATCH_CLOSED
+        {
+            return None;
+        }
+        let closed = terminal_latch_word(session_id, TERMINAL_LATCH_CLOSED)?;
+        if terminal_latch
+            .compare_exchange(current, closed, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return decode_terminal_reason(current & TERMINAL_LATCH_STATE_MASK);
+        }
     }
 }
 
@@ -1651,6 +2208,49 @@ mod tests {
     }
 
     #[test]
+    fn finalization_budget_includes_longer_outstanding_snapshot_work() {
+        let base = finalization_wait_bound("x", options(), 0);
+        let with_outstanding = finalization_wait_bound("x", options(), MAX_INSERTION_SCALARS * 3);
+        let per_unit = TARGET_CALL_DEADLINE
+            .saturating_add(CHILD_PROCESS_DEADLINE)
+            .saturating_add(HANDY_RECEIPT_DEADLINE);
+        assert_eq!(
+            with_outstanding,
+            base.saturating_add(per_unit.saturating_mul(3))
+        );
+    }
+
+    #[test]
+    fn stale_terminal_compare_cannot_modify_replacement_session_latch() {
+        let latch = AtomicU64::new(0);
+        let old = DictationSessionId(41);
+        let new = DictationSessionId(42);
+        assert!(arm_terminal_latch(&latch, old));
+        let stale_expected = terminal_latch_word(old, 0).unwrap();
+        assert_eq!(close_terminal_latch(&latch, old), None);
+        assert!(arm_terminal_latch(&latch, new));
+
+        let stale_desired = stale_expected | encode_terminal_reason(TerminalReason::StreamFailed);
+        assert!(latch
+            .compare_exchange(
+                stale_expected,
+                stale_desired,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err());
+        assert_eq!(latched_terminal_reason(&latch, new), None);
+        assert_eq!(
+            publish_terminal_latch(&latch, new, TerminalReason::Cancelled),
+            LatchPublish::First
+        );
+        assert_eq!(
+            latched_terminal_reason(&latch, new),
+            Some(TerminalReason::Cancelled)
+        );
+    }
+
+    #[test]
     fn fallback_authority_is_consumed_exactly_once_and_never_armed() {
         let manager = FocusedOutputManager::new(Arc::new(UnavailableBackend));
         let session_id = manager.allocate_session_id();
@@ -1781,22 +2381,57 @@ mod tests {
     }
 
     #[test]
-    fn armed_cancel_keeps_an_earlier_unsafe_terminal_and_preserves_partial() {
+    fn armed_cancel_consumes_plan_before_identity_and_allows_a_new_session() {
         let backend = FakeBackend::new(posted_capability(false));
         let manager = FocusedOutputManager::new(Arc::new(backend));
+        let cancelled_id = manager.allocate_session_id();
+        manager.register_fallback(cancelled_id).unwrap();
+        manager.begin(context(cancelled_id)).unwrap();
+
+        manager.terminate(cancelled_id, TerminalReason::UnsafeUserEdit);
+        manager.cancel(cancelled_id);
+        assert_eq!(manager.active_plan(), None);
+        assert_eq!(manager.active_session_id(), None);
+        assert!(matches!(
+            manager.finalize(cancelled_id, "final text".to_owned(), None, options()),
+            FinalDeliveryDisposition::NoText
+        ));
+
+        let next_id = manager.allocate_session_id();
+        manager.register_fallback(next_id).unwrap();
+        assert_eq!(
+            manager.active_plan(),
+            Some(ActivePlan {
+                session_id: next_id,
+                kind: OutputPlanKind::Fallback,
+            })
+        );
+        manager.finish_no_text(next_id);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn fallback_reason_status_is_content_free_and_exact() {
+        let sink = Arc::new(RecordingStatusSink::default());
+        let manager =
+            FocusedOutputManager::new_with_status_sink(Arc::new(UnavailableBackend), sink.clone());
         let session_id = manager.allocate_session_id();
         manager.register_fallback(session_id).unwrap();
-        manager.begin(context(session_id)).unwrap();
+        manager.publish_fallback_reason(
+            session_id,
+            FocusedOutputReasonCode::ModelDoesNotSupportStreaming,
+        );
 
-        manager.terminate(session_id, TerminalReason::UnsafeUserEdit);
-        manager.cancel(session_id);
-        assert!(matches!(
-            manager.finalize(session_id, "final text".to_owned(), None, options()),
-            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
-                reason: TerminalReason::UnsafeUserEdit,
-                ..
-            })
-        ));
+        let event = lock_recover(&sink.events).last().cloned().unwrap();
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.status, FocusedOutputStatus::Fallback);
+        assert_eq!(
+            event.reason,
+            Some(FocusedOutputReasonCode::ModelDoesNotSupportStreaming)
+        );
+        assert_eq!(event.capability, None);
+        assert_eq!(event.target_application, None);
+        manager.finish_no_text(session_id);
         manager.shutdown();
     }
 
