@@ -404,6 +404,7 @@ jobs:
           Write-Host "ORT_LIB_LOCATION=$ortLib"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_LIB_LOCATION=$ortLib"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_PREFER_DYNAMIC_LINK=1"
+          Add-Content -Path $env:GITHUB_PATH -Value $ortLib
 
       # ggml-vulkan (built by transcribe-cpp-sys when the Vulkan backend is on)
       # does `find_package(SPIRV-Headers CONFIG REQUIRED)` for <spirv-headers/
