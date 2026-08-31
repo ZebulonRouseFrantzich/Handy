@@ -53,6 +53,7 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
 
       // Get the key with OS-specific naming and normalize it
       const rawKey = getKeyName(e, osType);
+      if (rawKey === null) return;
       const key = normalizeKey(rawKey);
 
       if (!keyPressed.includes(key)) {
@@ -70,6 +71,7 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
 
       // Get the key with OS-specific naming and normalize it
       const rawKey = getKeyName(e, osType);
+      if (rawKey === null) return;
       const key = normalizeKey(rawKey);
 
       // Remove from currently pressed keys

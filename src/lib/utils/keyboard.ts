@@ -4,6 +4,12 @@
 
 export type OSType = "macos" | "windows" | "linux" | "unknown";
 
+// WebKitGTK can emit these synthetic events around real function-key input.
+const IGNORED_SYNTHETIC_KEYS: Record<string, true> = {
+  WakeUp: true,
+  Unidentified: true,
+};
+
 /**
  * Extract a consistent key name from a KeyboardEvent
  * This function provides cross-platform keyboard event handling
@@ -12,9 +18,11 @@ export type OSType = "macos" | "windows" | "linux" | "unknown";
 export const getKeyName = (
   e: KeyboardEvent,
   osType: OSType = "unknown",
-): string => {
+): string | null => {
+  const useCode = e.code && !IGNORED_SYNTHETIC_KEYS[e.code];
+
   // Handle special cases first
-  if (e.code) {
+  if (useCode) {
     const code = e.code;
 
     // Handle function keys (F1-F24)
@@ -118,11 +126,11 @@ export const getKeyName = (
     }
 
     // For any other codes, try to convert to a reasonable format
-    return code.toLowerCase().replace(/([a-z])([A-Z])/g, "$1 $2");
+    return e.code.toLowerCase().replace(/([a-z])([A-Z])/g, "$1 $2");
   }
 
-  // Fallback to e.key if e.code is not available
-  if (e.key) {
+  // Fall back to e.key when e.code is missing or is a synthetic WebKit key.
+  if (e.key && !IGNORED_SYNTHETIC_KEYS[e.key]) {
     const key = e.key;
 
     // Handle special key names with OS-specific formatting
@@ -150,8 +158,7 @@ export const getKeyName = (
     return key.toLowerCase();
   }
 
-  // Last resort fallback
-  return `unknown-${e.keyCode || e.which || 0}`;
+  return null;
 };
 
 /**
