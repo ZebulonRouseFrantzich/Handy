@@ -952,7 +952,7 @@ struct UiaCallback {
     state: Arc<CallbackState>,
 }
 
-impl IUIAutomationEventHandler_Impl for UiaCallback {
+impl IUIAutomationEventHandler_Impl for UiaCallback_Impl {
     fn HandleAutomationEvent(
         &self,
         _sender: Ref<'_, IUIAutomationElement>,
@@ -975,7 +975,7 @@ impl IUIAutomationEventHandler_Impl for UiaCallback {
     }
 }
 
-impl IUIAutomationFocusChangedEventHandler_Impl for UiaCallback {
+impl IUIAutomationFocusChangedEventHandler_Impl for UiaCallback_Impl {
     fn HandleFocusChangedEvent(&self, _sender: Ref<'_, IUIAutomationElement>) -> WindowsResult<()> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.state.terminate(TERMINAL_TARGET_CHANGED);
@@ -987,7 +987,7 @@ impl IUIAutomationFocusChangedEventHandler_Impl for UiaCallback {
     }
 }
 
-impl IUIAutomationPropertyChangedEventHandler_Impl for UiaCallback {
+impl IUIAutomationPropertyChangedEventHandler_Impl for UiaCallback_Impl {
     fn HandlePropertyChangedEvent(
         &self,
         _sender: Ref<'_, IUIAutomationElement>,
@@ -1061,7 +1061,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             LayoutKeyClassification::Printable { chars } => {
                 state.publish(NativeEvent::CompatibleKey { chars });
             }
-            LayoutKeyClassification::Terminal => state.terminate(TERMINAL_UNSAFE_KEY),
+            LayoutKeyClassification::Terminal => {
+                state.terminate(TERMINAL_UNSAFE_KEY);
+            }
         }
     }));
 
