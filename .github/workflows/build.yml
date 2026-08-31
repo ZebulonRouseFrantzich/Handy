@@ -347,6 +347,7 @@ jobs:
           ORT_DIR="$(pwd)/onnxruntime-osx-x86_64-${ORT_VERSION}"
           echo "ORT_LIB_LOCATION=$ORT_DIR/lib" >> $GITHUB_ENV
           echo "ORT_PREFER_DYNAMIC_LINK=1" >> $GITHUB_ENV
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$ORT_DIR/lib" >> $GITHUB_ENV
           # Bundle the versioned dylib (matches the install name @rpath/libonnxruntime.1.24.2.dylib)
           jq --arg lib "$ORT_DIR/lib/libonnxruntime.${ORT_VERSION}.dylib" \
             '.bundle.macOS.frameworks = [$lib]' \
