@@ -23,9 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::{
-    core::{implement, Interface, Ref, Result as WindowsResult},
+    core::{implement, Interface, Ref, Result as WindowsResult, BOOL},
     Win32::{
-        Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             Com::{
                 CoCancelCall, CoCreateInstance, CoDisableCallCancellation,
@@ -45,25 +45,25 @@ use windows::{
                 IUIAutomationPropertyChangedEventHandler_Impl, IUIAutomationTextPattern,
                 IUIAutomationTextRange, IUIAutomationValuePattern, TextPatternRangeEndpoint_End,
                 TextPatternRangeEndpoint_Start, TreeScope_Element, UIA_EditControlTypeId,
-                UIA_IsMultilineAttributeId, UIA_IsReadOnlyAttributeId, UIA_TextPatternId,
-                UIA_Text_TextChangedEventId, UIA_Text_TextSelectionChangedEventId,
-                UIA_ValuePatternId, UIA_ValueValuePropertyId, UIA_CONTROLTYPE_ID, UIA_EVENT_ID,
-                UIA_PROPERTY_ID,
+                UIA_IsReadOnlyAttributeId, UIA_TextPatternId, UIA_Text_TextChangedEventId,
+                UIA_Text_TextSelectionChangedEventId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+                UIA_CONTROLTYPE_ID, UIA_EVENT_ID, UIA_PROPERTY_ID,
             },
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetKeyboardLayout, GetKeyboardState, SendInput, ToUnicodeEx, HKL,
-                INPUT, INPUT_0, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP,
-                KEYEVENTF_UNICODE, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT, VIRTUAL_KEY,
-                VK_BACK, VK_CANCEL, VK_CLEAR, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-                VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-                VK_NEXT, VK_PACKET, VK_PAUSE, VK_PRIOR, VK_PROCESSKEY, VK_RCONTROL, VK_RETURN,
-                VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+                VIRTUAL_KEY, VK_BACK, VK_CANCEL, VK_CLEAR, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+                VK_ESCAPE, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+                VK_MENU, VK_NEXT, VK_PACKET, VK_PAUSE, VK_PRIOR, VK_PROCESSKEY, VK_RCONTROL,
+                VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+                VK_UP,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, GetAncestor, GetForegroundWindow, GetMessageW,
                 GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-                UnhookWindowsHookEx, GA_ROOT, HC_ACTION, MSG, PM_NOREMOVE, WH_KEYBOARD_LL,
-                WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+                UnhookWindowsHookEx, GA_ROOT, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+                LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+                WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
             },
         },
     },
@@ -992,7 +992,7 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for UiaCallback {
         &self,
         _sender: Ref<'_, IUIAutomationElement>,
         property_id: UIA_PROPERTY_ID,
-        _new_value: &[VARIANT],
+        _new_value: &VARIANT,
     ) -> WindowsResult<()> {
         let result = catch_unwind(AssertUnwindSafe(|| {
             if property_id == UIA_ValueValuePropertyId
@@ -1719,15 +1719,7 @@ impl UiaTarget {
     }
 
     fn supports_auto_submit(&self) -> bool {
-        let is_multiline = unsafe {
-            self.element
-                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-        }
-        .and_then(|pattern| unsafe { pattern.DocumentRange() })
-        .and_then(|range| unsafe { range.GetAttributeValue(UIA_IsMultilineAttributeId) })
-        .ok()
-        .and_then(|value| bool::try_from(&value).ok());
-        auto_submit_supported_for_metadata(self.control_type, is_multiline)
+        auto_submit_supported_for_metadata(self.control_type, None)
     }
 }
 
