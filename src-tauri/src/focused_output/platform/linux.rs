@@ -2396,15 +2396,14 @@ async fn register_device_listener(
         preemptive: false,
         global: true,
     };
-    let signal_proxy = match zbus::Proxy::new(
-        connection.connection(),
-        controller.sender.as_str(),
-        DEVICE_EVENT_CONTROLLER_PATH,
-        DEVICE_EVENT_LISTENER_INTERFACE,
-    )
-    .await
+    let signal_rule = match zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(controller.sender.as_str())
+        .and_then(|builder| builder.path(DEVICE_EVENT_CONTROLLER_PATH))
+        .and_then(|builder| builder.interface(DEVICE_EVENT_LISTENER_INTERFACE))
+        .and_then(|builder| builder.member("KeystrokeListenerRegistered"))
     {
-        Ok(proxy) => proxy,
+        Ok(builder) => builder.build(),
         Err(_) => {
             remove_listener(connection, listener_path).await;
             return Err(());
@@ -2412,7 +2411,7 @@ async fn register_device_listener(
     };
     let mut registrations = match timeout(
         TARGET_CALL_DEADLINE,
-        signal_proxy.receive_signal("KeystrokeListenerRegistered"),
+        zbus::MessageStream::for_match_rule(signal_rule, connection.connection(), Some(1)),
     )
     .await
     {
@@ -2447,11 +2446,18 @@ async fn register_device_listener(
     let registration_args = (&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode);
     let registration_signal = async {
         while let Some(message) = registrations.next().await {
+            let Ok(message) = message else {
+                return false;
+            };
             let Ok(registration) = message.body().deserialize::<RegisteredKeystrokeListener>()
             else {
+                log::debug!("AT-SPI key registration signal had an unexpected body");
                 continue;
             };
-            if registered_keystroke_listener_matches(&registration, &listener_bus, listener_path) {
+            let exact =
+                registered_keystroke_listener_matches(&registration, &listener_bus, listener_path);
+            log::debug!("AT-SPI key registration signal matched request: {exact}");
+            if exact {
                 return true;
             }
         }
