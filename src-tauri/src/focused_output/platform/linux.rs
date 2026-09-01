@@ -2442,22 +2442,8 @@ async fn register_device_listener(
         }
     };
     let keys: [KeyDefinition<'_>; 0] = [];
-    let registration_call = timeout(
-        TARGET_CALL_DEADLINE,
-        raw_proxy.call::<_, _, bool>(
-            "RegisterKeystrokeListener",
-            &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode),
-        ),
-    )
-    .await;
-    if !matches!(registration_call, Ok(Ok(_))) {
-        remove_listener(connection, listener_path).await;
-        return Err(());
-    }
-    // at-spi2-core currently returns false even after a successful global
-    // registration. Its registration signal is emitted only after the X11
-    // key grabs succeed, so require the exact signal instead of that reply.
-    let keystrokes = timeout(TARGET_CALL_DEADLINE, async {
+    let registration_args = (&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode);
+    let registration_signal = async {
         while let Some(message) = registrations.next().await {
             let Ok(registration) = message.body().deserialize::<RegisteredKeystrokeListener>()
             else {
@@ -2468,9 +2454,21 @@ async fn register_device_listener(
             }
         }
         false
-    })
-    .await;
-    if !matches!(keystrokes, Ok(true)) {
+    };
+    // Keep the signal stream polled while the method runs: zbus does not
+    // guarantee delivery to an idle stream, and the registry emits this
+    // signal immediately before returning from the method.
+    let (registration_call, keystrokes) = tokio::join!(
+        timeout(
+            TARGET_CALL_DEADLINE,
+            raw_proxy.call::<_, _, bool>("RegisterKeystrokeListener", &registration_args,),
+        ),
+        timeout(TARGET_CALL_DEADLINE, registration_signal),
+    );
+    // at-spi2-core currently returns false even after a successful global
+    // registration. Its registration signal is emitted only after the X11
+    // key grabs succeed, so require the exact signal instead of that reply.
+    if !matches!(registration_call, Ok(Ok(_))) || !matches!(keystrokes, Ok(true)) {
         deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
