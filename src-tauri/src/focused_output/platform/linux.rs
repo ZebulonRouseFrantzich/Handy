@@ -192,10 +192,11 @@ impl FocusedFieldBackend for LinuxFocusedFieldBackend {
                 TARGET_CALL_DEADLINE,
             )
             .map_err(|_| FocusedOutputReasonCode::BackendDisconnected)?;
-        // The first AT-SPI connection may consume the target-call budget while
-        // populating its cache before begin_session can publish the receipt.
+        // The accessibility toggle, connection, and two target-capture passes
+        // are independently bounded. Allow those budgets before declaring the
+        // backend disconnected.
         let begun = rx
-            .recv_timeout(THREAD_READY_DEADLINE + TARGET_CALL_DEADLINE)
+            .recv_timeout(THREAD_READY_DEADLINE + TARGET_CALL_DEADLINE * 4)
             .map_err(|_| FocusedOutputReasonCode::BackendDisconnected)??;
         let receipt = BeginReceipt::new(session_id, begun.capability.clone(), begun.application)
             .ok_or(FocusedOutputReasonCode::BackendDisconnected)?;
