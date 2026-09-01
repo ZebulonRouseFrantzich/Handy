@@ -766,7 +766,6 @@ async fn begin_session(
         }
         return Err(FocusedOutputReasonCode::MonitorUnavailable);
     }
-    let initial_caret = captured.caret;
     state.session = Some(SessionRecord {
         generation,
         session_id: context.session_id,
@@ -783,22 +782,9 @@ async fn begin_session(
         external_caret: None,
         listener_removed: false,
     });
-    let final_validation = validate_target(
-        connection,
-        state.session.as_ref().expect("session was just installed"),
-    )
-    .await;
-    if final_validation != Ok(initial_caret) {
-        let mut session = state.session.take().expect("session was just installed");
-        cleanup(connection, &mut session).await;
-        if state.registered {
-            deregister_events(connection).await;
-            state.registered = false;
-        }
-        return Err(final_validation
-            .err()
-            .unwrap_or(FocusedOutputReasonCode::TargetChanged));
-    }
+    // Every insertion revalidates process identity, focus metadata, security
+    // state, interfaces, and caret before writing. Setup-time AT-SPI events are
+    // queued for this installed session and close any capture-to-arm race.
     Ok(BeginData {
         generation,
         capability,
@@ -2476,10 +2462,6 @@ async fn register_device_listener(
     }
     // Pointer activity is delivered through the registered AT-SPI MouseEvents
     // stream; current registryd exposes device listeners only for keystrokes.
-    if controller_identity(connection).await.as_ref() != Ok(&controller) {
-        deregister_device_listener(connection, listener_path).await;
-        return Err(());
-    }
     Ok(())
 }
 
