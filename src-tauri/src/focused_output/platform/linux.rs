@@ -1278,6 +1278,10 @@ where
             .dispatch_text
             .store(false, Ordering::Release);
         if terminal != T_NONE || session.cancellation.is_cancelled() {
+            log::debug!(
+                "Linux focused insertion disarmed before dispatch: terminal={terminal}, cancelled={}",
+                session.cancellation.is_cancelled()
+            );
             publish_terminal(session);
             return InsertOutcome::Rejected {
                 reason: if terminal == T_NONE {
@@ -1328,11 +1332,18 @@ where
         let chunk = &request.text[range];
         let caret = match validate_target(connection, session).await {
             Ok(caret) if caret == session.caret => caret,
-            Ok(_) => {
+            Ok(observed) => {
+                log::debug!(
+                    "Linux focused insertion caret changed: expected={}, observed={observed}",
+                    session.caret
+                );
                 session.monitor.terminal(T_CARET);
                 return verified_prefix(accepted, FocusedOutputReasonCode::CaretMoved);
             }
-            Err(reason) => return verified_prefix(accepted, reason),
+            Err(reason) => {
+                log::debug!("Linux focused insertion target validation failed: {reason:?}");
+                return verified_prefix(accepted, reason);
+            }
         };
         let bytes = match i32::try_from(chunk.len()) {
             Ok(value) => value,
