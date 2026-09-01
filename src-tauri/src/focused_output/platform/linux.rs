@@ -2459,17 +2459,18 @@ async fn register_device_listener(
     // Keep the signal stream polled while the method runs: zbus does not
     // guarantee delivery to an idle stream, and the registry emits this
     // signal immediately before returning from the method.
-    let (registration_call, keystrokes) = tokio::join!(
+    let (_registration_call, keystrokes) = tokio::join!(
         timeout(
             TARGET_CALL_DEADLINE,
             raw_proxy.call::<_, _, bool>("RegisterKeystrokeListener", &registration_args,),
         ),
         timeout(TARGET_CALL_DEADLINE, registration_signal),
     );
-    // at-spi2-core currently returns false even after a successful global
-    // registration. Its registration signal is emitted only after the X11
-    // key grabs succeed, so require the exact signal instead of that reply.
-    if !matches!(registration_call, Ok(Ok(_))) || !matches!(keystrokes, Ok(true)) {
+    // at-spi2-core's method reply is not authoritative: deployed registryd
+    // versions can return false or never complete it after successful global
+    // grabs. The exact registration signal is emitted only after those X11
+    // grabs succeed, so it is the bounded success receipt.
+    if !matches!(keystrokes, Ok(true)) {
         deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
