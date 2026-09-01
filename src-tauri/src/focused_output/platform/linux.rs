@@ -2410,12 +2410,14 @@ async fn register_device_listener(
             return Err(());
         }
     };
-    let mut registrations = match signal_proxy
-        .receive_signal("KeystrokeListenerRegistered")
-        .await
+    let mut registrations = match timeout(
+        TARGET_CALL_DEADLINE,
+        signal_proxy.receive_signal("KeystrokeListenerRegistered"),
+    )
+    .await
     {
-        Ok(stream) => stream,
-        Err(_) => {
+        Ok(Ok(stream)) => stream,
+        _ => {
             remove_listener(connection, listener_path).await;
             return Err(());
         }
