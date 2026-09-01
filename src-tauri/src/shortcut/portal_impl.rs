@@ -281,6 +281,19 @@ pub fn classify_portal_bindings(
     }
 }
 
+fn apply_configure_capability(
+    mut status: ShortcutBackendStatus,
+    portal_version: u32,
+) -> ShortcutBackendStatus {
+    // GlobalShortcuts v1 has no standard way to reopen configuration for a
+    // complete persistent binding. Keep retry available for incomplete states,
+    // where a fresh BindShortcuts may still prompt for missing shortcuts.
+    if portal_version < 2 && status.state == ShortcutBackendState::Ready {
+        status.can_configure = false;
+    }
+    status
+}
+
 fn shortcut_map(shortcuts: &[BoundShortcut]) -> HashMap<String, String> {
     shortcuts
         .iter()
@@ -352,9 +365,13 @@ impl Runtime {
 
 fn classify_active_runtime(
     runtime: &Runtime,
+    portal_version: u32,
     can_configure_suppressed: bool,
 ) -> ShortcutBackendStatus {
-    let mut status = classify_portal_bindings(&runtime.requested, &runtime.bindings);
+    let mut status = apply_configure_capability(
+        classify_portal_bindings(&runtime.requested, &runtime.bindings),
+        portal_version,
+    );
     if can_configure_suppressed {
         status.can_configure = false;
     }
@@ -384,11 +401,15 @@ struct CandidateHealth {
 fn apply_candidate_bindings(
     runtime: &mut Runtime,
     health: &CandidateHealth,
+    portal_version: u32,
 ) -> ShortcutBackendStatus {
     if let Some(bindings) = health.bindings.clone() {
         runtime.update(bindings);
     }
-    classify_portal_bindings(&runtime.requested, &runtime.bindings)
+    apply_configure_capability(
+        classify_portal_bindings(&runtime.requested, &runtime.bindings),
+        portal_version,
+    )
 }
 
 fn candidate_can_commit(
@@ -951,7 +972,7 @@ impl PortalShortcutState {
         let previous = self.status();
         let mut busy = previous.clone();
         busy.can_configure = false;
-        if !self.publish_for_generation(generation, busy.clone()) {
+        if !self.publish_for_generation(generation, busy.clone(), true) {
             return Err("Shortcut portal session is no longer active".into());
         }
         let mut configure_guard = ConfigureGuard::new(self, generation);
@@ -972,7 +993,7 @@ impl PortalShortcutState {
             return Err("Desktop portal restarted during shortcut configuration".into());
         }
         if let Err(error) = result {
-            self.publish_for_generation(generation, previous);
+            self.publish_for_generation(generation, previous, false);
             configure_guard.disarm();
             return Err(format!(
                 "Failed to open desktop shortcut configuration: {error}"
@@ -980,7 +1001,7 @@ impl PortalShortcutState {
         }
         let current = self.status();
         let result = if current == busy {
-            if self.publish_for_generation(generation, previous.clone()) {
+            if self.publish_for_generation(generation, previous.clone(), false) {
                 Ok(previous)
             } else {
                 Ok(self.status())
@@ -988,7 +1009,7 @@ impl PortalShortcutState {
         } else {
             let mut current = current;
             current.can_configure = true;
-            if self.publish_for_generation(generation, current.clone()) {
+            if self.publish_for_generation(generation, current.clone(), false) {
                 Ok(current)
             } else {
                 Ok(self.status())
@@ -1222,7 +1243,10 @@ impl PortalShortcutState {
             return Err("Desktop portal restarted during shortcut binding".into());
         }
         let bindings = shortcut_map(&response);
-        let status = classify_portal_bindings(&requested, &bindings);
+        let status = apply_configure_capability(
+            classify_portal_bindings(&requested, &bindings),
+            cached.version,
+        );
         if status.state == ShortcutBackendState::Unavailable {
             return Err(PRIMARY_BINDING_MISSING.into());
         }
@@ -1301,9 +1325,11 @@ impl PortalShortcutState {
                 let mut inner = self.inner.lock().unwrap();
                 let health = inner.candidates.remove(&generation_id);
                 if let Some(health) = &health {
+                    let generation = armed.generation.as_mut().unwrap();
                     candidate.status = apply_candidate_bindings(
-                        &mut armed.generation.as_mut().unwrap().runtime,
+                        &mut generation.runtime,
                         health,
+                        generation.version,
                     );
                 }
                 let current_base = inner.active.as_ref().map(|active| active.id);
@@ -1508,7 +1534,8 @@ impl PortalShortcutState {
                 return;
             };
             let releases = active.runtime.update(bindings);
-            let status = classify_active_runtime(&active.runtime, can_configure_suppressed);
+            let status =
+                classify_active_runtime(&active.runtime, active.version, can_configure_suppressed);
             inner.status = status.clone();
             (releases, status)
         };
@@ -1878,7 +1905,12 @@ impl PortalShortcutState {
             (self.on_status)(status);
         }
     }
-    fn publish_for_generation(&self, generation: u64, status: ShortcutBackendStatus) -> bool {
+    fn publish_for_generation(
+        &self,
+        generation: u64,
+        status: ShortcutBackendStatus,
+        suppress_configure: bool,
+    ) -> bool {
         let _dispatch = self.dispatch.lock().unwrap();
         let published = {
             let mut inner = self.inner.lock().unwrap();
@@ -1891,7 +1923,7 @@ impl PortalShortcutState {
                 )
             });
             if published {
-                inner.can_configure_suppressed = !status.can_configure;
+                inner.can_configure_suppressed = suppress_configure;
                 inner.status = status.clone();
             }
             published
@@ -1904,8 +1936,13 @@ impl PortalShortcutState {
     fn active_status(&self) -> Option<ShortcutBackendStatus> {
         let inner = self.inner.lock().unwrap();
         inner.active.as_ref().and_then(|active| {
-            (!active.deliberate && active.failed_epoch.is_none())
-                .then(|| classify_active_runtime(&active.runtime, inner.can_configure_suppressed))
+            (!active.deliberate && active.failed_epoch.is_none()).then(|| {
+                classify_active_runtime(
+                    &active.runtime,
+                    active.version,
+                    inner.can_configure_suppressed,
+                )
+            })
         })
     }
     fn restore(&self, previous: Option<ShortcutBackendStatus>, error: &str) {
@@ -1923,7 +1960,7 @@ impl PortalShortcutState {
             );
             let status = match inner.active.as_ref() {
                 Some(active) if !active.deliberate && active.failed_epoch.is_none() => Some(
-                    classify_portal_bindings(&active.runtime.requested, &active.runtime.bindings),
+                    classify_active_runtime(&active.runtime, active.version, false),
                 ),
                 Some(_) if previous.is_some() => None,
 
@@ -1980,9 +2017,7 @@ impl PortalShortcutState {
                     active.failed_epoch,
                     generation,
                 )
-                .then(|| {
-                    classify_portal_bindings(&active.runtime.requested, &active.runtime.bindings)
-                })
+                .then(|| classify_active_runtime(&active.runtime, active.version, false))
             });
             if let Some(status) = &status {
                 inner.can_configure_suppressed = false;
@@ -2010,7 +2045,7 @@ impl PortalShortcutState {
             );
             let status = match inner.active.as_ref() {
                 Some(active) if !active.deliberate && active.failed_epoch.is_none() => Some(
-                    classify_portal_bindings(&active.runtime.requested, &active.runtime.bindings),
+                    classify_active_runtime(&active.runtime, active.version, false),
                 ),
                 Some(_) => None,
                 None => Some(ShortcutBackendStatus {
@@ -2340,6 +2375,22 @@ mod tests {
     }
 
     #[test]
+    fn portal_version_controls_configuration_for_complete_bindings_only() {
+        let requested = ids(&[PRIMARY_ID, POST_PROCESS_ID]);
+        let ready = classify_portal_bindings(
+            &requested,
+            &bindings(&[(PRIMARY_ID, "F8"), (POST_PROCESS_ID, "Ctrl+F8")]),
+        );
+        let partial = classify_portal_bindings(&requested, &bindings(&[(PRIMARY_ID, "F8")]));
+        let unavailable = classify_portal_bindings(&requested, &HashMap::new());
+
+        assert!(!apply_configure_capability(ready.clone(), 1).can_configure);
+        assert!(apply_configure_capability(partial, 1).can_configure);
+        assert!(apply_configure_capability(unavailable, 1).can_configure);
+        assert!(apply_configure_capability(ready, 2).can_configure);
+    }
+
+    #[test]
     fn duplicate_edges_are_idempotent_and_keep_trigger_descriptions() {
         let mut runtime = Runtime {
             requested: ids(&[PRIMARY_ID, POST_PROCESS_ID]),
@@ -2570,7 +2621,7 @@ mod tests {
             bindings: Some(bindings(&[(PRIMARY_ID, "F9")])),
         };
 
-        let status = apply_candidate_bindings(&mut runtime, &health);
+        let status = apply_candidate_bindings(&mut runtime, &health, 1);
         assert_eq!(status.state, ShortcutBackendState::Partial);
         assert_eq!(status.bindings, bindings(&[(PRIMARY_ID, "F9")]));
         assert_eq!(runtime.bindings, status.bindings);
@@ -2580,7 +2631,7 @@ mod tests {
             ..health
         };
         assert_eq!(
-            apply_candidate_bindings(&mut runtime, &removed_primary).state,
+            apply_candidate_bindings(&mut runtime, &removed_primary, 1).state,
             ShortcutBackendState::Unavailable
         );
     }
@@ -2654,8 +2705,8 @@ mod tests {
             pressed: HashSet::new(),
         };
 
-        assert!(classify_active_runtime(&runtime, false).can_configure);
-        assert!(!classify_active_runtime(&runtime, true).can_configure);
+        assert!(classify_active_runtime(&runtime, 2, false).can_configure);
+        assert!(!classify_active_runtime(&runtime, 2, true).can_configure);
     }
 
     #[test]
