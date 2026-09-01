@@ -193,11 +193,11 @@ impl FocusedFieldBackend for LinuxFocusedFieldBackend {
                 TARGET_CALL_DEADLINE,
             )
             .map_err(|_| FocusedOutputReasonCode::BackendDisconnected)?;
-        // The accessibility toggle, connection, and two target-capture passes
-        // are independently bounded. Allow those budgets before declaring the
-        // backend disconnected.
+        // Initial connection, target capture, listener registration, and final
+        // revalidation each contain independently bounded calls. Allow their
+        // combined setup budget before declaring the backend disconnected.
         let begun = rx
-            .recv_timeout(THREAD_READY_DEADLINE + TARGET_CALL_DEADLINE * 4)
+            .recv_timeout(THREAD_READY_DEADLINE + TARGET_CALL_DEADLINE * 8)
             .map_err(|_| FocusedOutputReasonCode::BackendDisconnected)??;
         let receipt = BeginReceipt::new(session_id, begun.capability.clone(), begun.application)
             .ok_or(FocusedOutputReasonCode::BackendDisconnected)?;
@@ -2398,7 +2398,7 @@ async fn register_device_listener(
     };
     let signal_proxy = match zbus::Proxy::new(
         connection.connection(),
-        REGISTRY,
+        controller.sender.as_str(),
         DEVICE_EVENT_CONTROLLER_PATH,
         DEVICE_EVENT_LISTENER_INTERFACE,
     )
