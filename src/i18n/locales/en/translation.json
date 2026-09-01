@@ -167,6 +167,15 @@
         "none": "No shortcuts configured",
         "notFound": "Shortcut not found",
         "pressKeys": "Press keys...",
+        "portal": {
+          "loading": "Loading system shortcuts...",
+          "initializing": "Waiting for desktop shortcut access...",
+          "configure": "Configure system shortcuts",
+          "notAssigned": "Not assigned",
+          "identityUnavailable": "Desktop portal application registration is unavailable.",
+          "unavailable": "System global shortcuts are unavailable.",
+          "fallback": "Bind `handy --toggle-transcription` in your desktop shortcut settings, or select Handy Keys."
+        },
         "bindings": {
           "transcribe": {
             "name": "Transcribe Shortcut",
@@ -537,6 +546,10 @@
       "keyboardImplementation": {
         "title": "Keyboard Implementation",
         "description": "Choose the keyboard shortcut backend.",
+        "options": {
+          "system": "System Global Shortcut",
+          "handyKeys": "Handy Keys"
+        },
         "bindingsReset": "Keyboard shortcuts were incompatible and reset to defaults"
       },
       "paths": {

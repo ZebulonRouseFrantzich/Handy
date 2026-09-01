@@ -179,7 +179,11 @@ Without these tools, Handy falls back to enigo which may have limited compatibil
 - The recording overlay is disabled by default on Linux (`Overlay Position: None`) because certain compositors treat it as the active window. When the overlay is visible it can steal focus, which prevents Handy from pasting back into the application that triggered transcription. If you enable the overlay anyway, be aware that clipboard-based pasting might fail or end up in the wrong window.
 - If you are having trouble with the app, running with the environment variable `WEBKIT_DISABLE_DMABUF_RENDERER=1` may help
 - If Handy fails to start reliably on Linux, see [Troubleshooting → Linux Startup Crashes or Instability](#linux-startup-crashes-or-instability).
-- **Global keyboard shortcuts (Wayland):** On Wayland, system-level shortcuts must be configured through your desktop environment or window manager. Use the [CLI flags](#cli-parameters) as the command for your custom shortcut.
+- **Global keyboard shortcuts (Wayland):** Select **System Global Shortcut** in Handy. Handy first uses the desktop's Global Shortcuts portal, where you review and consent to the requested shortcuts and the desktop owns the assigned key combinations.
+
+  If the desktop does not support the portal, portal application registration is unavailable, or a portable AppImage has not been integrated with the desktop, configure `handy --toggle-transcription` through your desktop environment or window manager as a fallback. Use the [CLI flags](#cli-parameters) as the command for a custom shortcut:
+
+  Portal and CLI shortcuts only activate transcription. They do not change Wayland's separate text-insertion limitations; the appropriate text input tool described above is still required.
 
   **GNOME:**
   1. Open **Settings > Keyboard > Keyboard Shortcuts > Custom Shortcuts**

@@ -56,6 +56,7 @@ hound = "3.5.1"
 log = "0.4.25"
 env_filter = "0.1.0"
 tokio = { version = "1.43.0", features = ["net", "rt", "sync", "time"] }
+parking_lot = "0.12"
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 earshot = "1.2.2"
 enigo = "0.6.1"
@@ -191,6 +192,11 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13.13", default-features = false, features = ["global_shortcuts", "raw_handle", "tokio", "wayland"] }
+getrandom = "0.3"
+raw-window-handle = "0.6"
+zvariant = "5.15"
+xkbcommon = "0.9.0"
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 atspi = { version = "0.30.0", default-features = false, features = [
   "connection",

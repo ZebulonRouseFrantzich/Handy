@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "enableGTKAppId": true,
     "macOSPrivateApi": true,
     "windows": [],
     "security": {
@@ -47,7 +48,8 @@
       "deb": {
         "depends": ["libgtk-layer-shell0", "libopenblas0"],
         "files": {
-          "/usr/lib/Handy": "transcribe-libs"
+          "/usr/lib/Handy": "transcribe-libs",
+          "/usr/share/applications/com.pais.handy.desktop": "linux/com.pais.handy.desktop"
         }
       },
       "rpm": {
@@ -59,13 +61,15 @@
           "type": "none"
         },
         "files": {
-          "/usr/lib/Handy": "transcribe-libs"
+          "/usr/lib/Handy": "transcribe-libs",
+          "/usr/share/applications/com.pais.handy.desktop": "linux/com.pais.handy.desktop"
         }
       },
       "appimage": {
         "bundleMediaFramework": true,
         "files": {
-          "/usr/lib": "transcribe-libs"
+          "/usr/lib": "transcribe-libs",
+          "/usr/share/applications/com.pais.handy.desktop": "linux/com.pais.handy.desktop"
         }
       }
     },

@@ -416,10 +416,8 @@ async changeWhatsNewLastSeenVersionSetting(version: string) : Promise<Result<nul
 }
 },
 /**
- * Change the keyboard implementation with runtime switching.
- * This will unregister all shortcuts from the old implementation,
- * validate shortcuts for the new implementation (resetting invalid ones to defaults),
- * and register them with the new implementation.
+ * Change shortcut implementation without committing settings or dispatch
+ * ownership until the complete candidate backend is ready.
  */
 async changeKeyboardImplementationSetting(implementation: string) : Promise<Result<ImplementationChangeResult, string>> {
     try {
@@ -430,10 +428,21 @@ async changeKeyboardImplementationSetting(implementation: string) : Promise<Resu
 }
 },
 /**
- * Get the current keyboard implementation
+ * Get the current persisted keyboard implementation.
  */
 async getKeyboardImplementation() : Promise<string> {
     return await TAURI_INVOKE("get_keyboard_implementation");
+},
+async getShortcutBackendStatus() : Promise<ShortcutBackendStatus> {
+    return await TAURI_INVOKE("get_shortcut_backend_status");
+},
+async configureSystemShortcuts() : Promise<Result<ShortcutBackendStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("configure_system_shortcuts") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async changeShowTrayIconSetting(enabled: boolean) : Promise<Result<null, string>> {
     try {
@@ -631,11 +640,10 @@ async initializeEnigo() : Promise<Result<null, string>> {
 }
 },
 /**
- * Initialize keyboard shortcuts.
- * On macOS, this should be called after accessibility permissions are granted.
- * This is idempotent - calling it multiple times is safe.
+ * Initialize keyboard shortcuts after platform permissions are available.
+ * Concurrent calls share the same backend attempt and later calls are idempotent.
  */
-async initializeShortcuts() : Promise<Result<null, string>> {
+async initializeShortcuts() : Promise<Result<ShortcutBackendStatus, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("initialize_shortcuts") };
 } catch (e) {
@@ -1129,6 +1137,9 @@ uncovered_bindings: string[];
  * warning banner appears and explains why recording refused.
  */
 recorder_blocked: boolean }
+export type ShortcutBackendKind = "tauri" | "xdg_portal" | "handy_keys"
+export type ShortcutBackendState = "initializing" | "ready" | "partial" | "unavailable"
+export type ShortcutBackendStatus = { backend: ShortcutBackendKind; state: ShortcutBackendState; message: string | null; bindings: Partial<{ [key in string]: string }>; can_configure: boolean }
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
 export type SoundTheme = "marimba" | "pop" | "custom"
 /**

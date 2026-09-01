@@ -11,7 +11,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use crate::settings::get_settings;
 use crate::settings::{self, ShortcutBinding};
 
-use super::handler::handle_shortcut_event;
+use super::{handler::handle_shortcut_event, ShortcutDispatchSource};
 
 /// Initialize shortcuts using Tauri's global-shortcut plugin
 pub fn init_shortcuts(app: &AppHandle) {
@@ -117,6 +117,7 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
                 );
                 handle_shortcut_event(
                     app_handle,
+                    ShortcutDispatchSource::Tauri,
                     &binding_id_for_closure,
                     &shortcut_string,
                     is_pressed,

@@ -1,22 +1,28 @@
-//! Keyboard shortcut management module
-//!
-//! This module provides a unified interface for keyboard shortcuts with
-//! multiple backend implementations:
-//!
-//! - `tauri`: Uses Tauri's built-in global-shortcut plugin
-//! - `handy_keys`: Uses the handy-keys library for more control
-//!
-//! The active implementation is determined by the `keyboard_implementation`
-//! setting and can be changed at runtime.
+//! Keyboard shortcut management and runtime backend routing.
 
 mod handler;
 pub mod handy_keys;
+#[cfg(target_os = "linux")]
+mod portal_dbus;
+#[cfg(target_os = "linux")]
+pub mod portal_impl;
 pub mod tauri_impl;
 
+#[cfg(target_os = "linux")]
+pub use portal_impl::{ShortcutBackendKind, ShortcutBackendState, ShortcutBackendStatus};
+
 use log::{debug, error, info, warn};
+use parking_lot::{Mutex, RwLock};
+#[cfg(not(target_os = "linux"))]
+use serde::Deserialize;
 use serde::Serialize;
 use specta::Type;
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
@@ -26,32 +32,649 @@ use crate::settings::{
     SoundTheme, Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
 };
 use crate::tray;
+#[cfg(target_os = "linux")]
+use ashpd::WindowIdentifier;
+#[cfg(target_os = "linux")]
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-// Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutBackendKind {
+    Tauri,
+    XdgPortal,
+    HandyKeys,
+}
 
-/// Initialize shortcuts using the configured implementation
-pub fn init_shortcuts(app: &AppHandle) {
-    let user_settings = settings::load_or_create_app_settings(app);
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutBackendState {
+    Initializing,
+    Ready,
+    Partial,
+    Unavailable,
+}
 
-    // Check which implementation to use
-    match user_settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => {
-            tauri_impl::init_shortcuts(app);
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ShortcutBackendStatus {
+    pub backend: ShortcutBackendKind,
+    pub state: ShortcutBackendState,
+    pub message: Option<String>,
+    pub bindings: HashMap<String, String>,
+    pub can_configure: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ShortcutBackendStatus {
+    pub fn static_ready(backend: ShortcutBackendKind) -> Self {
+        Self {
+            backend,
+            state: ShortcutBackendState::Ready,
+            message: None,
+            bindings: HashMap::new(),
+            can_configure: false,
         }
-        KeyboardImplementation::HandyKeys => {
-            if let Err(e) = handy_keys::init_shortcuts(app) {
-                error!("Failed to initialize handy-keys shortcuts: {}", e);
-                // Fall back to Tauri implementation and persist this fallback
-                warn!("Falling back to Tauri global shortcut implementation and saving fallback to settings");
+    }
+}
 
-                // Update settings to persist the fallback so we don't retry HandyKeys on next launch
-                let mut settings = settings::get_settings(app);
-                settings.keyboard_implementation = KeyboardImplementation::Tauri;
-                settings::write_settings(app, settings);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutDispatchSource {
+    Tauri,
+    HandyKeys,
+    Portal(u64),
+}
 
-                tauri_impl::init_shortcuts(app);
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct RetiringPortalReleases {
+    generation: u64,
+    binding_ids: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct ShortcutBackendRuntimeSnapshot {
+    active: Option<ShortcutDispatchSource>,
+    #[cfg(target_os = "linux")]
+    retiring_portal: Option<RetiringPortalReleases>,
+    status: ShortcutBackendStatus,
+}
+
+/// Managed runtime gate. On Linux its single lock is the atomic commit point
+/// for dispatch ownership and frontend-visible backend status.
+pub struct ShortcutBackendRuntimeState {
+    snapshot: RwLock<ShortcutBackendRuntimeSnapshot>,
+    pub operation: AsyncMutex<()>,
+}
+
+impl Default for ShortcutBackendRuntimeState {
+    fn default() -> Self {
+        Self {
+            snapshot: RwLock::new(ShortcutBackendRuntimeSnapshot {
+                active: None,
+                #[cfg(target_os = "linux")]
+                retiring_portal: None,
+                status: initializing_status(ShortcutBackendKind::Tauri),
+            }),
+            operation: AsyncMutex::new(()),
+        }
+    }
+}
+
+impl ShortcutBackendRuntimeState {
+    fn commit(&self, source: ShortcutDispatchSource, status: ShortcutBackendStatus) {
+        *self.snapshot.write() = ShortcutBackendRuntimeSnapshot {
+            active: Some(source),
+            #[cfg(target_os = "linux")]
+            retiring_portal: None,
+            status,
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    fn commit_with_retiring_portal(
+        &self,
+        source: ShortcutDispatchSource,
+        status: ShortcutBackendStatus,
+        retiring_portal: Option<(u64, HashSet<String>)>,
+    ) {
+        *self.snapshot.write() = ShortcutBackendRuntimeSnapshot {
+            active: Some(source),
+            retiring_portal: retiring_portal.map(|(generation, binding_ids)| {
+                RetiringPortalReleases {
+                    generation,
+                    binding_ids,
+                }
+            }),
+            status,
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_portal_retirement(&self, generation: Option<u64>) {
+        let mut snapshot = self.snapshot.write();
+        if snapshot
+            .retiring_portal
+            .as_ref()
+            .map(|retiring| retiring.generation)
+            == generation
+        {
+            snapshot.retiring_portal = None;
+        }
+    }
+
+    fn set_status(&self, status: ShortcutBackendStatus) {
+        self.snapshot.write().status = status;
+    }
+
+    fn status(&self) -> ShortcutBackendStatus {
+        self.snapshot.read().status.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn callback_matches_runtime(
+    active: Option<ShortcutDispatchSource>,
+    retiring_portal: &mut Option<RetiringPortalReleases>,
+    source: ShortcutDispatchSource,
+    binding_id: &str,
+    is_pressed: bool,
+) -> bool {
+    let known_binding = matches!(binding_id, "transcribe" | "transcribe_with_post_process");
+    match (active, source) {
+        (Some(ShortcutDispatchSource::Tauri), ShortcutDispatchSource::Tauri) => true,
+        (Some(ShortcutDispatchSource::HandyKeys), ShortcutDispatchSource::HandyKeys) => {
+            if is_pressed {
+                if let Some(retiring) = retiring_portal {
+                    retiring.binding_ids.remove(binding_id);
+                }
+            }
+            true
+        }
+        (
+            Some(ShortcutDispatchSource::Portal(active_generation)),
+            ShortcutDispatchSource::Portal(callback_generation),
+        ) => portal_impl::portal_callback_is_active(
+            ShortcutBackendKind::XdgPortal,
+            Some(active_generation),
+            callback_generation,
+            known_binding,
+        ),
+        (
+            Some(ShortcutDispatchSource::HandyKeys),
+            ShortcutDispatchSource::Portal(callback_generation),
+        ) => {
+            !is_pressed
+                && known_binding
+                && retiring_portal.as_mut().is_some_and(|retiring| {
+                    retiring.generation == callback_generation
+                        && retiring.binding_ids.remove(binding_id)
+                })
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn shortcut_callback_is_active(
+    app: &AppHandle,
+    source: ShortcutDispatchSource,
+    binding_id: &str,
+    is_pressed: bool,
+) -> bool {
+    let Some(runtime) = app.try_state::<ShortcutBackendRuntimeState>() else {
+        return false;
+    };
+    let mut snapshot = runtime.snapshot.write();
+    let active = snapshot.active;
+    callback_matches_runtime(
+        active,
+        &mut snapshot.retiring_portal,
+        source,
+        binding_id,
+        is_pressed,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn shortcut_callback_is_active(
+    _app: &AppHandle,
+    _source: ShortcutDispatchSource,
+    _binding_id: &str,
+    _is_pressed: bool,
+) -> bool {
+    true
+}
+
+#[derive(Default)]
+struct InitializationFlight {
+    running: bool,
+    attempt: u64,
+    result: Option<(u64, Result<ShortcutBackendStatus, String>)>,
+    successful: bool,
+}
+
+/// Managed single-flight state for the public initialization command.
+pub struct ShortcutInitializationState {
+    flight: Mutex<InitializationFlight>,
+    notify: Notify,
+}
+
+impl Default for ShortcutInitializationState {
+    fn default() -> Self {
+        Self {
+            flight: Mutex::new(InitializationFlight::default()),
+            notify: Notify::new(),
+        }
+    }
+}
+
+struct InitializationLeaderGuard<'a> {
+    initialization: &'a ShortcutInitializationState,
+    attempt: u64,
+    armed: bool,
+}
+
+impl Drop for InitializationLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut flight = self.initialization.flight.lock();
+        if flight.running && flight.attempt == self.attempt {
+            flight.running = false;
+            flight.result = Some((
+                self.attempt,
+                Err("Shortcut initialization attempt was cancelled".into()),
+            ));
+        }
+        drop(flight);
+        self.initialization.notify.notify_waiters();
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct PortalShortcutStateHolder {
+    construction: AsyncMutex<()>,
+    state: RwLock<Option<Arc<portal_impl::PortalShortcutState>>>,
+    status: Mutex<ShortcutBackendStatus>,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for PortalShortcutStateHolder {
+    fn default() -> Self {
+        Self {
+            construction: AsyncMutex::new(()),
+            state: RwLock::new(None),
+            status: Mutex::new(initializing_status(ShortcutBackendKind::XdgPortal)),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PortalShortcutStateHolder {
+    pub fn current(&self) -> Option<Arc<portal_impl::PortalShortcutState>> {
+        self.state.read().clone()
+    }
+
+    fn status(&self) -> ShortcutBackendStatus {
+        self.status.lock().clone()
+    }
+
+    fn publish(&self, app: &AppHandle, status: ShortcutBackendStatus) {
+        *self.status.lock() = status.clone();
+        if resolved_backend(settings::get_settings(app).keyboard_implementation)
+            != ShortcutBackendKind::XdgPortal
+        {
+            return;
+        }
+        if let Some(generation) = self
+            .current()
+            .and_then(|state| state.active_generation_id())
+        {
+            if let Some(runtime) = app.try_state::<ShortcutBackendRuntimeState>() {
+                runtime.commit(ShortcutDispatchSource::Portal(generation), status.clone());
+            }
+            let _ = app.emit("shortcut-backend-status-changed", status);
+        } else {
+            if let Some(runtime) = app.try_state::<ShortcutBackendRuntimeState>() {
+                runtime.set_status(status.clone());
+            }
+            let _ = app.emit("shortcut-backend-status-changed", status);
+        }
+    }
+
+    async fn get_or_create(
+        &self,
+        app: &AppHandle,
+    ) -> Result<Arc<portal_impl::PortalShortcutState>, String> {
+        if let Some(state) = self.current() {
+            return Ok(state);
+        }
+        let _construction = self.construction.lock().await;
+        if let Some(state) = self.current() {
+            return Ok(state);
+        }
+
+        let event_app = app.clone();
+        let on_event: portal_impl::PortalEventHandler = Arc::new(move |event| {
+            handler::handle_shortcut_event(
+                &event_app,
+                ShortcutDispatchSource::Portal(event.generation_id),
+                &event.shortcut_id,
+                &event.shortcut,
+                event.is_pressed,
+            );
+        });
+        let status_app = app.clone();
+        let on_status: portal_impl::PortalStatusHandler = Arc::new(move |status| {
+            if let Some(holder) = status_app.try_state::<PortalShortcutStateHolder>() {
+                holder.publish(&status_app, status);
+            }
+        });
+
+        match portal_impl::PortalShortcutState::new(on_event, on_status).await {
+            Ok(state) => {
+                *self.state.write() = Some(state.clone());
+                Ok(state)
+            }
+            Err(error) => {
+                let status =
+                    unavailable_status(ShortcutBackendKind::XdgPortal, error.clone(), false);
+                self.publish(app, status);
+                Err(error)
             }
         }
+    }
+}
+
+fn initializing_status(backend: ShortcutBackendKind) -> ShortcutBackendStatus {
+    ShortcutBackendStatus {
+        backend,
+        state: ShortcutBackendState::Initializing,
+        message: None,
+        bindings: HashMap::new(),
+        can_configure: false,
+    }
+}
+
+fn unavailable_status(
+    backend: ShortcutBackendKind,
+    message: String,
+    can_configure: bool,
+) -> ShortcutBackendStatus {
+    ShortcutBackendStatus {
+        backend,
+        state: ShortcutBackendState::Unavailable,
+        message: Some(message),
+        bindings: HashMap::new(),
+        can_configure,
+    }
+}
+fn resolved_backend(implementation: KeyboardImplementation) -> ShortcutBackendKind {
+    #[cfg(target_os = "linux")]
+    {
+        portal_impl::resolve_shortcut_backend(true, crate::utils::is_wayland(), implementation)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match implementation {
+            KeyboardImplementation::Tauri => ShortcutBackendKind::Tauri,
+            KeyboardImplementation::HandyKeys => ShortcutBackendKind::HandyKeys,
+        }
+    }
+}
+
+fn publish_runtime_status(
+    app: &AppHandle,
+    source: Option<ShortcutDispatchSource>,
+    status: ShortcutBackendStatus,
+) {
+    if let Some(runtime) = app.try_state::<ShortcutBackendRuntimeState>() {
+        if let Some(source) = source {
+            runtime.commit(source, status.clone());
+        } else {
+            runtime.set_status(status.clone());
+        }
+    }
+    let _ = app.emit("shortcut-backend-status-changed", status);
+}
+
+#[cfg(target_os = "linux")]
+async fn portal_parent(app: &AppHandle) -> Option<WindowIdentifier> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let parent_app = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || {
+        let handles = (|| {
+            let window = parent_app
+                .get_webview_window("main")
+                .ok_or_else(|| "The main window is unavailable".to_string())?;
+            let window_handle = window
+                .window_handle()
+                .map_err(|error| format!("Could not obtain the main window handle: {error}"))?
+                .as_raw();
+            let display_handle = window.display_handle().ok().map(|handle| handle.as_raw());
+            Ok::<_, String>((window_handle, display_handle))
+        })();
+
+        match handles {
+            Ok((window_handle, display_handle)) => {
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    let parent =
+                        WindowIdentifier::from_raw_handle(&window_handle, display_handle.as_ref())
+                            .await;
+                    let _ = sender.send(parent);
+                });
+            }
+            Err(error) => {
+                warn!("{error}");
+                let _ = sender.send(None);
+            }
+        }
+    }) {
+        warn!("Could not schedule portal parent export on the main thread: {error}");
+        return None;
+    }
+
+    let parent = match receiver.await {
+        Ok(parent) => parent,
+        Err(error) => {
+            warn!("Portal parent export did not complete: {error}");
+            None
+        }
+    };
+    if parent.is_none() {
+        warn!("Opening the desktop shortcut dialog without a parent window");
+    }
+    parent
+}
+
+#[cfg(target_os = "linux")]
+fn portal_specs(
+    settings: &crate::settings::AppSettings,
+) -> Result<Vec<portal_impl::PortalShortcutSpec>, String> {
+    portal_impl::shortcut_specs_from_settings(&settings.bindings, settings.post_process_enabled)
+}
+
+async fn initialize_backend(app: &AppHandle) -> Result<ShortcutBackendStatus, String> {
+    let runtime = app
+        .try_state::<ShortcutBackendRuntimeState>()
+        .ok_or("ShortcutBackendRuntimeState is not managed")?;
+    let _operation = runtime.operation.lock().await;
+    let user_settings = settings::load_or_create_app_settings(app);
+    let backend = resolved_backend(user_settings.keyboard_implementation);
+    publish_runtime_status(app, None, initializing_status(backend));
+
+    match backend {
+        ShortcutBackendKind::Tauri => {
+            tauri_impl::init_shortcuts(app);
+            let status = ShortcutBackendStatus::static_ready(ShortcutBackendKind::Tauri);
+            publish_runtime_status(app, Some(ShortcutDispatchSource::Tauri), status.clone());
+            Ok(status)
+        }
+        ShortcutBackendKind::HandyKeys => {
+            if let Err(error) = handy_keys::init_shortcuts(app) {
+                let status =
+                    unavailable_status(ShortcutBackendKind::HandyKeys, error.clone(), false);
+                publish_runtime_status(app, None, status);
+                return Err(error);
+            }
+            let status = ShortcutBackendStatus::static_ready(ShortcutBackendKind::HandyKeys);
+            publish_runtime_status(app, Some(ShortcutDispatchSource::HandyKeys), status.clone());
+            Ok(status)
+        }
+        ShortcutBackendKind::XdgPortal => {
+            #[cfg(target_os = "linux")]
+            {
+                let holder = app
+                    .try_state::<PortalShortcutStateHolder>()
+                    .ok_or("PortalShortcutStateHolder is not managed")?;
+                let state = holder.get_or_create(app).await?;
+                let specs = match portal_specs(&user_settings) {
+                    Ok(specs) => specs,
+                    Err(error) => {
+                        holder.publish(
+                            app,
+                            unavailable_status(
+                                ShortcutBackendKind::XdgPortal,
+                                error.clone(),
+                                false,
+                            ),
+                        );
+                        return Err(error);
+                    }
+                };
+                state.initialize(specs, portal_parent(app).await).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unreachable!("portal routing is Linux-only")
+            }
+        }
+    }
+}
+
+/// Initialize the resolved shortcut backend. Concurrent callers share the
+/// same attempt and result; only a later call retries a failed attempt.
+pub async fn init_shortcuts(app: &AppHandle) -> Result<ShortcutBackendStatus, String> {
+    enum Role {
+        Leader(u64),
+        Follower(u64),
+    }
+
+    let initialization = app
+        .try_state::<ShortcutInitializationState>()
+        .ok_or("ShortcutInitializationState is not managed")?;
+    let role = {
+        let mut flight = initialization.flight.lock();
+        if flight.successful {
+            return Ok(get_shortcut_backend_status(app.clone()));
+        }
+        if flight.running {
+            Role::Follower(flight.attempt)
+        } else {
+            flight.running = true;
+            flight.attempt += 1;
+            Role::Leader(flight.attempt)
+        }
+    };
+
+    if let Role::Follower(attempt) = role {
+        loop {
+            let notified = initialization.notify.notified();
+            if let Some(result) = initialization
+                .flight
+                .lock()
+                .result
+                .as_ref()
+                .filter(|(completed, _)| *completed == attempt)
+                .map(|(_, result)| result.clone())
+            {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    let Role::Leader(attempt) = role else {
+        unreachable!()
+    };
+    let mut leader = InitializationLeaderGuard {
+        initialization: &initialization,
+        attempt,
+        armed: true,
+    };
+    let result = initialize_backend(app).await;
+    {
+        let mut flight = initialization.flight.lock();
+        flight.running = false;
+        flight.successful = result.as_ref().is_ok_and(|status| {
+            matches!(
+                status.state,
+                ShortcutBackendState::Ready | ShortcutBackendState::Partial
+            )
+        });
+        flight.result = Some((attempt, result.clone()));
+        leader.armed = false;
+    }
+    initialization.notify.notify_waiters();
+    result
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_shortcut_backend_status(app: AppHandle) -> ShortcutBackendStatus {
+    let settings = settings::get_settings(&app);
+    let backend = resolved_backend(settings.keyboard_implementation);
+    #[cfg(target_os = "linux")]
+    if backend == ShortcutBackendKind::XdgPortal {
+        return app
+            .try_state::<PortalShortcutStateHolder>()
+            .map(|holder| holder.status())
+            .unwrap_or_else(|| {
+                unavailable_status(
+                    ShortcutBackendKind::XdgPortal,
+                    "PortalShortcutStateHolder is not managed".into(),
+                    false,
+                )
+            });
+    }
+
+    app.try_state::<ShortcutBackendRuntimeState>()
+        .map(|runtime| runtime.status())
+        .filter(|status| status.backend == backend)
+        .unwrap_or_else(|| initializing_status(backend))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn configure_system_shortcuts(app: AppHandle) -> Result<ShortcutBackendStatus, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let runtime = app
+            .try_state::<ShortcutBackendRuntimeState>()
+            .ok_or("ShortcutBackendRuntimeState is not managed")?;
+        let _operation = runtime.operation.lock().await;
+        let settings = settings::get_settings(&app);
+        if resolved_backend(settings.keyboard_implementation) != ShortcutBackendKind::XdgPortal {
+            return Err("System shortcuts are not managed by the desktop".into());
+        }
+        let holder = app
+            .try_state::<PortalShortcutStateHolder>()
+            .ok_or("PortalShortcutStateHolder is not managed")?;
+        let state = holder.get_or_create(&app).await?;
+        let parent = portal_parent(&app).await;
+        if state.active_generation_id().is_some() {
+            state.configure(parent).await
+        } else {
+            state.initialize(portal_specs(&settings)?, parent).await
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Err("System shortcuts are not managed by the desktop".into())
     }
 }
 
@@ -62,9 +685,10 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
     crate::secure_input::register_cancel_fallback(app);
 
     let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::register_cancel_shortcut(app),
-        KeyboardImplementation::HandyKeys => handy_keys::register_cancel_shortcut(app),
+    match resolved_backend(settings.keyboard_implementation) {
+        ShortcutBackendKind::Tauri => tauri_impl::register_cancel_shortcut(app),
+        ShortcutBackendKind::HandyKeys => handy_keys::register_cancel_shortcut(app),
+        ShortcutBackendKind::XdgPortal => {}
     }
 }
 
@@ -73,27 +697,34 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
     crate::secure_input::unregister_cancel_fallback(app);
 
     let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::unregister_cancel_shortcut(app),
-        KeyboardImplementation::HandyKeys => handy_keys::unregister_cancel_shortcut(app),
+    match resolved_backend(settings.keyboard_implementation) {
+        ShortcutBackendKind::Tauri => tauri_impl::unregister_cancel_shortcut(app),
+        ShortcutBackendKind::HandyKeys => handy_keys::unregister_cancel_shortcut(app),
+        ShortcutBackendKind::XdgPortal => {}
     }
 }
 
 /// Register a shortcut using the appropriate implementation
 pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
     let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
-        KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+    match resolved_backend(settings.keyboard_implementation) {
+        ShortcutBackendKind::Tauri => tauri_impl::register_shortcut(app, binding),
+        ShortcutBackendKind::HandyKeys => handy_keys::register_shortcut(app, binding),
+        ShortcutBackendKind::XdgPortal => {
+            Err("Portal shortcuts are configured by the desktop".into())
+        }
     }
 }
 
 /// Unregister a shortcut using the appropriate implementation
 pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
     let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
-        KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+    match resolved_backend(settings.keyboard_implementation) {
+        ShortcutBackendKind::Tauri => tauri_impl::unregister_shortcut(app, binding),
+        ShortcutBackendKind::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+        ShortcutBackendKind::XdgPortal => {
+            Err("Portal shortcuts are configured by the desktop".into())
+        }
     }
 }
 
@@ -115,6 +746,11 @@ pub fn change_binding(
     id: String,
     binding: String,
 ) -> Result<BindingResponse, String> {
+    if resolved_backend(settings::get_settings(&app).keyboard_implementation)
+        == ShortcutBackendKind::XdgPortal
+    {
+        return Err("Portal shortcuts are configured by the desktop".into());
+    }
     // Reject empty bindings — every shortcut should have a value
     if binding.trim().is_empty() {
         return Err("Binding cannot be empty".to_string());
@@ -269,6 +905,11 @@ pub fn resume_all_shortcuts(app: &AppHandle) {
 #[tauri::command]
 #[specta::specta]
 pub fn suspend_all_bindings(app: AppHandle) -> Result<(), String> {
+    if resolved_backend(settings::get_settings(&app).keyboard_implementation)
+        == ShortcutBackendKind::XdgPortal
+    {
+        return Err("Portal shortcuts are configured by the desktop".into());
+    }
     suspend_all_shortcuts(&app);
     Ok(())
 }
@@ -277,6 +918,11 @@ pub fn suspend_all_bindings(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub fn resume_all_bindings(app: AppHandle) -> Result<(), String> {
+    if resolved_backend(settings::get_settings(&app).keyboard_implementation)
+        == ShortcutBackendKind::XdgPortal
+    {
+        return Err("Portal shortcuts are configured by the desktop".into());
+    }
     resume_all_shortcuts(&app);
     Ok(())
 }
@@ -293,72 +939,146 @@ pub struct ImplementationChangeResult {
     pub reset_bindings: Vec<String>,
 }
 
-/// Change the keyboard implementation with runtime switching.
-/// This will unregister all shortcuts from the old implementation,
-/// validate shortcuts for the new implementation (resetting invalid ones to defaults),
-/// and register them with the new implementation.
+/// Change shortcut implementation without committing settings or dispatch
+/// ownership until the complete candidate backend is ready.
 #[tauri::command]
 #[specta::specta]
-pub fn change_keyboard_implementation_setting(
+pub async fn change_keyboard_implementation_setting(
     app: AppHandle,
     implementation: String,
 ) -> Result<ImplementationChangeResult, String> {
+    let new_impl = parse_keyboard_implementation(&implementation);
+    let runtime = app
+        .try_state::<ShortcutBackendRuntimeState>()
+        .ok_or("ShortcutBackendRuntimeState is not managed")?;
+    let _operation = runtime.operation.lock().await;
     let current_settings = settings::get_settings(&app);
     let current_impl = current_settings.keyboard_implementation;
-    let new_impl = parse_keyboard_implementation(&implementation);
-
-    // If same implementation, nothing to do
     if current_impl == new_impl {
         return Ok(ImplementationChangeResult {
             success: true,
             reset_bindings: vec![],
         });
     }
+    let old_backend = resolved_backend(current_impl);
+    let new_backend = resolved_backend(new_impl);
+    let mut proposed = current_settings.clone();
+    proposed.keyboard_implementation = new_impl;
+    let (candidate_bindings, reset_bindings) =
+        prepare_candidate_bindings(&mut proposed, new_backend)?;
 
     info!(
         "Switching keyboard implementation from {:?} to {:?}",
         current_impl, new_impl
     );
 
-    // Unregister all shortcuts from the current implementation
-    unregister_all_shortcuts(&app, current_impl);
+    match new_backend {
+        ShortcutBackendKind::XdgPortal => {
+            #[cfg(target_os = "linux")]
+            {
+                let holder = app
+                    .try_state::<PortalShortcutStateHolder>()
+                    .ok_or("PortalShortcutStateHolder is not managed")?;
+                let state = holder.get_or_create(&app).await?;
+                let specs = portal_specs(&proposed)?;
+                let persist_app = app.clone();
+                let persist_settings = proposed.clone();
+                state
+                    .replace_transactionally(specs, portal_parent(&app).await, move || {
+                        settings::write_settings(&persist_app, persist_settings);
+                        Ok(())
+                    })
+                    .await?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("portal routing is Linux-only");
+        }
+        ShortcutBackendKind::HandyKeys => {
+            handy_keys::register_candidate(&app, &candidate_bindings)?;
+            #[cfg(target_os = "linux")]
+            let portal_to_retire = if old_backend == ShortcutBackendKind::XdgPortal {
+                app.try_state::<PortalShortcutStateHolder>()
+                    .and_then(|holder| holder.current())
+            } else {
+                None
+            };
 
-    // Update the setting
-    let mut settings = settings::get_settings(&app);
-    settings.keyboard_implementation = new_impl;
-    settings::write_settings(&app, settings);
-
-    // Carbon fallback registrations use the Tauri plugin. Remove them before
-    // registering the full Tauri implementation to avoid duplicate conflicts.
-    if new_impl == KeyboardImplementation::Tauri {
-        crate::secure_input::reconcile_fallback(&app);
+            settings::write_settings(&app, proposed.clone());
+            let status = ShortcutBackendStatus::static_ready(ShortcutBackendKind::HandyKeys);
+            #[cfg(target_os = "linux")]
+            if let Some(state) = portal_to_retire {
+                let retiring_generation =
+                    state.with_active_pressed_binding_ids(|retiring_portal| {
+                        let generation =
+                            retiring_portal.as_ref().map(|(generation, _)| *generation);
+                        runtime.commit_with_retiring_portal(
+                            ShortcutDispatchSource::HandyKeys,
+                            status.clone(),
+                            retiring_portal,
+                        );
+                        generation
+                    });
+                let _ = app.emit("shortcut-backend-status-changed", status);
+                state.retire_active().await;
+                runtime.finish_portal_retirement(retiring_generation);
+            } else {
+                publish_runtime_status(&app, Some(ShortcutDispatchSource::HandyKeys), status);
+            }
+            #[cfg(not(target_os = "linux"))]
+            publish_runtime_status(&app, Some(ShortcutDispatchSource::HandyKeys), status);
+        }
+        ShortcutBackendKind::Tauri => {
+            // Carbon Secure Input shadows use this same native backend and
+            // would conflict with the Tauri candidate. Suspend them around the
+            // complete transition so a failed candidate restores Handy Keys
+            // first, then its prior shadows, without exposing a mixed backend.
+            let previous_bindings = active_bindings(&current_settings);
+            crate::secure_input::with_fallback_suspended(&app, || {
+                if old_backend == ShortcutBackendKind::HandyKeys {
+                    unregister_bindings_for_backend(&app, old_backend, &previous_bindings);
+                }
+                if let Err(error) = register_tauri_candidate(&app, &candidate_bindings) {
+                    if old_backend == ShortcutBackendKind::HandyKeys {
+                        if let Err(restore_error) =
+                            handy_keys::register_candidate(&app, &previous_bindings)
+                        {
+                            error!(
+                                "Failed to restore Handy Keys after Tauri candidate failure: {}",
+                                restore_error
+                            );
+                            return Err(format!(
+                                "{}; additionally failed to restore Handy Keys: {}",
+                                error, restore_error
+                            ));
+                        }
+                    }
+                    return Err(error);
+                }
+                settings::write_settings(&app, proposed.clone());
+                let status = ShortcutBackendStatus::static_ready(ShortcutBackendKind::Tauri);
+                publish_runtime_status(&app, Some(ShortcutDispatchSource::Tauri), status);
+                Ok(())
+            })?;
+        }
     }
 
-    // Initialize new implementation if needed (HandyKeys needs state)
-    if new_impl == KeyboardImplementation::HandyKeys && initialize_handy_keys_with_rollback(&app)? {
-        // Shortcuts already registered during init.
-        crate::secure_input::reconcile_fallback(&app);
-        return Ok(ImplementationChangeResult {
-            success: true,
-            reset_bindings: vec![],
-        });
+    // Candidate callbacks were gated until the commit above. Retiring the old
+    // non-portal registrations afterwards cannot create a duplicate dispatch window.
+    if old_backend != ShortcutBackendKind::XdgPortal
+        && !(old_backend == ShortcutBackendKind::HandyKeys
+            && new_backend == ShortcutBackendKind::Tauri)
+    {
+        unregister_bindings_for_backend(&app, old_backend, &active_bindings(&current_settings));
     }
-
-    // Register all shortcuts with new implementation, resetting invalid ones
-    let reset_bindings = register_all_shortcuts_for_implementation(&app, new_impl);
     crate::secure_input::reconcile_fallback(&app);
-
-    // Emit event to notify frontend of the change
     let _ = app.emit(
         "settings-changed",
         serde_json::json!({
             "setting": "keyboard_implementation",
             "value": implementation,
-            "reset_bindings": reset_bindings
+            "reset_bindings": reset_bindings,
         }),
     );
-
-    info!("Keyboard implementation switched to {:?}", new_impl);
 
     Ok(ImplementationChangeResult {
         success: true,
@@ -366,7 +1086,7 @@ pub fn change_keyboard_implementation_setting(
     })
 }
 
-/// Get the current keyboard implementation
+/// Get the current persisted keyboard implementation.
 #[tauri::command]
 #[specta::specta]
 pub fn get_keyboard_implementation(app: AppHandle) -> String {
@@ -377,22 +1097,30 @@ pub fn get_keyboard_implementation(app: AppHandle) -> String {
     }
 }
 
-// ============================================================================
-// Validation Helpers
-// ============================================================================
+fn validate_shortcut_for_backend(raw: &str, backend: ShortcutBackendKind) -> Result<(), String> {
+    match backend {
+        ShortcutBackendKind::Tauri => tauri_impl::validate_shortcut(raw),
+        ShortcutBackendKind::HandyKeys => handy_keys::validate_shortcut(raw),
+        ShortcutBackendKind::XdgPortal => {
+            #[cfg(target_os = "linux")]
+            {
+                portal_impl::portal_trigger_from_binding(raw).map(|_| ())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err("Portal shortcuts are unavailable on this platform".into())
+            }
+        }
+    }
+}
 
-/// Validate a shortcut for a specific implementation
 fn validate_shortcut_for_implementation(
     raw: &str,
     implementation: KeyboardImplementation,
 ) -> Result<(), String> {
-    match implementation {
-        KeyboardImplementation::Tauri => tauri_impl::validate_shortcut(raw),
-        KeyboardImplementation::HandyKeys => handy_keys::validate_shortcut(raw),
-    }
+    validate_shortcut_for_backend(raw, resolved_backend(implementation))
 }
 
-/// Parse a keyboard implementation string into the enum
 fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
     match s {
         "tauri" => KeyboardImplementation::Tauri,
@@ -407,117 +1135,86 @@ fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
     }
 }
 
-/// Unregister all shortcuts for the current implementation
-fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementation) {
-    let bindings = settings::get_bindings(app);
-
-    for (id, binding) in bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
-            continue;
-        }
-
-        let result = match implementation {
-            KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
-            KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
-        };
-
-        if let Err(e) = result {
-            warn!(
-                "Failed to unregister shortcut '{}' during switch: {}",
-                id, e
-            );
-        }
-    }
+fn active_bindings(settings: &crate::settings::AppSettings) -> Vec<ShortcutBinding> {
+    settings
+        .bindings
+        .iter()
+        .filter(|(id, _)| {
+            id.as_str() != "cancel"
+                && (id.as_str() != "transcribe_with_post_process" || settings.post_process_enabled)
+        })
+        .map(|(_, binding)| binding.clone())
+        .collect()
 }
 
-/// Register all shortcuts for a specific implementation, validating and resetting invalid ones
-fn register_all_shortcuts_for_implementation(
-    app: &AppHandle,
-    implementation: KeyboardImplementation,
-) -> Vec<String> {
+fn prepare_candidate_bindings(
+    proposed: &mut crate::settings::AppSettings,
+    backend: ShortcutBackendKind,
+) -> Result<(Vec<ShortcutBinding>, Vec<String>), String> {
+    let defaults = settings::get_default_settings().bindings;
     let mut reset_bindings = Vec::new();
-    let default_bindings = settings::get_default_settings().bindings;
-    let mut current_settings = settings::get_settings(app);
-
-    for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+    let mut bindings = Vec::new();
+    for (id, default_binding) in defaults {
+        if id == "cancel"
+            || (id == "transcribe_with_post_process" && !proposed.post_process_enabled)
+        {
             continue;
         }
-
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
-            continue;
-        }
-
-        let mut binding = current_settings
+        let mut binding = proposed
             .bindings
-            .get(id)
+            .get(&id)
             .cloned()
             .unwrap_or_else(|| default_binding.clone());
-
-        // Validate the shortcut for the target implementation
-        if let Err(e) =
-            validate_shortcut_for_implementation(&binding.current_binding, implementation)
-        {
+        if let Err(error) = validate_shortcut_for_backend(&binding.current_binding, backend) {
             info!(
                 "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
-                id, binding.current_binding, implementation, e
+                id, binding.current_binding, backend, error
             );
-
-            // Reset to default
             binding.current_binding = default_binding.current_binding.clone();
-            current_settings
-                .bindings
-                .insert(id.clone(), binding.clone());
-            reset_bindings.push(id.clone());
+            validate_shortcut_for_backend(&binding.current_binding, backend)?;
+            proposed.bindings.insert(id.clone(), binding.clone());
+            reset_bindings.push(id);
         }
-
-        // Register with the appropriate implementation
-        let result = match implementation {
-            KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
-            KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
-        };
-
-        if let Err(e) = result {
-            error!(
-                "Failed to register shortcut '{}' for {:?}: {}",
-                id, implementation, e
-            );
-        }
+        bindings.push(binding);
     }
-
-    // Save settings if any bindings were reset
-    if !reset_bindings.is_empty() {
-        settings::write_settings(app, current_settings);
-    }
-
-    reset_bindings
+    Ok((bindings, reset_bindings))
 }
 
-/// Initialize HandyKeys if not already initialized, with rollback on failure
-fn initialize_handy_keys_with_rollback(app: &AppHandle) -> Result<bool, String> {
-    if app.try_state::<handy_keys::HandyKeysState>().is_some() {
-        return Ok(false); // Already initialized, caller should continue
+fn register_tauri_candidate(app: &AppHandle, bindings: &[ShortcutBinding]) -> Result<(), String> {
+    let mut registered = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if let Err(error) = tauri_impl::register_shortcut(app, binding.clone()) {
+            for registered_binding in registered.into_iter().rev() {
+                let _ = tauri_impl::unregister_shortcut(app, registered_binding);
+            }
+            return Err(format!(
+                "Failed to register system shortcut '{}': {}",
+                binding.id, error
+            ));
+        }
+        registered.push(binding.clone());
     }
+    Ok(())
+}
 
-    if let Err(e) = handy_keys::init_shortcuts(app) {
-        error!("Failed to initialize HandyKeys: {}", e);
-        // Rollback to Tauri
-        let mut settings = settings::get_settings(app);
-        settings.keyboard_implementation = KeyboardImplementation::Tauri;
-        settings::write_settings(app, settings);
-        crate::secure_input::reconcile_fallback(app);
-        tauri_impl::init_shortcuts(app);
-        return Err(format!(
-            "Failed to initialize HandyKeys: {}. Reverted to Tauri.",
-            e
-        ));
+fn unregister_bindings_for_backend(
+    app: &AppHandle,
+    backend: ShortcutBackendKind,
+    bindings: &[ShortcutBinding],
+) {
+    for binding in bindings {
+        let result = match backend {
+            ShortcutBackendKind::Tauri => tauri_impl::unregister_shortcut(app, binding.clone()),
+            ShortcutBackendKind::HandyKeys => handy_keys::unregister_shortcut(app, binding.clone()),
+            ShortcutBackendKind::XdgPortal => continue,
+        };
+        if let Err(error) = result {
+            warn!(
+                "Failed to retire shortcut '{}' from {:?}: {}",
+                binding.id, backend, error
+            );
+        }
     }
-
-    // init_shortcuts already registered shortcuts
-    Ok(true)
 }
 
 // ============================================================================
@@ -982,24 +1679,58 @@ pub fn change_auto_submit_key_setting(app: AppHandle, key: String) -> Result<(),
 
 #[tauri::command]
 #[specta::specta]
-pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
-    let mut settings = settings::get_settings(&app);
-    settings.post_process_enabled = enabled;
-    settings::write_settings(&app, settings.clone());
+pub async fn change_post_process_enabled_setting(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let runtime = app
+        .try_state::<ShortcutBackendRuntimeState>()
+        .ok_or("ShortcutBackendRuntimeState is not managed")?;
+    let _operation = runtime.operation.lock().await;
+    let current = settings::get_settings(&app);
+    if current.post_process_enabled == enabled {
+        return Ok(());
+    }
+    let backend = resolved_backend(current.keyboard_implementation);
+    let mut proposed = current.clone();
+    proposed.post_process_enabled = enabled;
 
-    // Register or unregister the post-processing shortcut
-    if let Some(binding) = settings
+    if backend == ShortcutBackendKind::XdgPortal {
+        #[cfg(target_os = "linux")]
+        {
+            let holder = app
+                .try_state::<PortalShortcutStateHolder>()
+                .ok_or("PortalShortcutStateHolder is not managed")?;
+            let state = holder.get_or_create(&app).await?;
+            let persist_app = app.clone();
+            state
+                .replace_transactionally(
+                    portal_specs(&proposed)?,
+                    portal_parent(&app).await,
+                    move || {
+                        settings::write_settings(&persist_app, proposed);
+                        Ok(())
+                    },
+                )
+                .await?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!("portal routing is Linux-only");
+    }
+
+    if let Some(binding) = proposed
         .bindings
         .get("transcribe_with_post_process")
         .cloned()
     {
         if enabled {
-            let _ = register_shortcut(&app, binding);
+            register_shortcut(&app, binding)?;
         } else {
-            let _ = unregister_shortcut(&app, binding);
+            unregister_shortcut(&app, binding)?;
         }
     }
-
+    settings::write_settings(&app, proposed);
     crate::secure_input::reconcile_fallback(&app);
     Ok(())
 }
@@ -1396,4 +2127,148 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
     tauri::async_runtime::spawn_blocking(crate::managers::transcription::get_available_accelerators)
         .await
         .expect("get_available_accelerators panicked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_commit_switches_dispatch_source_and_status_together() {
+        let runtime = ShortcutBackendRuntimeState::default();
+        {
+            let initial = runtime.snapshot.read();
+            assert_eq!(initial.active, None);
+            assert_eq!(initial.status.backend, ShortcutBackendKind::Tauri);
+            assert_eq!(initial.status.state, ShortcutBackendState::Initializing);
+        }
+
+        let ready = ShortcutBackendStatus {
+            backend: ShortcutBackendKind::XdgPortal,
+            state: ShortcutBackendState::Ready,
+            message: None,
+            bindings: HashMap::from([("transcribe".into(), "F8".into())]),
+            can_configure: true,
+        };
+        runtime.commit(ShortcutDispatchSource::Portal(7), ready.clone());
+        {
+            let committed = runtime.snapshot.read();
+            assert_eq!(committed.active, Some(ShortcutDispatchSource::Portal(7)));
+            assert_eq!(committed.status, ready);
+        }
+
+        let unavailable = ShortcutBackendStatus {
+            backend: ShortcutBackendKind::XdgPortal,
+            state: ShortcutBackendState::Unavailable,
+            message: Some("The desktop shortcut session ended unexpectedly".into()),
+            bindings: HashMap::new(),
+            can_configure: true,
+        };
+        runtime.set_status(unavailable.clone());
+        let changed = runtime.snapshot.read();
+        assert_eq!(changed.active, Some(ShortcutDispatchSource::Portal(7)));
+        assert_eq!(changed.status, unavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retiring_releases(generation: u64, binding_ids: &[&str]) -> Option<RetiringPortalReleases> {
+        Some(RetiringPortalReleases {
+            generation,
+            binding_ids: binding_ids.iter().map(|id| (*id).to_string()).collect(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_cutover_held_portal_release_is_accepted_once() {
+        let mut retiring = retiring_releases(7, &["transcribe"]);
+        assert!(callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::Portal(7),
+            "transcribe",
+            false,
+        ));
+        assert!(!callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::Portal(7),
+            "transcribe",
+            false,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_cutover_portal_press_and_release_are_rejected() {
+        let mut retiring = retiring_releases(7, &[]);
+        assert!(!callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::Portal(7),
+            "transcribe",
+            true,
+        ));
+        assert!(!callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::Portal(7),
+            "transcribe",
+            false,
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_handy_press_cancels_matching_portal_release_authorization() {
+        let mut retiring = retiring_releases(7, &["transcribe"]);
+        assert!(callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::HandyKeys,
+            "transcribe",
+            true,
+        ));
+        assert!(!callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::Portal(7),
+            "transcribe",
+            false,
+        ));
+        assert!(callback_matches_runtime(
+            Some(ShortcutDispatchSource::HandyKeys),
+            &mut retiring,
+            ShortcutDispatchSource::HandyKeys,
+            "transcribe",
+            false,
+        ));
+    }
+
+    #[test]
+    fn dropped_initialization_leader_unblocks_attempt_for_retry() {
+        let initialization = ShortcutInitializationState::default();
+        {
+            let mut flight = initialization.flight.lock();
+            flight.running = true;
+            flight.attempt = 1;
+        }
+        {
+            let _leader = InitializationLeaderGuard {
+                initialization: &initialization,
+                attempt: 1,
+                armed: true,
+            };
+        }
+
+        let flight = initialization.flight.lock();
+        assert!(!flight.running);
+        assert!(!flight.successful);
+        let (attempt, result) = flight.result.as_ref().expect("cancellation result");
+        assert_eq!(*attempt, 1);
+        assert_eq!(
+            result.as_ref().unwrap_err(),
+            "Shortcut initialization attempt was cancelled"
+        );
+    }
 }

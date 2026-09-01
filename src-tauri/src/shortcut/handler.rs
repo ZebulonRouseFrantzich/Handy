@@ -13,25 +13,18 @@ use crate::settings::get_settings;
 use crate::transcription_coordinator::is_transcribe_binding;
 use crate::TranscriptionCoordinator;
 
-/// Handle a shortcut event from either implementation.
-///
-/// This function contains the shared logic for:
-/// - Looking up the action in ACTION_MAP
-/// - Handling the cancel binding (only fires when recording)
-/// - Handling push-to-talk mode (start on press, stop on release)
-/// - Handling toggle mode (toggle state on press only)
-///
-/// # Arguments
-/// * `app` - The Tauri app handle
-/// * `binding_id` - The ID of the binding (e.g., "transcribe", "cancel")
-/// * `hotkey_string` - The string representation of the hotkey
-/// * `is_pressed` - Whether this is a key press (true) or release (false)
+/// Handle a shortcut event from one of the runtime shortcut backends.
 pub fn handle_shortcut_event(
     app: &AppHandle,
+    source: super::ShortcutDispatchSource,
     binding_id: &str,
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    if !super::shortcut_callback_is_active(app, source, binding_id, is_pressed) {
+        return;
+    }
+
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.

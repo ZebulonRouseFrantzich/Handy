@@ -102,6 +102,17 @@ pub fn reconcile_fallback(app: &AppHandle) {
     imp::reconcile_fallback(app)
 }
 
+/// Temporarily remove active Carbon shadow grabs while attempting a backend
+/// transition. A failed transition restores the exact prior shadow set before
+/// returning; a successful transition leaves it suspended for reconciliation
+/// against the newly committed backend.
+pub(crate) fn with_fallback_suspended<T>(
+    app: &AppHandle,
+    transition: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    imp::with_fallback_suspended(app, transition)
+}
+
 /// Managed state + monitor startup. On non-macOS platforms the state exists
 /// but the monitor never runs and everything reports disabled.
 pub fn init(app: &AppHandle) {
@@ -472,6 +483,87 @@ mod imp {
         false
     }
 
+    fn mark_restoration_failure(fallback: &mut FallbackState, binding: &ShortcutBinding) {
+        fallback.registered.retain(|registered| {
+            registered.id != binding.id || registered.current_binding != binding.current_binding
+        });
+        fallback.covered.retain(|id| id != &binding.id);
+        fallback.degraded.retain(|id| id != &binding.id);
+        if !fallback.uncovered.contains(&binding.id) {
+            fallback.uncovered.push(binding.id.clone());
+        }
+    }
+
+    fn restore_suspended_registrations(
+        app: &AppHandle,
+        fallback: &mut FallbackState,
+        bindings: &[ShortcutBinding],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for binding in bindings {
+            if let Err(error) = crate::shortcut::tauri_impl::register_shortcut(app, binding.clone())
+            {
+                mark_restoration_failure(fallback, binding);
+                errors.push(format!("'{}': {}", binding.current_binding, error));
+            }
+        }
+        errors
+    }
+
+    pub fn with_fallback_suspended<T>(
+        app: &AppHandle,
+        transition: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let state = app.state::<SecureInputState>();
+        let _operation = state.fallback_operation.lock().unwrap();
+        let mut previous = {
+            let mut fallback = state.fallback.lock().unwrap();
+            std::mem::take(&mut *fallback)
+        };
+
+        let registered = previous.registered.clone();
+        let mut removed = Vec::with_capacity(registered.len());
+        for binding in &registered {
+            if let Err(error) =
+                crate::shortcut::tauri_impl::unregister_shortcut(app, binding.clone())
+            {
+                let restoration_errors =
+                    restore_suspended_registrations(app, &mut previous, &removed);
+                *state.fallback.lock().unwrap() = previous;
+                let mut message = format!(
+                    "Failed to suspend Secure Input fallback '{}': {}",
+                    binding.current_binding, error
+                );
+                if !restoration_errors.is_empty() {
+                    message.push_str(&format!(
+                        "; additionally failed to restore {}",
+                        restoration_errors.join(", ")
+                    ));
+                }
+                return Err(message);
+            }
+            removed.push(binding.clone());
+        }
+
+        match transition() {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let restoration_errors =
+                    restore_suspended_registrations(app, &mut previous, &removed);
+                *state.fallback.lock().unwrap() = previous;
+                if restoration_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(format!(
+                        "{}; additionally failed to restore Secure Input fallback {}",
+                        error,
+                        restoration_errors.join(", ")
+                    ))
+                }
+            }
+        }
+    }
+
     /// Rebuild the fallback from current state. The operation mutex serializes
     /// reconciliations, while the fallback mutex is released before every
     /// global-shortcut plugin call to avoid lock-order inversion with callbacks.
@@ -666,6 +758,13 @@ mod imp {
     pub fn unregister_cancel_fallback(_app: &AppHandle) {}
 
     pub fn reconcile_fallback(_app: &AppHandle) {}
+
+    pub fn with_fallback_suspended<T>(
+        _app: &AppHandle,
+        transition: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        transition()
+    }
 
     pub async fn run_diagnostic(_duration_secs: u32) -> Result<KeyboardDiagnosticReport, String> {
         Err("The keyboard diagnostic is only supported on macOS".to_string())

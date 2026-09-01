@@ -5,6 +5,7 @@ import type {
   AppSettings as Settings,
   AudioDevice,
   TranscribeAcceleratorSetting,
+  ShortcutBackendStatus,
   OrtAcceleratorSetting,
   VadBackend,
   ProgressiveOutputDestination,
@@ -16,6 +17,7 @@ interface SettingsStore {
   settings: Settings | null;
   defaultSettings: Settings | null;
   isLoading: boolean;
+  shortcutBackendStatus: ShortcutBackendStatus | null;
   isUpdating: Record<string, boolean>;
   audioDevices: AudioDevice[];
   outputDevices: AudioDevice[];
@@ -31,6 +33,7 @@ interface SettingsStore {
   ) => Promise<void>;
   resetSetting: (key: keyof Settings) => Promise<void>;
   refreshSettings: () => Promise<void>;
+  refreshShortcutBackendStatus: () => Promise<void>;
   refreshAudioDevices: () => Promise<void>;
   refreshOutputDevices: () => Promise<void>;
   updateBinding: (id: string, binding: string) => Promise<void>;
@@ -59,6 +62,7 @@ interface SettingsStore {
 
   // Internal state setters
   setSettings: (settings: Settings | null) => void;
+  setShortcutBackendStatus: (status: ShortcutBackendStatus | null) => void;
   setDefaultSettings: (defaultSettings: Settings | null) => void;
   setLoading: (loading: boolean) => void;
   setUpdating: (key: string, updating: boolean) => void;
@@ -148,8 +152,14 @@ const settingUpdaters: {
   auto_submit_key: (value) =>
     commands.changeAutoSubmitKeySetting(value as string),
   history_limit: (value) => commands.updateHistoryLimit(value as number),
-  post_process_enabled: (value) =>
-    commands.changePostProcessEnabledSetting(value as boolean),
+  post_process_enabled: async (value) => {
+    const result = await commands.changePostProcessEnabledSetting(
+      value as boolean,
+    );
+    if (result.status === "error") {
+      throw new Error(result.error);
+    }
+  },
   post_process_selected_prompt_id: (value) =>
     commands.setPostProcessSelectedPrompt(value as string),
   mute_while_recording: (value) =>
@@ -215,6 +225,7 @@ export const useSettingsStore = create<SettingsStore>()(
   subscribeWithSelector((set, get) => ({
     settings: null,
     defaultSettings: null,
+    shortcutBackendStatus: null,
     isLoading: true,
     isUpdating: {},
     audioDevices: [],
@@ -226,6 +237,8 @@ export const useSettingsStore = create<SettingsStore>()(
     setSettings: (settings) => set({ settings }),
     setDefaultSettings: (defaultSettings) => set({ defaultSettings }),
     setLoading: (isLoading) => set({ isLoading }),
+    setShortcutBackendStatus: (shortcutBackendStatus) =>
+      set({ shortcutBackendStatus }),
     setUpdating: (key, updating) =>
       set((state) => ({
         isUpdating: { ...state.isUpdating, [key]: updating },
@@ -260,6 +273,14 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (error) {
         console.error("Failed to load settings:", error);
         set({ isLoading: false });
+      }
+    },
+    refreshShortcutBackendStatus: async () => {
+      try {
+        const shortcutBackendStatus = await commands.getShortcutBackendStatus();
+        set({ shortcutBackendStatus });
+      } catch (error) {
+        console.error("Failed to load shortcut backend status:", error);
       }
     },
 
@@ -347,7 +368,12 @@ export const useSettingsStore = create<SettingsStore>()(
         }
       } catch (error) {
         console.error(`Failed to update setting ${String(key)}:`, error);
-        if (settings) {
+        if (key === "post_process_enabled") {
+          await Promise.all([
+            get().refreshSettings(),
+            get().refreshShortcutBackendStatus(),
+          ]);
+        } else if (settings) {
           set({ settings: { ...settings, [key]: originalValue } });
         }
       } finally {

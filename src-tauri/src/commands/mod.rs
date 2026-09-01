@@ -161,28 +161,30 @@ pub fn initialize_enigo(app: AppHandle) -> Result<(), String> {
     }
 }
 
-/// Marker state to track if shortcuts have been initialized.
+/// Marker state installed only after a shortcut backend reaches Ready or Partial.
 pub struct ShortcutsInitialized;
 
-/// Initialize keyboard shortcuts.
-/// On macOS, this should be called after accessibility permissions are granted.
-/// This is idempotent - calling it multiple times is safe.
+/// Initialize keyboard shortcuts after platform permissions are available.
+/// Concurrent calls share the same backend attempt and later calls are idempotent.
 #[specta::specta]
 #[tauri::command]
-pub fn initialize_shortcuts(app: AppHandle) -> Result<(), String> {
-    // Check if already initialized
+pub async fn initialize_shortcuts(
+    app: AppHandle,
+) -> Result<crate::shortcut::ShortcutBackendStatus, String> {
     if app.try_state::<ShortcutsInitialized>().is_some() {
         log::debug!("Shortcuts already initialized");
-        return Ok(());
+        return Ok(crate::shortcut::get_shortcut_backend_status(app));
     }
 
-    // Initialize shortcuts
-    crate::shortcut::init_shortcuts(&app);
-
-    // Mark as initialized before reconciling the macOS Secure Input fallback.
-    app.manage(ShortcutsInitialized);
-    crate::secure_input::reconcile_fallback(&app);
-
-    log::info!("Shortcuts initialized successfully");
-    Ok(())
+    let status = crate::shortcut::init_shortcuts(&app).await?;
+    if matches!(
+        status.state,
+        crate::shortcut::ShortcutBackendState::Ready
+            | crate::shortcut::ShortcutBackendState::Partial
+    ) {
+        app.manage(ShortcutsInitialized);
+        crate::secure_input::reconcile_fallback(&app);
+        log::info!("Shortcuts initialized successfully");
+    }
+    Ok(status)
 }

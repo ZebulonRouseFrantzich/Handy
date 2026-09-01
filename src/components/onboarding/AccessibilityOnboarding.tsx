@@ -24,6 +24,19 @@ interface PermissionsState {
   accessibility: PermissionStatus;
   microphone: PermissionStatus;
 }
+const initializeInputServices = async () => {
+  const [enigoResult, shortcutResult] = await Promise.all([
+    commands.initializeEnigo(),
+    commands.initializeShortcuts(),
+  ]);
+
+  if (enigoResult.status === "error") {
+    console.warn("Failed to initialize Enigo:", enigoResult.error);
+  }
+  if (shortcutResult.status === "error") {
+    console.warn("Failed to initialize shortcuts:", shortcutResult.error);
+  }
+};
 
 const AccessibilityOnboarding: React.FC<AccessibilityOnboardingProps> = ({
   onComplete,
@@ -103,12 +116,12 @@ const AccessibilityOnboarding: React.FC<AccessibilityOnboardingProps> = ({
           // If accessibility is granted, initialize Enigo and shortcuts
           if (accessibilityGranted) {
             try {
-              await Promise.all([
-                commands.initializeEnigo(),
-                commands.initializeShortcuts(),
-              ]);
-            } catch (e) {
-              console.warn("Failed to initialize after permission grant:", e);
+              await initializeInputServices();
+            } catch (error) {
+              console.warn(
+                "Failed to initialize after permission grant:",
+                error,
+              );
             }
           }
 
@@ -193,11 +206,11 @@ const AccessibilityOnboarding: React.FC<AccessibilityOnboardingProps> = ({
           if (accessibilityGranted && prev.accessibility !== "granted") {
             newState.accessibility = "granted";
             // Initialize Enigo and shortcuts when accessibility is granted
-            Promise.all([
-              commands.initializeEnigo(),
-              commands.initializeShortcuts(),
-            ]).catch((e) => {
-              console.warn("Failed to initialize after permission grant:", e);
+            void initializeInputServices().catch((error) => {
+              console.warn(
+                "Failed to initialize after permission grant:",
+                error,
+              );
             });
           }
 

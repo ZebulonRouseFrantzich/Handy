@@ -64,6 +64,12 @@ pub static FILE_LOG_LEVEL: AtomicU8 = AtomicU8::new(log::LevelFilter::Debug as u
 /// and whenever debug mode is toggled (see `shortcut::change_debug_mode_setting`).
 pub static WEBVIEW_LOG_STREAMING: AtomicBool = AtomicBool::new(false);
 
+#[derive(Default)]
+struct ShortcutExitState {
+    shutdown_started: AtomicBool,
+    exit_ready: AtomicBool,
+}
+
 fn level_filter_from_u8(value: u8) -> log::LevelFilter {
     match value {
         0 => log::LevelFilter::Off,
@@ -688,6 +694,8 @@ pub fn run(cli_args: CliArgs) {
             shortcut::change_whats_new_last_seen_version_setting,
             shortcut::change_keyboard_implementation_setting,
             shortcut::get_keyboard_implementation,
+            shortcut::get_shortcut_backend_status,
+            shortcut::configure_system_shortcuts,
             shortcut::change_show_tray_icon_setting,
             focused_output::commands::get_focused_output_capability,
             focused_output::commands::get_focused_output_status,
@@ -858,6 +866,17 @@ pub fn run(cli_args: CliArgs) {
                 show_main_window(app);
             }
         }));
+    }
+
+    // Install shortcut lifecycle state before the invoke handler can accept
+    // frontend commands, preventing initialization from racing construction.
+    builder = builder
+        .manage(shortcut::ShortcutBackendRuntimeState::default())
+        .manage(shortcut::ShortcutInitializationState::default())
+        .manage(ShortcutExitState::default());
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.manage(shortcut::PortalShortcutStateHolder::default());
     }
 
     builder
@@ -1064,6 +1083,45 @@ pub fn run(cli_args: CliArgs) {
                     tray::recreate_tray_icon(app);
                 }
                 show_main_window(app);
+            }
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                // Tauri deliberately ignores prevent_exit for restart requests.
+                // Do not start a teardown task that the restart cannot await.
+                if *code == Some(tauri::RESTART_EXIT_CODE) {
+                    return;
+                }
+
+                let Some(exit_state) = app.try_state::<ShortcutExitState>() else {
+                    log::error!("Shortcut exit state is unavailable; proceeding with exit");
+                    return;
+                };
+                if exit_state.exit_ready.load(Ordering::Acquire) {
+                    return;
+                }
+
+                api.prevent_exit();
+                if exit_state.shutdown_started.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+
+                let app_handle = app.clone();
+                let exit_code = code.unwrap_or(0);
+                tauri::async_runtime::spawn(async move {
+                    #[cfg(target_os = "linux")]
+                    if let Some(portal) = app_handle
+                        .try_state::<shortcut::PortalShortcutStateHolder>()
+                        .and_then(|holder| holder.current())
+                    {
+                        portal.shutdown().await;
+                    }
+
+                    if let Some(exit_state) = app_handle.try_state::<ShortcutExitState>() {
+                        exit_state.exit_ready.store(true, Ordering::Release);
+                    } else {
+                        log::error!("Shortcut exit state disappeared after teardown; forcing exit");
+                    }
+                    app_handle.exit(exit_code);
+                });
             }
             // Teardown transcribe.cpp before exit
             tauri::RunEvent::Exit => {

@@ -18,7 +18,7 @@ import { Sidebar, SidebarSection, SECTIONS_CONFIG } from "./components/Sidebar";
 import { WhatsNewGate } from "./components/whats-new";
 import { useSettings } from "./hooks/useSettings";
 import { useSettingsStore } from "./stores/settingsStore";
-import { commands, events } from "@/bindings";
+import { commands, events, type ShortcutBackendStatus } from "@/bindings";
 import { getLanguageDirection, initializeRTL } from "@/lib/utils/rtl";
 
 type OnboardingStep = "accessibility" | "model" | "done";
@@ -49,6 +49,12 @@ function App() {
   const refreshOutputDevices = useSettingsStore(
     (state) => state.refreshOutputDevices,
   );
+  const setShortcutBackendStatus = useSettingsStore(
+    (state) => state.setShortcutBackendStatus,
+  );
+  const refreshShortcutBackendStatus = useSettingsStore(
+    (state) => state.refreshShortcutBackendStatus,
+  );
   const hasCompletedPostOnboardingInit = useRef(false);
   const notifiedFocusedOutputSessionsRef = useRef<Set<number> | null>(null);
   if (notifiedFocusedOutputSessionsRef.current === null) {
@@ -66,20 +72,95 @@ function App() {
     initializeRTL(i18n.language);
   }, [i18n.language]);
 
-  // Initialize Enigo, shortcuts, and refresh audio devices when main app loads
+  // Subscribe before initializing so an early unavailable status cannot be missed.
   useEffect(() => {
-    if (onboardingStep === "done" && !hasCompletedPostOnboardingInit.current) {
-      hasCompletedPostOnboardingInit.current = true;
-      Promise.all([
-        commands.initializeEnigo(),
-        commands.initializeShortcuts(),
-      ]).catch((e) => {
-        console.warn("Failed to initialize:", e);
-      });
-      refreshAudioDevices();
-      refreshOutputDevices();
-    }
-  }, [onboardingStep, refreshAudioDevices, refreshOutputDevices]);
+    if (onboardingStep !== "done") return;
+
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    let lastObservedState =
+      useSettingsStore.getState().shortcutBackendStatus?.state;
+
+    const applyShortcutBackendStatus = (status: ShortcutBackendStatus) => {
+      if (disposed) return;
+
+      const previousState = lastObservedState;
+      lastObservedState = status.state;
+      setShortcutBackendStatus(status);
+      if (previousState !== "unavailable" && status.state === "unavailable") {
+        toast.error(i18n.t("settings.general.shortcut.portal.unavailable"));
+      }
+    };
+
+    const initialize = async () => {
+      try {
+        try {
+          const unlisten = await listen<ShortcutBackendStatus>(
+            "shortcut-backend-status-changed",
+            (event) => applyShortcutBackendStatus(event.payload),
+          );
+          if (disposed) {
+            unlisten();
+            return;
+          }
+          stopListening = unlisten;
+        } catch (error) {
+          if (disposed) return;
+          console.warn("Failed to listen for shortcut backend status:", error);
+        }
+
+        if (disposed) return;
+
+        if (!hasCompletedPostOnboardingInit.current) {
+          hasCompletedPostOnboardingInit.current = true;
+          void refreshAudioDevices();
+          void refreshOutputDevices();
+
+          const [enigoResult, shortcutResult] = await Promise.all([
+            commands.initializeEnigo(),
+            commands.initializeShortcuts(),
+          ]);
+
+          if (enigoResult.status === "error") {
+            console.warn("Failed to initialize Enigo:", enigoResult.error);
+          }
+          if (shortcutResult.status === "error") {
+            console.warn(
+              "Failed to initialize shortcuts:",
+              shortcutResult.error,
+            );
+          } else {
+            applyShortcutBackendStatus(shortcutResult.data);
+          }
+        }
+      } catch (error) {
+        console.warn("Failed to initialize application services:", error);
+      } finally {
+        if (disposed) return;
+
+        await refreshShortcutBackendStatus();
+        const refreshedStatus =
+          useSettingsStore.getState().shortcutBackendStatus;
+        if (refreshedStatus) {
+          applyShortcutBackendStatus(refreshedStatus);
+        }
+      }
+    };
+
+    void initialize();
+
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, [
+    onboardingStep,
+    refreshAudioDevices,
+    refreshOutputDevices,
+    refreshShortcutBackendStatus,
+    setShortcutBackendStatus,
+    i18n,
+  ]);
 
   // Handle keyboard shortcuts for debug mode toggle
   useEffect(() => {

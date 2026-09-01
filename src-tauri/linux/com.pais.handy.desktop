@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Handy
+Exec=handy
+Icon=handy
+Terminal=false
+Categories=Utility;
+NoDisplay=true

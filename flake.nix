@@ -42,6 +42,7 @@
         libayatana-appindicator
         libevdev
         libxtst
+        libxkbcommon
         gtk-layer-shell
         openssl
         vulkan-loader
@@ -170,6 +171,12 @@
                 --set WEBKIT_DMABUF_RENDERER_FORCE_SHM 1
                 --set ALSA_PLUGIN_DIR "${combinedAlsaPlugins}"
               )
+            '';
+
+            postInstall = ''
+              install -Dm444 \
+                src-tauri/linux/com.pais.handy.desktop \
+                $out/share/applications/com.pais.handy.desktop
             '';
 
             meta = {

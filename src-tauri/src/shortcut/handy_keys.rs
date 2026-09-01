@@ -40,7 +40,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::settings::{self, get_settings, ShortcutBinding};
 
-use super::handler::handle_shortcut_event;
+use super::{handler::handle_shortcut_event, ShortcutDispatchSource};
 
 /// Commands that can be sent to the hotkey manager thread
 enum ManagerCommand {
@@ -132,7 +132,13 @@ impl HandyKeysState {
                         binding_id, hotkey_string, event.state
                     );
                     let is_pressed = event.state == HotkeyState::Pressed;
-                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
+                    handle_shortcut_event(
+                        &app,
+                        ShortcutDispatchSource::HandyKeys,
+                        binding_id,
+                        hotkey_string,
+                        is_pressed,
+                    );
                 }
             }
 
@@ -421,38 +427,62 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
         .map_err(|e| format!("Invalid shortcut for HandyKeys: {}", e))
 }
 
-/// Initialize handy-keys shortcuts
-pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let state = HandyKeysState::new(app.clone())?;
-
-    let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
-
-    // Register all bindings except cancel (which is dynamic)
-    for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue;
-        }
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
-            continue;
-        }
-
-        let binding = user_settings
-            .bindings
-            .get(&id)
-            .cloned()
-            .unwrap_or(default_binding);
-
-        if let Err(e) = state.register(&binding) {
-            error!(
-                "Failed to register handy-keys shortcut {} during init: {}",
-                id, e
-            );
-        }
+/// Lazily construct the one managed handy-keys manager.
+pub fn ensure_state(app: &AppHandle) -> Result<(), String> {
+    if app.try_state::<HandyKeysState>().is_some() {
+        return Ok(());
     }
 
-    app.manage(state);
+    let state = HandyKeysState::new(app.clone())?;
+    if !app.manage(state) && app.try_state::<HandyKeysState>().is_none() {
+        return Err("Failed to manage HandyKeysState".into());
+    }
+    Ok(())
+}
+
+/// Register a complete inactive candidate and roll back every successful grab
+/// when any later registration fails.
+pub fn register_candidate(app: &AppHandle, bindings: &[ShortcutBinding]) -> Result<(), String> {
+    ensure_state(app)?;
+    let state = app
+        .try_state::<HandyKeysState>()
+        .ok_or("HandyKeysState not initialized")?;
+    let mut registered = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if let Err(error) = state.register(binding) {
+            for registered_binding in registered.iter().rev() {
+                let _ = state.unregister(registered_binding);
+            }
+            return Err(format!(
+                "Failed to register handy-keys shortcut '{}': {}",
+                binding.id, error
+            ));
+        }
+        registered.push(binding.clone());
+    }
+    Ok(())
+}
+
+/// Initialize handy-keys shortcuts transactionally.
+pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
+    let default_bindings = settings::get_default_settings().bindings;
+    let user_settings = settings::load_or_create_app_settings(app);
+    let bindings: Vec<_> = default_bindings
+        .into_iter()
+        .filter(|(id, _)| {
+            id != "cancel"
+                && (id != "transcribe_with_post_process" || user_settings.post_process_enabled)
+        })
+        .map(|(id, default_binding)| {
+            user_settings
+                .bindings
+                .get(&id)
+                .cloned()
+                .unwrap_or(default_binding)
+        })
+        .collect();
+
+    register_candidate(app, &bindings)?;
     info!("handy-keys shortcuts initialized");
     Ok(())
 }

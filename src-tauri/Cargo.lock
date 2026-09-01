@@ -208,6 +208,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-channel",
+ "futures-util",
+ "getrandom 0.4.1",
+ "raw-window-handle",
+ "serde",
+ "tokio",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1501,6 +1520,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlib"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "dlopen2"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2555,6 +2583,7 @@ name = "handy"
 version = "0.9.6"
 dependencies = [
  "anyhow",
+ "ashpd",
  "atspi",
  "chrono",
  "clap",
@@ -2566,6 +2595,7 @@ dependencies = [
  "ferrous-opencc",
  "flate2",
  "futures-util",
+ "getrandom 0.3.4",
  "gtk",
  "gtk-layer-shell",
  "handy-keys",
@@ -2583,6 +2613,8 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "once_cell",
+ "parking_lot",
+ "raw-window-handle",
  "rdev",
  "regex",
  "reqwest 0.12.28",
@@ -2625,6 +2657,8 @@ dependencies = [
  "windows 0.61.3",
  "windows-core 0.61.2",
  "winreg 0.55.0",
+ "xkbcommon",
+ "zvariant",
 ]
 
 [[package]]
@@ -5571,6 +5605,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7933,6 +7973,7 @@ dependencies = [
  "cc",
  "downcast-rs",
  "rustix",
+ "scoped-tls",
  "smallvec",
  "wayland-sys",
 ]
@@ -7991,6 +8032,8 @@ version = "0.31.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6dbfc3ac5ef974c92a2235805cc0114033018ae1290a72e474aa8b28cbbdfd"
 dependencies = [
+ "dlib",
+ "log",
  "pkg-config",
 ]
 

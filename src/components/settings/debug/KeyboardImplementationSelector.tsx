@@ -3,13 +3,9 @@ import { useTranslation } from "react-i18next";
 import { SettingContainer } from "../../ui/SettingContainer";
 import { Dropdown, type DropdownOption } from "../../ui/Dropdown";
 import { useSettings } from "../../../hooks/useSettings";
+import { useSettingsStore } from "../../../stores/settingsStore";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
-
-const KEYBOARD_IMPLEMENTATION_OPTIONS: DropdownOption[] = [
-  { value: "tauri", label: "Tauri Global Shortcut" },
-  { value: "handy_keys", label: "Handy Keys" },
-];
 
 interface KeyboardImplementationSelectorProps {
   descriptionMode?: "tooltip" | "inline";
@@ -21,6 +17,19 @@ export const KeyboardImplementationSelector: React.FC<
 > = ({ descriptionMode = "tooltip", grouped = false }) => {
   const { t } = useTranslation();
   const { getSetting, isUpdating, refreshSettings } = useSettings();
+  const refreshShortcutBackendStatus = useSettingsStore(
+    (state) => state.refreshShortcutBackendStatus,
+  );
+  const keyboardImplementationOptions: DropdownOption[] = [
+    {
+      value: "tauri",
+      label: t("settings.debug.keyboardImplementation.options.system"),
+    },
+    {
+      value: "handy_keys",
+      label: t("settings.debug.keyboardImplementation.options.handyKeys"),
+    },
+  ];
   const currentImplementation =
     getSetting("keyboard_implementation") ?? "tauri";
 
@@ -43,11 +52,11 @@ export const KeyboardImplementationSelector: React.FC<
       if (result.data.reset_bindings.length > 0) {
         toast.warning(t("settings.debug.keyboardImplementation.bindingsReset"));
       }
-
-      await refreshSettings();
     } catch (error) {
       console.error("Failed to update keyboard implementation:", error);
       toast.error(String(error));
+    } finally {
+      await Promise.all([refreshSettings(), refreshShortcutBackendStatus()]);
     }
   };
 
@@ -60,7 +69,7 @@ export const KeyboardImplementationSelector: React.FC<
       layout="horizontal"
     >
       <Dropdown
-        options={KEYBOARD_IMPLEMENTATION_OPTIONS}
+        options={keyboardImplementationOptions}
         selectedValue={currentImplementation}
         onSelect={handleSelect}
         disabled={isUpdating("keyboard_implementation")}
