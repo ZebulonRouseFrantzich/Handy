@@ -49,6 +49,7 @@ const LISTENER_ROOT: &str = "/com/pais/handy/focused_output/linux";
 const REGISTRY: &str = "org.a11y.atspi.Registry";
 const DEVICE_EVENT_CONTROLLER_PATH: &str = "/org/a11y/atspi/registry/deviceeventcontroller";
 const DEVICE_EVENT_CONTROLLER_INTERFACE: &str = "org.a11y.atspi.DeviceEventController";
+const DEVICE_EVENT_LISTENER_INTERFACE: &str = "org.a11y.atspi.DeviceEventListener";
 // AT-SPI 2.46+ defines this argument as a u32 bitmask. atspi-proxies
 // 0.14.0 still emits the obsolete `au` signature, so keystroke registration
 // and deregistration use a raw zbus proxy.
@@ -2334,6 +2335,30 @@ where
     }
 }
 
+type RegisteredKeystrokeListener = (
+    String,
+    zbus::zvariant::OwnedObjectPath,
+    u32,
+    u32,
+    Vec<(i32, i32, String, i32)>,
+    u32,
+    (bool, bool, bool),
+);
+
+fn registered_keystroke_listener_matches(
+    registration: &RegisteredKeystrokeListener,
+    bus: &str,
+    path: &str,
+) -> bool {
+    registration.0 == bus
+        && registration.1.as_str() == path
+        && registration.2 == 0
+        && registration.3 == KEY_EVENT_TYPES
+        && registration.4.is_empty()
+        && registration.5 == 0
+        && registration.6 == (false, false, true)
+}
+
 async fn register_device_listener(
     connection: &AccessibilityConnection,
     listener_path: &str,
@@ -2371,6 +2396,37 @@ async fn register_device_listener(
         preemptive: false,
         global: true,
     };
+    let signal_proxy = match zbus::Proxy::new(
+        connection.connection(),
+        REGISTRY,
+        DEVICE_EVENT_CONTROLLER_PATH,
+        DEVICE_EVENT_LISTENER_INTERFACE,
+    )
+    .await
+    {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
+    let mut registrations = match signal_proxy
+        .receive_signal("KeystrokeListenerRegistered")
+        .await
+    {
+        Ok(stream) => stream,
+        Err(_) => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
+    let listener_bus = match connection.connection().unique_name() {
+        Some(name) => name.as_str().to_owned(),
+        None => {
+            remove_listener(connection, listener_path).await;
+            return Err(());
+        }
+    };
     let raw_proxy = match zbus::Proxy::new(
         connection.connection(),
         REGISTRY,
@@ -2386,23 +2442,36 @@ async fn register_device_listener(
         }
     };
     let keys: [KeyDefinition<'_>; 0] = [];
-    let keystrokes: bool = match timeout(
+    let registration_call = timeout(
         TARGET_CALL_DEADLINE,
-        raw_proxy.call(
+        raw_proxy.call::<_, _, bool>(
             "RegisterKeystrokeListener",
             &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode),
         ),
     )
-    .await
-    {
-        Ok(Ok(registered)) => registered,
-        _ => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
-    if !keystrokes {
+    .await;
+    if !matches!(registration_call, Ok(Ok(_))) {
         remove_listener(connection, listener_path).await;
+        return Err(());
+    }
+    // at-spi2-core currently returns false even after a successful global
+    // registration. Its registration signal is emitted only after the X11
+    // key grabs succeed, so require the exact signal instead of that reply.
+    let keystrokes = timeout(TARGET_CALL_DEADLINE, async {
+        while let Some(message) = registrations.next().await {
+            let Ok(registration) = message.body().deserialize::<RegisteredKeystrokeListener>()
+            else {
+                continue;
+            };
+            if registered_keystroke_listener_matches(&registration, &listener_bus, listener_path) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    if !matches!(keystrokes, Ok(true)) {
+        deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
     let pressed =
@@ -3065,6 +3134,33 @@ mod tests {
 
         assert_eq!(register.signature().to_string(), "(oa(iisi)uu(bbb))");
         assert_eq!(deregister.signature().to_string(), "(oa(iisi)uu)");
+        let registration = (
+            ":1.42".to_owned(),
+            zbus::zvariant::OwnedObjectPath::try_from("/com/pais/handy/test").unwrap(),
+            0,
+            KEY_EVENT_TYPES,
+            Vec::new(),
+            0,
+            (false, false, true),
+        );
+        assert_eq!(registration.signature().to_string(), "(souua(iisi)u(bbb))");
+        assert!(registered_keystroke_listener_matches(
+            &registration,
+            ":1.42",
+            "/com/pais/handy/test"
+        ));
+        assert!(!registered_keystroke_listener_matches(
+            &registration,
+            ":1.43",
+            "/com/pais/handy/test"
+        ));
+        let mut non_global = registration;
+        non_global.6 = (false, false, false);
+        assert!(!registered_keystroke_listener_matches(
+            &non_global,
+            ":1.42",
+            "/com/pais/handy/test"
+        ));
     }
 
     #[test]
