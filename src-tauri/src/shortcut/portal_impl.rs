@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use super::portal_dbus::{BoundShortcut, NewShortcut, PortalClient, PortalSession, PortalSignal};
+use super::portal_dbus::{
+    BoundShortcut, ConfigureShortcutsOutcome, NewShortcut, PortalClient, PortalSession,
+    PortalSignal,
+};
 use ashpd::{
     zbus::{fdo::DBusProxy, names::BusName, Connection},
     AppID, WindowIdentifier,
@@ -437,7 +440,6 @@ struct Generation {
     id: u64,
     session: Arc<PortalSession>,
     portal: Arc<PortalClient>,
-    version: u32,
     specs: Vec<PortalShortcutSpec>,
     owner: String,
     runtime: Runtime,
@@ -449,7 +451,6 @@ struct Generation {
 struct CachedPortal {
     owner: String,
     portal: Arc<PortalClient>,
-    version: u32,
 }
 struct Inner {
     status: ShortcutBackendStatus,
@@ -916,13 +917,12 @@ impl PortalShortcutState {
                         generation.owner.clone(),
                         generation.portal.clone(),
                         generation.session.clone(),
-                        generation.version,
                         generation.specs.clone(),
                     )
                 })
             })
         };
-        let Some((generation, owner, portal, session, version, specs)) = active else {
+        let Some((generation, owner, portal, session, specs)) = active else {
             let specs = self
                 .inner
                 .lock()
@@ -932,9 +932,6 @@ impl PortalShortcutState {
                 .ok_or_else(|| "No portal shortcut snapshot is available for retry".to_string())?;
             return self.bind_and_commit_or_restore(specs, parent).await;
         };
-        if version < 2 {
-            return self.bind_and_commit_or_restore(specs, parent).await;
-        }
         let observed_owner = match self.until_shutdown(current_owner(&self.connection)).await {
             Ok(Ok(owner)) => owner,
             Ok(Err(_)) => {
@@ -971,12 +968,20 @@ impl PortalShortcutState {
             self.owner_changed(Some(observed_owner));
             return Err("Desktop portal restarted during shortcut configuration".into());
         }
-        if let Err(error) = result {
-            self.publish_for_generation(generation, previous);
-            configure_guard.disarm();
-            return Err(format!(
-                "Failed to open desktop shortcut configuration: {error}"
-            ));
+        match result {
+            Ok(ConfigureShortcutsOutcome::Requested) => {}
+            Ok(ConfigureShortcutsOutcome::Unsupported) => {
+                self.publish_for_generation(generation, previous);
+                configure_guard.disarm();
+                return self.bind_and_commit_or_restore(specs, parent).await;
+            }
+            Err(error) => {
+                self.publish_for_generation(generation, previous);
+                configure_guard.disarm();
+                return Err(format!(
+                    "Failed to open desktop shortcut configuration: {error}"
+                ));
+            }
         }
         let current = self.status();
         let result = if current == busy {
@@ -1232,7 +1237,6 @@ impl PortalShortcutState {
                 id: generation_id,
                 session,
                 portal: cached.portal,
-                version: cached.version,
                 specs,
                 owner: cached.owner.clone(),
                 runtime: Runtime {
@@ -1644,7 +1648,6 @@ impl PortalShortcutState {
                             let portal = Arc::new(portal);
                             Some(CachedPortal {
                                 owner: portal.owner().to_string(),
-                                version: portal.version(),
                                 portal,
                             })
                         }
@@ -1776,7 +1779,6 @@ impl PortalShortcutState {
         }
         let cached = CachedPortal {
             owner: portal.owner().to_string(),
-            version: portal.version(),
             portal,
         };
         let _dispatch = self.dispatch.lock().unwrap();

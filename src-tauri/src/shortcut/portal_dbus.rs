@@ -173,11 +173,16 @@ pub enum PortalSignal {
     ShortcutsChanged(ShortcutsChangedSignal),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigureShortcutsOutcome {
+    Requested,
+    Unsupported,
+}
+
 #[derive(Debug)]
 pub struct PortalClient {
     connection: Connection,
     owner: String,
-    version: u32,
     proxy: Proxy<'static>,
 }
 
@@ -200,24 +205,22 @@ impl PortalClient {
     pub async fn new(connection: Connection, owner: String) -> Result<Self, String> {
         let proxy =
             unique_proxy(&connection, &owner, PORTAL_PATH, GLOBAL_SHORTCUTS_INTERFACE).await?;
-        let version = proxy
+        // Probe the interface before caching this lazy proxy. The value is not
+        // used for capability gating: some implementations expose
+        // ConfigureShortcuts while still advertising interface v1.
+        proxy
             .get_property::<u32>("version")
             .await
             .map_err(|error| error.to_string())?;
         Ok(Self {
             connection,
             owner,
-            version,
             proxy,
         })
     }
 
     pub fn owner(&self) -> &str {
         &self.owner
-    }
-
-    pub fn version(&self) -> u32 {
-        self.version
     }
 
     pub async fn create_session(&self) -> Result<PortalSession, String> {
@@ -294,16 +297,23 @@ impl PortalClient {
         &self,
         session: &PortalSession,
         parent: Option<&WindowIdentifier>,
-    ) -> Result<(), String> {
+    ) -> Result<ConfigureShortcutsOutcome, String> {
         self.verify_session(session)?;
         let parent = parent.map(ToString::to_string).unwrap_or_default();
-        self.proxy
+        match self
+            .proxy
             .call::<_, _, ()>(
                 "ConfigureShortcuts",
                 &(session.path.as_ref(), parent, EmptyOptions::default()),
             )
             .await
-            .map_err(|error| error.to_string())
+        {
+            Ok(()) => Ok(ConfigureShortcutsOutcome::Requested),
+            Err(error) if configure_shortcuts_is_unsupported(&error) => {
+                Ok(ConfigureShortcutsOutcome::Unsupported)
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub async fn receive_signals(&self) -> Result<SignalStream<PortalSignal>, String> {
@@ -323,6 +333,18 @@ impl PortalClient {
         } else {
             Err("Shortcut session belongs to a different portal owner".into())
         }
+    }
+}
+
+fn configure_shortcuts_is_unsupported(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => {
+            name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+        }
+        zbus::Error::FDO(error) => {
+            matches!(error.as_ref(), zbus::fdo::Error::UnknownMethod(_))
+        }
+        _ => false,
     }
 }
 
@@ -669,5 +691,18 @@ mod tests {
         assert_eq!(shortcut.id, "transcribe");
         assert_eq!(shortcut.description, "Transcribe");
         assert_eq!(shortcut.trigger_description, "Ctrl+Space");
+    }
+
+    #[test]
+    fn unknown_configure_method_selects_the_v1_fallback() {
+        let unsupported = zbus::Error::FDO(Box::new(zbus::fdo::Error::UnknownMethod(
+            "ConfigureShortcuts is unavailable".into(),
+        )));
+        let other = zbus::Error::FDO(Box::new(zbus::fdo::Error::Failed(
+            "configuration failed".into(),
+        )));
+
+        assert!(configure_shortcuts_is_unsupported(&unsupported));
+        assert!(!configure_shortcuts_is_unsupported(&other));
     }
 }
