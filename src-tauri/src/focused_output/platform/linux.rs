@@ -17,7 +17,7 @@ use atspi::events::{Event, FocusEvents, MouseEvents, ObjectEvents};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::cache::CacheProxy;
 use atspi::proxy::device_event_controller::{
-    DeviceEvent, DeviceEventControllerProxy, EventListenerMode, EventType, KeyDefinition,
+    DeviceEvent, EventListenerMode, EventType, KeyDefinition,
 };
 use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::text::TextProxy;
@@ -2377,13 +2377,6 @@ async fn register_device_listener(
         )
         .await
         .map_err(|_| ())?;
-    let proxy = match DeviceEventControllerProxy::new(connection.connection()).await {
-        Ok(proxy) => proxy,
-        Err(_) => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
     let path: zbus::zvariant::ObjectPath<'_> = match listener_path.try_into() {
         Ok(path) => path,
         Err(_) => {
@@ -2480,27 +2473,9 @@ async fn register_device_listener(
         deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
-    let pressed =
-        match bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonPressed))
-            .await
-        {
-            Ok(registered) => registered,
-            Err(()) => {
-                deregister_device_listener(connection, listener_path).await;
-                return Err(());
-            }
-        };
-    let released =
-        match bounded_call(proxy.register_device_event_listener(&path, EventType::ButtonReleased))
-            .await
-        {
-            Ok(registered) => registered,
-            Err(()) => {
-                deregister_device_listener(connection, listener_path).await;
-                return Err(());
-            }
-        };
-    if !pressed || !released || controller_identity(connection).await.as_ref() != Ok(&controller) {
+    // Pointer activity is delivered through the registered AT-SPI MouseEvents
+    // stream; current registryd exposes device listeners only for keystrokes.
+    if controller_identity(connection).await.as_ref() != Ok(&controller) {
         deregister_device_listener(connection, listener_path).await;
         return Err(());
     }
@@ -2508,33 +2483,24 @@ async fn register_device_listener(
 }
 
 async fn deregister_device_listener(connection: &AccessibilityConnection, listener_path: &str) {
-    if let Ok(proxy) = DeviceEventControllerProxy::new(connection.connection()).await {
-        if let Ok(path) = zbus::zvariant::ObjectPath::try_from(listener_path) {
-            if let Ok(raw_proxy) = zbus::Proxy::new(
-                connection.connection(),
-                REGISTRY,
-                DEVICE_EVENT_CONTROLLER_PATH,
-                DEVICE_EVENT_CONTROLLER_INTERFACE,
+    if let Ok(path) = zbus::zvariant::ObjectPath::try_from(listener_path) {
+        if let Ok(raw_proxy) = zbus::Proxy::new(
+            connection.connection(),
+            REGISTRY,
+            DEVICE_EVENT_CONTROLLER_PATH,
+            DEVICE_EVENT_CONTROLLER_INTERFACE,
+        )
+        .await
+        {
+            let keys: [KeyDefinition<'_>; 0] = [];
+            let _ = timeout(
+                TARGET_CALL_DEADLINE,
+                raw_proxy.call::<_, _, ()>(
+                    "DeregisterKeystrokeListener",
+                    &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES),
+                ),
             )
-            .await
-            {
-                let keys: [KeyDefinition<'_>; 0] = [];
-                let _ = timeout(
-                    TARGET_CALL_DEADLINE,
-                    raw_proxy.call::<_, _, ()>(
-                        "DeregisterKeystrokeListener",
-                        &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES),
-                    ),
-                )
-                .await;
-            }
-            for event_type in [EventType::ButtonPressed, EventType::ButtonReleased] {
-                let _ = timeout(
-                    TARGET_CALL_DEADLINE,
-                    proxy.deregister_device_event_listener(&path, event_type),
-                )
-                .await;
-            }
+            .await;
         }
     }
     remove_listener(connection, listener_path).await;
