@@ -2157,6 +2157,12 @@ fn device_signal(shared: &MonitorShared, event: &DeviceEvent<'_>) -> Option<Moni
                 }
                 return Some(MonitorSignal::ToolKey);
             }
+            // Modifier presses have no text-field effect by themselves. The
+            // following non-modifier key determines whether this is the
+            // configured stop chord or an unsafe command.
+            if is_modifier_key(event.event_string) {
+                return None;
+            }
             if shared
                 .stop_chord
                 .map(|chord| chord.matches(event.modifiers, event.event_string))
@@ -3228,6 +3234,37 @@ mod tests {
         assert!(chord.matches((1 << 2) | 1, "space"));
         assert!(!chord.matches(1 << 2, "space"));
         assert!(!chord.matches((1 << 2) | 1, "Return"));
+
+        let (tx, _rx) = bounded(2);
+        let shared = MonitorShared {
+            terminal: AtomicU8::new(T_NONE),
+            published: AtomicBool::new(false),
+            dispatch: AtomicBool::new(false),
+            dispatch_direct: AtomicBool::new(false),
+            dispatch_text: AtomicBool::new(false),
+            intent_epoch: AtomicU64::new(0),
+            physical_callbacks: AtomicU64::new(0),
+            tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(0),
+            tx,
+            stop_chord: Some(chord),
+            cancellation: SessionCancellation::default(),
+        };
+        let mut modifier = key_event("Control_L", false);
+        modifier.modifiers = 1 << 2;
+        assert!(device_signal(&shared, &modifier).is_none());
+        assert_eq!(shared.terminal.load(Ordering::Acquire), T_NONE);
+
+        let mut stop_key = key_event("space", false);
+        stop_key.modifiers = (1 << 2) | 1;
+        assert!(device_signal(&shared, &stop_key).is_none());
+
+        let mut other_command = key_event("x", true);
+        other_command.modifiers = 1 << 2;
+        assert!(matches!(
+            device_signal(&shared, &other_command),
+            Some(MonitorSignal::Command)
+        ));
     }
 
     #[test]
