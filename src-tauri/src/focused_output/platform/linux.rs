@@ -13,7 +13,9 @@ use atspi::events::focus::FocusEvent;
 use atspi::events::object::{
     StateChangedEvent, TextCaretMovedEvent, TextChangedEvent, TextSelectionChangedEvent,
 };
-use atspi::events::{Event, FocusEvents, MouseEvents, ObjectEvents};
+use atspi::events::{
+    DBusInterface, DBusMember, Event, FocusEvents, MouseEvents, ObjectEvents,
+};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::cache::CacheProxy;
 use atspi::proxy::device_event_controller::{
@@ -497,6 +499,39 @@ struct ConnectedState {
     registered: bool,
 }
 
+fn is_focused_event_header(interface: &str, member: &str) -> bool {
+    (interface == ObjectEvents::DBUS_INTERFACE
+        && matches!(
+            member,
+            TextChangedEvent::DBUS_MEMBER
+                | TextCaretMovedEvent::DBUS_MEMBER
+                | TextSelectionChangedEvent::DBUS_MEMBER
+                | StateChangedEvent::DBUS_MEMBER
+        ))
+        || (interface == FocusEvents::DBUS_INTERFACE && member == FocusEvent::DBUS_MEMBER)
+        || interface == MouseEvents::DBUS_INTERFACE
+}
+
+fn focused_event_stream(
+    connection: &AccessibilityConnection,
+) -> impl Stream<Item = Result<Event, atspi::AtspiError>> {
+    zbus::MessageStream::from(connection.connection()).filter_map(|result| async move {
+        let message = match result {
+            Ok(message) => message,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let header = message.header();
+        let (Some(interface), Some(member)) = (header.interface(), header.member()) else {
+            return None;
+        };
+        if is_focused_event_header(interface.as_str(), member.as_str()) {
+            Some(Event::try_from(&message))
+        } else {
+            None
+        }
+    })
+}
+
 async fn connected_loop(
     commands: &Receiver<LoopCommand>,
     connection: AccessibilityConnection,
@@ -504,7 +539,7 @@ async fn connected_loop(
     next_generation: &mut u64,
 ) -> bool {
     let event_connection = connection.clone();
-    let mut events = Box::pin(event_connection.event_stream());
+    let mut events = Box::pin(focused_event_stream(&event_connection));
     let mut state = ConnectedState {
         session: None,
         registered: false,
@@ -3104,6 +3139,30 @@ mod tests {
             Some("org.a11y.atspi.Registry")
         ));
     }
+    #[test]
+    fn focused_event_stream_excludes_control_and_unregistered_signals() {
+        assert!(is_focused_event_header(
+            ObjectEvents::DBUS_INTERFACE,
+            TextChangedEvent::DBUS_MEMBER
+        ));
+        assert!(is_focused_event_header(
+            FocusEvents::DBUS_INTERFACE,
+            FocusEvent::DBUS_MEMBER
+        ));
+        assert!(is_focused_event_header(
+            MouseEvents::DBUS_INTERFACE,
+            "Button"
+        ));
+        assert!(!is_focused_event_header(
+            DEVICE_EVENT_LISTENER_INTERFACE,
+            "KeystrokeListenerRegistered"
+        ));
+        assert!(!is_focused_event_header(
+            ObjectEvents::DBUS_INTERFACE,
+            "PropertyChange"
+        ));
+    }
+
     #[test]
     fn keystroke_listener_uses_current_at_spi_bitmask_signature() {
         use zbus::zvariant::DynamicType;
