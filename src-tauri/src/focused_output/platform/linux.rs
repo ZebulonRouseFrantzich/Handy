@@ -529,7 +529,14 @@ async fn connected_loop(
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(event)) => process_idle_event(&mut state, event),
-                Some(Err(_)) | None => {
+                Some(Err(error)) => {
+                    log::debug!("Linux focused AT-SPI event stream failed: {error}");
+                    invalidate_bus(&mut state);
+                    close_all(&connection, &mut state).await;
+                    return true;
+                }
+                None => {
+                    log::debug!("Linux focused AT-SPI event stream closed");
                     invalidate_bus(&mut state);
                     close_all(&connection, &mut state).await;
                     return true;
@@ -2047,6 +2054,11 @@ impl DeviceListener {
         match catch_unwind(AssertUnwindSafe(|| {
             let _activity = CallbackActivity::begin(&self.shared);
             if !sender_is_controller(&self.controller, header.sender().map(|name| name.as_str())) {
+                log::debug!(
+                    "Linux focused device callback sender mismatch: expected={} actual={:?}",
+                    self.controller.sender,
+                    header.sender().map(|name| name.as_str())
+                );
                 self.shared.terminal(T_MONITOR);
                 return false;
             }
@@ -2064,6 +2076,7 @@ impl DeviceListener {
         })) {
             Ok(value) => value,
             Err(_) => {
+                log::debug!("Linux focused device callback panicked");
                 self.shared.terminal(T_MONITOR);
                 false
             }
