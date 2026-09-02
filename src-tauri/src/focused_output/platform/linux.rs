@@ -60,6 +60,7 @@ const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const MAX_SCALARS: usize = 16;
 const MAX_ANCESTORS: usize = 128;
 const POLL: Duration = Duration::from_millis(5);
+const FOCUS_LOSS_GRACE: Duration = Duration::from_millis(100);
 const T_SECURE: u8 = 11;
 
 const T_NONE: u8 = 0;
@@ -495,6 +496,7 @@ fn reject(command: LoopCommand, reason: FocusedOutputReasonCode) {
 struct ConnectedState {
     session: Option<SessionRecord>,
     registered: bool,
+    registry_owner: Arc<RegistryOwnerMonitor>,
 }
 
 fn is_focused_event_header(interface: &str, member: &str) -> bool {
@@ -518,6 +520,9 @@ fn focused_event_stream(
             Ok(message) => message,
             Err(error) => return Some(Err(error.into())),
         };
+        if message.message_type() != zbus::message::Type::Signal {
+            return None;
+        }
         let header = message.header();
         let (Some(interface), Some(member)) = (header.interface(), header.member()) else {
             return None;
@@ -530,6 +535,96 @@ fn focused_event_stream(
     })
 }
 
+struct RegistryOwnerMonitor {
+    lost: AtomicBool,
+    active: Mutex<Option<std::sync::Weak<MonitorShared>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl RegistryOwnerMonitor {
+    fn new() -> Self {
+        Self {
+            lost: AtomicBool::new(false),
+            active: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn arm(&self, monitor: &Arc<MonitorShared>) {
+        match self.active.lock() {
+            Ok(mut active) => *active = Some(Arc::downgrade(monitor)),
+            Err(poisoned) => *poisoned.into_inner() = Some(Arc::downgrade(monitor)),
+        }
+        if self.lost.load(Ordering::Acquire) {
+            monitor.terminal(T_MONITOR);
+        }
+    }
+
+    fn lose(&self) {
+        if !self.lost.swap(true, Ordering::AcqRel) {
+            let monitor = match self.active.lock() {
+                Ok(active) => active.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Some(monitor) = monitor.and_then(|monitor| monitor.upgrade()) {
+                monitor.terminal(T_MONITOR);
+            }
+            self.notify.notify_one();
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+}
+
+struct AbortTask(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn monitor_registry_owner(
+    connection: zbus::Connection,
+    monitor: Arc<RegistryOwnerMonitor>,
+    ready: tokio::sync::oneshot::Sender<Result<(), ()>>,
+) {
+    let proxy = match zbus::fdo::DBusProxy::new(&connection).await {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            let _ = ready.send(Err(()));
+            return;
+        }
+    };
+    let mut stream = match proxy
+        .receive_name_owner_changed_with_args(&[(0, REGISTRY)])
+        .await
+    {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = ready.send(Err(()));
+            return;
+        }
+    };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    match stream.next().await {
+        Some(signal) if signal.args().is_ok() => {
+            log::debug!("Linux focused AT-SPI registry owner changed");
+        }
+        Some(_) => {
+            log::debug!("Linux focused AT-SPI registry owner signal was invalid");
+        }
+        None => {
+            log::debug!("Linux focused AT-SPI registry owner stream closed");
+        }
+    }
+    monitor.lose();
+}
+
 async fn connected_loop(
     commands: &Receiver<LoopCommand>,
     connection: AccessibilityConnection,
@@ -538,12 +633,31 @@ async fn connected_loop(
 ) -> bool {
     let event_connection = connection.clone();
     let mut events = Box::pin(focused_event_stream(&event_connection));
+    let registry_owner = Arc::new(RegistryOwnerMonitor::new());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let _owner_task = AbortTask(tokio::spawn(monitor_registry_owner(
+        connection.connection().clone(),
+        registry_owner.clone(),
+        ready_tx,
+    )));
+    if !matches!(ready_rx.await, Ok(Ok(()))) {
+        if let Some(command) = first {
+            reject(command, FocusedOutputReasonCode::MonitorUnavailable);
+        }
+        return true;
+    }
     let mut state = ConnectedState {
         session: None,
         registered: false,
+        registry_owner: registry_owner.clone(),
     };
     let mut command = first;
     loop {
+        if registry_owner.is_lost() {
+            invalidate_bus(&mut state);
+            close_all(&connection, &mut state).await;
+            return true;
+        }
         if let Some(current) = command.take() {
             if !handle_command(
                 &connection,
@@ -562,8 +676,8 @@ async fn connected_loop(
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(event)) => process_idle_event(&mut state, event),
-                Some(Err(error)) => {
-                    log::debug!("Linux focused AT-SPI event stream failed: {error}");
+                Some(Err(_)) => {
+                    log::debug!("Linux focused AT-SPI event stream failed");
                     invalidate_bus(&mut state);
                     close_all(&connection, &mut state).await;
                     return true;
@@ -574,6 +688,11 @@ async fn connected_loop(
                     close_all(&connection, &mut state).await;
                     return true;
                 }
+            },
+            _ = registry_owner.notify.notified() => {
+                invalidate_bus(&mut state);
+                close_all(&connection, &mut state).await;
+                return true;
             },
             _ = sleep(POLL) => match commands.try_recv() {
                 Ok(next) => command = Some(next),
@@ -685,6 +804,7 @@ struct SessionRecord {
     caret: i32,
     user_intent: bool,
     external_caret: Option<i32>,
+    focus_loss_at: Option<Instant>,
     listener_removed: bool,
 }
 
@@ -806,6 +926,7 @@ async fn begin_session(
         }
         return Err(FocusedOutputReasonCode::MonitorUnavailable);
     }
+    state.registry_owner.arm(&monitor);
     state.session = Some(SessionRecord {
         generation,
         session_id: context.session_id,
@@ -820,6 +941,7 @@ async fn begin_session(
         caret: captured.caret,
         user_intent: false,
         external_caret: None,
+        focus_loss_at: None,
         listener_removed: false,
     });
     // Every insertion revalidates process identity, focus metadata, security
@@ -1927,9 +2049,13 @@ fn classify_event(
         Event::Object(ObjectEvents::StateChanged(event)) => {
             if !same_object(&event.item, &session.target) {
                 EventClass::Foreign
-            } else if (event.state == State::Focused && !event.enabled)
-                || (event.state == State::Defunct && event.enabled)
-            {
+            } else if event.state == State::Focused && !event.enabled {
+                session.focus_loss_at = Some(Instant::now());
+                EventClass::Neutral
+            } else if event.state == State::Focused && event.enabled {
+                session.focus_loss_at = None;
+                EventClass::Neutral
+            } else if event.state == State::Defunct && event.enabled {
                 EventClass::Unsafe(T_CLOSED)
             } else {
                 EventClass::Neutral
@@ -2176,6 +2302,19 @@ fn device_signal(shared: &MonitorShared, event: &DeviceEvent<'_>) -> Option<Moni
         }
         EventType::KeyReleased => None,
         EventType::KeyPressed => {
+            // Modifier presses have no text-field effect by themselves. The
+            // following non-modifier key determines whether this is the
+            // configured stop chord or an unsafe command.
+            if is_modifier_key(event.event_string) {
+                return None;
+            }
+            if shared
+                .stop_chord
+                .map(|chord| chord.matches(event.modifiers, event.event_string))
+                .unwrap_or(false)
+            {
+                return None;
+            }
             let dispatch = shared.dispatch.load(Ordering::Acquire);
             if !dispatch {
                 shared.intent_epoch.fetch_add(1, Ordering::AcqRel);
@@ -2202,19 +2341,6 @@ fn device_signal(shared: &MonitorShared, event: &DeviceEvent<'_>) -> Option<Moni
                     );
                 }
                 return Some(MonitorSignal::ToolKey);
-            }
-            // Modifier presses have no text-field effect by themselves. The
-            // following non-modifier key determines whether this is the
-            // configured stop chord or an unsafe command.
-            if is_modifier_key(event.event_string) {
-                return None;
-            }
-            if shared
-                .stop_chord
-                .map(|chord| chord.matches(event.modifiers, event.event_string))
-                .unwrap_or(false)
-            {
-                return None;
             }
             if matches_key(
                 event.event_string,
@@ -2564,6 +2690,10 @@ async fn remove_listener(connection: &AccessibilityConnection, listener_path: &s
     .await;
 }
 
+fn focus_loss_expired(lost_at: Option<Instant>) -> bool {
+    lost_at.is_some_and(|lost_at| lost_at.elapsed() >= FOCUS_LOSS_GRACE)
+}
+
 async fn drain_monitor(connection: &AccessibilityConnection, state: &mut ConnectedState) {
     let Some(session) = state.session.as_mut() else {
         return;
@@ -2576,6 +2706,9 @@ async fn drain_monitor(connection: &AccessibilityConnection, state: &mut Connect
 }
 
 fn drain_one_monitor(session: &mut SessionRecord) {
+    if focus_loss_expired(session.focus_loss_at) {
+        session.monitor.terminal(T_CLOSED);
+    }
     while let Ok(signal) = session.monitor_rx.try_recv() {
         match signal {
             MonitorSignal::SafeIntent => {
@@ -3338,6 +3471,13 @@ mod tests {
     }
 
     #[test]
+    fn transient_focus_loss_expires_only_after_grace() {
+        assert!(!focus_loss_expired(None));
+        assert!(!focus_loss_expired(Some(Instant::now())));
+        assert!(focus_loss_expired(Some(Instant::now() - FOCUS_LOSS_GRACE)));
+    }
+
+    #[test]
     fn callback_overflow_self_disarms_and_first_terminal_wins() {
         let (tx, _rx) = bounded(1);
         let shared = MonitorShared {
@@ -3360,6 +3500,34 @@ mod tests {
         assert!(shared.cancellation.is_cancelled());
         shared.terminal(T_POINTER);
         assert_eq!(shared.terminal.load(Ordering::Acquire), T_MONITOR);
+    }
+
+    #[test]
+    fn registry_owner_loss_cancels_an_in_flight_session() {
+        let cancellation = SessionCancellation::default();
+        let (tx, _rx) = bounded(1);
+        let shared = Arc::new(MonitorShared {
+            terminal: AtomicU8::new(T_NONE),
+            published: AtomicBool::new(false),
+            dispatch: AtomicBool::new(true),
+            dispatch_direct: AtomicBool::new(true),
+            dispatch_text: AtomicBool::new(false),
+            physical_callbacks: AtomicU64::new(0),
+            intent_epoch: AtomicU64::new(0),
+            tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(0),
+            tx,
+            stop_chord: None,
+            cancellation: cancellation.clone(),
+        });
+        let owner = RegistryOwnerMonitor::new();
+        owner.arm(&shared);
+
+        owner.lose();
+
+        assert!(owner.is_lost());
+        assert_eq!(shared.terminal.load(Ordering::Acquire), T_MONITOR);
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]
