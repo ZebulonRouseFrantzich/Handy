@@ -13,9 +13,7 @@ use atspi::events::focus::FocusEvent;
 use atspi::events::object::{
     StateChangedEvent, TextCaretMovedEvent, TextChangedEvent, TextSelectionChangedEvent,
 };
-use atspi::events::{
-    DBusInterface, DBusMember, Event, FocusEvents, MouseEvents, ObjectEvents,
-};
+use atspi::events::{DBusInterface, DBusMember, Event, FocusEvents, MouseEvents, ObjectEvents};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::cache::CacheProxy;
 use atspi::proxy::device_event_controller::{
