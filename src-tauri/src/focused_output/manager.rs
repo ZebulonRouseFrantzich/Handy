@@ -1068,6 +1068,18 @@ fn apply_interaction(armed: &mut ArmedSession, event: TargetInteractionEvent) {
         return;
     }
 
+    if matches!(
+        event,
+        TargetInteractionEvent::CompatibleExternalInsertion { .. }
+    ) && armed.capability.mixed_input_support() == MixedInputSupport::Unavailable
+    {
+        armed.set_terminal(
+            TerminalReason::UnsafeUserEdit,
+            FocusedOutputReasonCode::MixedInputUnavailable,
+        );
+        return;
+    }
+
     let event_code = interaction_reason_code(event);
     let (observation_id, effect) = match event {
         TargetInteractionEvent::CompatibleExternalInsertion {
@@ -1083,12 +1095,14 @@ fn apply_interaction(armed: &mut ArmedSession, event: TargetInteractionEvent) {
                     removed_len: 0,
                     inserted_chars: chars,
                 },
-                MixedInputSupport::GuardedKeyboardInsertionsOnly
-                | MixedInputSupport::Unavailable => EditEffectEvidence::GuardedCaretAdvance {
-                    value_changed: chars != 0,
-                    caret_before: before,
-                    caret_after: after,
-                },
+                MixedInputSupport::GuardedKeyboardInsertionsOnly => {
+                    EditEffectEvidence::GuardedCaretAdvance {
+                        value_changed: chars != 0,
+                        caret_before: before,
+                        caret_after: after,
+                    }
+                }
+                MixedInputSupport::Unavailable => unreachable!("handled above"),
             };
             (observation_id, Some(effect))
         }
@@ -1179,6 +1193,7 @@ fn process_snapshot(
             if let ApplyDecision::Terminal(reason) =
                 armed.ledger.apply_insert_outcome(&suffix, outcome)
             {
+                let reason = insertion_outcome_terminal_reason(reason, code);
                 armed.set_terminal(reason, code.unwrap_or_else(|| reason_code(reason)));
             }
         }
@@ -1351,13 +1366,6 @@ fn insert_in_units(
                     .coediting
                     .record_immediate_receipt(injection_id, receipt);
                 let _ = armed.coediting.acknowledge_verified_receipt(injection_id);
-                drain_terminals_for_armed(armed, terminal_rx);
-                drain_events_for_armed(armed, event_rx, overflow_session);
-                if let Some(terminal) = armed.terminal_reason {
-                    return InsertOutcome::Ambiguous {
-                        reason: reason_code(terminal),
-                    };
-                }
                 aggregate_receipt = weakest_receipt(aggregate_receipt, receipt);
                 let total = accepted_bytes.saturating_add(unit_bytes);
                 armed
@@ -1574,6 +1582,36 @@ fn outcome_reason(outcome: InsertOutcome) -> Option<FocusedOutputReasonCode> {
     }
 }
 
+fn insertion_outcome_terminal_reason(
+    default: TerminalReason,
+    code: Option<FocusedOutputReasonCode>,
+) -> TerminalReason {
+    match code {
+        Some(
+            FocusedOutputReasonCode::MixedInputUnavailable
+            | FocusedOutputReasonCode::PhysicalPointerActivity
+            | FocusedOutputReasonCode::DestructiveUserEdit
+            | FocusedOutputReasonCode::CaretMoved
+            | FocusedOutputReasonCode::SelectionChanged
+            | FocusedOutputReasonCode::UnsafeKeyboardCommand
+            | FocusedOutputReasonCode::ImeCompositionUnsupported,
+        ) => TerminalReason::UnsafeUserEdit,
+        Some(FocusedOutputReasonCode::Cancelled) => TerminalReason::Cancelled,
+        Some(
+            FocusedOutputReasonCode::MonitorUnavailable
+            | FocusedOutputReasonCode::BackendDisconnected
+            | FocusedOutputReasonCode::AtSpiUnavailable,
+        ) => TerminalReason::MonitorUnavailable,
+        Some(
+            FocusedOutputReasonCode::TargetChanged
+            | FocusedOutputReasonCode::TargetClosed
+            | FocusedOutputReasonCode::SecureInputActive
+            | FocusedOutputReasonCode::SecureField,
+        ) => TerminalReason::TargetInvalidated,
+        _ => default,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_plan(
     state: &Mutex<ManagerState>,
@@ -1719,6 +1757,7 @@ fn finalize_armed(
             if let ApplyDecision::Terminal(reason) =
                 armed.ledger.apply_insert_outcome(&tail, outcome)
             {
+                let reason = insertion_outcome_terminal_reason(reason, code);
                 armed.set_terminal(reason, code.unwrap_or_else(|| reason_code(reason)));
                 return preserve(armed, armed.terminal_reason.unwrap_or(reason));
             }
@@ -1901,6 +1940,7 @@ fn interaction_reason_code(event: TargetInteractionEvent) -> Option<FocusedOutpu
                 FocusedOutputReasonCode::UnsafeKeyboardCommand
             }
             UnsafeEditKind::ImeComposition => FocusedOutputReasonCode::ImeCompositionUnsupported,
+            UnsafeEditKind::UnattributedInsertion => FocusedOutputReasonCode::MixedInputUnavailable,
         }),
         TargetInteractionEvent::TargetInvalidated { reason, .. } => Some(reason),
         TargetInteractionEvent::MonitorUnavailable { .. } => {
@@ -2080,6 +2120,17 @@ mod tests {
     use crate::focused_output::platform::conformance::{posted_capability, FakeBackend};
     use crate::settings::{AutoSubmitKey, ClipboardHandling};
     use std::sync::Mutex;
+
+    #[test]
+    fn unattributed_insertion_reports_mixed_input_unavailable() {
+        assert_eq!(
+            interaction_reason_code(TargetInteractionEvent::UnsafeEdit {
+                observation_id: ObservationId(1),
+                kind: UnsafeEditKind::UnattributedInsertion,
+            }),
+            Some(FocusedOutputReasonCode::MixedInputUnavailable)
+        );
+    }
 
     struct UnavailableBackend;
 

@@ -102,11 +102,7 @@ pub(crate) struct CoeditingState {
 
 impl CoeditingState {
     pub(crate) fn new(scope: AttributionScope, mixed_input_support: MixedInputSupport) -> Self {
-        let terminal = match mixed_input_support {
-            MixedInputSupport::ObservedInsertionsOnly
-            | MixedInputSupport::GuardedKeyboardInsertionsOnly => None,
-            MixedInputSupport::Unavailable => Some(TerminalReason::MonitorUnavailable),
-        };
+        let terminal = None;
         Self {
             scope,
             mixed_input_support,
@@ -411,6 +407,7 @@ fn classify_unsafe_edit(kind: UnsafeEditKind) -> TerminalReason {
         | UnsafeEditKind::SubmitOrNewlineAmbiguous
         | UnsafeEditKind::CommandShortcut
         | UnsafeEditKind::ImeComposition
+        | UnsafeEditKind::UnattributedInsertion
         | UnsafeEditKind::Unknown => TerminalReason::UnsafeUserEdit,
     }
 }
@@ -963,9 +960,69 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_monitor_starts_terminal() {
-        let state = state(MixedInputSupport::Unavailable);
-        assert_eq!(state.terminal(), Some(TerminalReason::MonitorUnavailable));
+    fn unavailable_mixed_input_accepts_verified_handy_only() {
+        let now = Instant::now();
+        let mut verified_state = state(MixedInputSupport::Unavailable);
+        assert_eq!(verified_state.terminal(), None);
+        assert_eq!(
+            verified_state.arm_pending(pending(1, 7, now, None)),
+            ArmPendingResult::Armed
+        );
+        assert_eq!(
+            verified_state.record_immediate_receipt(InjectionId(1), ReceiptConfidence::Verified),
+            CoeditDecision::Continue
+        );
+        assert_eq!(
+            verified_state.acknowledge_verified_receipt(InjectionId(1)),
+            CoeditDecision::HandyAcknowledged {
+                injection_id: InjectionId(1)
+            }
+        );
+
+        let mut mismatched = state(MixedInputSupport::Unavailable);
+        assert_eq!(
+            mismatched.arm_pending(pending(1, 8, now, None)),
+            ArmPendingResult::Armed
+        );
+        assert_eq!(
+            mismatched.record_immediate_receipt(InjectionId(1), ReceiptConfidence::Verified),
+            CoeditDecision::Continue
+        );
+        assert_eq!(
+            mismatched.acknowledge_verified_receipt(InjectionId(2)),
+            CoeditDecision::Terminal(TerminalReason::AmbiguousInsertion)
+        );
+
+        for effect in [
+            EditEffectEvidence::DetailedInsert {
+                start: 10,
+                removed_len: 0,
+                inserted_chars: 1,
+            },
+            EditEffectEvidence::GuardedCaretAdvance {
+                value_changed: true,
+                caret_before: 10,
+                caret_after: 11,
+            },
+        ] {
+            let mut external_state = state(MixedInputSupport::Unavailable);
+            let observation_id = ObservationId(1);
+            assert_eq!(
+                external_state.on_evidence(InteractionEvidence::normalized(
+                    SCOPE,
+                    observation_id,
+                    now,
+                    TargetInteractionEvent::CompatibleExternalInsertion {
+                        observation_id,
+                        chars: 1,
+                        caret_after: Some(11),
+                    },
+                    Some(effect),
+                )),
+                CoeditDecision::Terminal(TerminalReason::UnsafeUserEdit)
+            );
+            assert_eq!(external_state.external_edit_epoch(), 0);
+        }
     }
 
     #[test]

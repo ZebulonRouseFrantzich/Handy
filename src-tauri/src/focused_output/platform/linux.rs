@@ -28,7 +28,7 @@ use atspi::{
     State, StateSet,
 };
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
@@ -74,6 +74,7 @@ const T_IME: u8 = 7;
 const T_MONITOR: u8 = 8;
 const T_CLOSED: u8 = 9;
 const T_CANCELLED: u8 = 10;
+const T_MIXED: u8 = 12;
 
 /// Strict Linux AT-SPI focused-field backend.
 ///
@@ -493,9 +494,20 @@ fn reject(command: LoopCommand, reason: FocusedOutputReasonCode) {
     }
 }
 
+#[derive(Default)]
+struct EventRegistrations {
+    text_changed: bool,
+    caret_moved: bool,
+    selection_changed: bool,
+    state_changed: bool,
+    focus: bool,
+    mouse: bool,
+}
+
 struct ConnectedState {
     session: Option<SessionRecord>,
-    registered: bool,
+    registrations: EventRegistrations,
+    connection_failed: bool,
     registry_owner: Arc<RegistryOwnerMonitor>,
 }
 
@@ -648,7 +660,8 @@ async fn connected_loop(
     }
     let mut state = ConnectedState {
         session: None,
-        registered: false,
+        registrations: EventRegistrations::default(),
+        connection_failed: false,
         registry_owner: registry_owner.clone(),
     };
     let mut command = first;
@@ -672,7 +685,15 @@ async fn connected_loop(
                 return false;
             }
         }
+        if state.connection_failed {
+            close_all(&connection, &mut state).await;
+            return true;
+        }
         drain_monitor(&connection, &mut state).await;
+        if state.connection_failed {
+            close_all(&connection, &mut state).await;
+            return true;
+        }
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(event)) => process_idle_event(&mut state, event),
@@ -733,8 +754,16 @@ where
             } else {
                 let generation = *next_generation;
                 *next_generation = next_generation.wrapping_add(1).max(1);
-                let result =
-                    begin_session(connection, state, context, sink, cancellation, generation).await;
+                let result = begin_session(
+                    connection,
+                    events,
+                    state,
+                    context,
+                    sink,
+                    cancellation,
+                    generation,
+                )
+                .await;
                 let _ = reply.try_send(result);
             }
         }
@@ -773,11 +802,18 @@ where
         LoopCommand::Close(generation, reply) => {
             if state.session.as_ref().map(|s| s.generation) == Some(generation) {
                 let mut session = state.session.take().expect("checked session");
-                cleanup(connection, &mut session).await;
+                if session.monitor_tier == MonitorTier::AtSpiSemanticOnly {
+                    let _ = drain_buffered_semantic_events(events, &mut session);
+                }
+                if !cleanup(connection, &mut session).await {
+                    state.connection_failed = true;
+                }
             }
-            if state.registered {
-                deregister_events(connection).await;
-                state.registered = false;
+            if deregister_all_events(connection, &mut state.registrations)
+                .await
+                .is_err()
+            {
+                state.connection_failed = true;
             }
             let _ = reply.try_send(());
         }
@@ -795,20 +831,21 @@ struct SessionRecord {
     session_id: DictationSessionId,
     target: Target,
     route: Route,
+    monitor_tier: MonitorTier,
     sink: Arc<dyn SessionEventSink>,
     cancellation: SessionCancellation,
     monitor: Arc<MonitorShared>,
     monitor_rx: Receiver<MonitorSignal>,
-    listener_path: String,
+    listener_path: Option<String>,
     next_observation: u64,
     caret: i32,
+    semantic_character_count: Option<i32>,
     user_intent: bool,
     external_caret: Option<i32>,
     focus_loss_at: Option<Instant>,
-    listener_removed: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
     bus: String,
     path: String,
@@ -817,6 +854,32 @@ struct Target {
     pid: u32,
     start_ticks: u64,
     owner_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorTier {
+    Physical,
+    AtSpiSemanticOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutePolicy {
+    Direct(MixedInputSupport),
+    Guarded,
+    Unavailable,
+}
+
+fn route_policy(direct: bool, monitor_tier: MonitorTier) -> RoutePolicy {
+    match (direct, monitor_tier) {
+        (true, MonitorTier::Physical) => {
+            RoutePolicy::Direct(MixedInputSupport::ObservedInsertionsOnly)
+        }
+        (true, MonitorTier::AtSpiSemanticOnly) => {
+            RoutePolicy::Direct(MixedInputSupport::Unavailable)
+        }
+        (false, MonitorTier::Physical) => RoutePolicy::Guarded,
+        (false, MonitorTier::AtSpiSemanticOnly) => RoutePolicy::Unavailable,
+    }
 }
 
 enum Route {
@@ -843,62 +906,32 @@ struct Capture {
     direct: bool,
 }
 
-async fn begin_session(
+async fn begin_session<S>(
     connection: &AccessibilityConnection,
+    events: &mut Pin<Box<S>>,
     state: &mut ConnectedState,
     context: BeginContext,
     sink: Arc<dyn SessionEventSink>,
     cancellation: SessionCancellation,
     generation: u64,
-) -> Result<BeginData, FocusedOutputReasonCode> {
+) -> Result<BeginData, FocusedOutputReasonCode>
+where
+    S: Stream<Item = Result<Event, atspi::AtspiError>>,
+{
     if cancellation.is_cancelled() {
         return Err(FocusedOutputReasonCode::Cancelled);
     }
     let captured = capture_target(connection, generation).await?;
     if context.auto_submit_requested {
-        // Linux helpers can post key events, but this backend has no established
-        // target/provider submit acknowledgement. Fail before arming rather than
-        // advertising submit support from executable presence alone.
         return Err(FocusedOutputReasonCode::AutoSubmitUnsupported);
     }
-    let (route, capability) = if captured.direct {
-        (
-            Route::Direct,
-            FocusedOutputCapability::verified_control(
-                FocusedOutputBackend::LinuxAtSpi,
-                ResolvedInsertionCapability {
-                    insertion_transport: InsertionTransport::AtSpiEditableText,
-                    receipt_confidence: ReceiptConfidence::Verified,
-                },
-                MixedInputSupport::ObservedInsertionsOnly,
-                false,
-            ),
-        )
-    } else {
-        let request = tool_request(context.typing_tool)?;
-        let tool = probe_tool(request)
-            .await
-            .ok_or(FocusedOutputReasonCode::TypingToolUnavailable)?;
-        (
-            Route::Guarded(tool),
-            FocusedOutputCapability::guarded_focused_control(
-                FocusedOutputBackend::LinuxAtSpi,
-                ResolvedInsertionCapability {
-                    insertion_transport: InsertionTransport::LinuxFocusedKeyboard,
-                    receipt_confidence: ReceiptConfidence::Posted,
-                },
-                MixedInputSupport::ObservedInsertionsOnly,
-                false,
-            ),
-        )
-    };
     let stop_chord = StopChord::parse(context.control_shortcut.as_deref());
     if context.control_shortcut.is_some() && stop_chord.is_none() {
         return Err(FocusedOutputReasonCode::ControlShortcutUnsupported);
     }
-    if !state.registered {
-        register_events(connection).await?;
-        state.registered = true;
+    if let Err(reason) = register_target_events(connection, &mut state.registrations).await {
+        state.connection_failed = true;
+        return Err(reason);
     }
     let (monitor_tx, monitor_rx) = bounded(MONITOR_CAPACITY);
     let monitor = Arc::new(MonitorShared {
@@ -916,42 +949,224 @@ async fn begin_session(
         cancellation: cancellation.clone(),
     });
     let listener_path = format!("{LISTENER_ROOT}/{generation}");
-    if register_device_listener(connection, &listener_path, monitor.clone())
-        .await
-        .is_err()
-    {
-        if state.registered {
-            deregister_events(connection).await;
-            state.registered = false;
+    let monitor_tier = match register_pointer_events(connection, &mut state.registrations).await {
+        Ok(()) => match register_device_listener(connection, &listener_path, monitor.clone()).await
+        {
+            Ok(PhysicalMonitorProbe::Installed) => MonitorTier::Physical,
+            Ok(PhysicalMonitorProbe::Unsupported) => {
+                if deregister_pointer_events(connection, &mut state.registrations)
+                    .await
+                    .is_err()
+                {
+                    state.connection_failed = true;
+                    let _ = deregister_all_events(connection, &mut state.registrations).await;
+                    return Err(FocusedOutputReasonCode::MonitorUnavailable);
+                }
+                MonitorTier::AtSpiSemanticOnly
+            }
+            Err(reason) => {
+                state.connection_failed = true;
+                let _ = deregister_all_events(connection, &mut state.registrations).await;
+                return Err(reason);
+            }
+        },
+        Err(reason) => {
+            state.connection_failed = true;
+            let _ = deregister_all_events(connection, &mut state.registrations).await;
+            return Err(reason);
         }
+    };
+    let installed_listener =
+        (monitor_tier == MonitorTier::Physical).then_some(listener_path.clone());
+    if state.registry_owner.is_lost() {
+        cleanup_unarmed(connection, state, installed_listener).await;
+        state.connection_failed = true;
         return Err(FocusedOutputReasonCode::MonitorUnavailable);
     }
+    let semantic_character_count = if monitor_tier == MonitorTier::AtSpiSemanticOnly {
+        match capture_character_count(connection, &captured.target).await {
+            Ok(count) if semantic_snapshot_valid(captured.caret, count) => Some(count),
+            Ok(_) => {
+                cleanup_unarmed(connection, state, installed_listener).await;
+                return Err(FocusedOutputReasonCode::TargetUnsupported);
+            }
+            Err(reason) => {
+                cleanup_unarmed(connection, state, installed_listener).await;
+                return Err(reason);
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(reason) = drain_prearm_events(events, &captured.target) {
+        cleanup_unarmed(connection, state, installed_listener).await;
+        if reason == FocusedOutputReasonCode::MonitorUnavailable {
+            state.connection_failed = true;
+        }
+        return Err(reason);
+    }
+    let recaptured = capture_target(connection, generation).await;
+    let recaptured = match recaptured {
+        Ok(value) if value.target == captured.target && value.caret == captured.caret => value,
+        Ok(_) => {
+            cleanup_unarmed(connection, state, installed_listener).await;
+            return Err(FocusedOutputReasonCode::TargetChanged);
+        }
+        Err(reason) => {
+            cleanup_unarmed(connection, state, installed_listener).await;
+            return Err(reason);
+        }
+    };
+    let semantic_character_count = if let Some(expected) = semantic_character_count {
+        match capture_character_count(connection, &recaptured.target).await {
+            Ok(observed)
+                if observed == expected && semantic_snapshot_valid(recaptured.caret, observed) =>
+            {
+                Some(observed)
+            }
+            Ok(_) => {
+                cleanup_unarmed(connection, state, installed_listener).await;
+                return Err(FocusedOutputReasonCode::TargetChanged);
+            }
+            Err(reason) => {
+                cleanup_unarmed(connection, state, installed_listener).await;
+                return Err(reason);
+            }
+        }
+    } else {
+        None
+    };
+    let (route, capability) = match route_policy(recaptured.direct, monitor_tier) {
+        RoutePolicy::Direct(mixed_input_support) => (
+            Route::Direct,
+            FocusedOutputCapability::verified_control(
+                FocusedOutputBackend::LinuxAtSpi,
+                ResolvedInsertionCapability {
+                    insertion_transport: InsertionTransport::AtSpiEditableText,
+                    receipt_confidence: ReceiptConfidence::Verified,
+                },
+                mixed_input_support,
+                false,
+            ),
+        ),
+        RoutePolicy::Guarded => {
+            let request = match tool_request(context.typing_tool) {
+                Ok(request) => request,
+                Err(reason) => {
+                    cleanup_unarmed(connection, state, installed_listener).await;
+                    return Err(reason);
+                }
+            };
+            let Some(tool) = probe_tool(request).await else {
+                cleanup_unarmed(connection, state, installed_listener).await;
+                return Err(FocusedOutputReasonCode::TypingToolUnavailable);
+            };
+            (
+                Route::Guarded(tool),
+                FocusedOutputCapability::guarded_focused_control(
+                    FocusedOutputBackend::LinuxAtSpi,
+                    ResolvedInsertionCapability {
+                        insertion_transport: InsertionTransport::LinuxFocusedKeyboard,
+                        receipt_confidence: ReceiptConfidence::Posted,
+                    },
+                    MixedInputSupport::ObservedInsertionsOnly,
+                    false,
+                ),
+            )
+        }
+        RoutePolicy::Unavailable => {
+            cleanup_unarmed(connection, state, installed_listener).await;
+            return Err(FocusedOutputReasonCode::MonitorUnavailable);
+        }
+    };
     state.registry_owner.arm(&monitor);
     state.session = Some(SessionRecord {
         generation,
         session_id: context.session_id,
-        target: captured.target,
+        target: recaptured.target,
         route,
+        monitor_tier,
         sink,
         cancellation,
         monitor,
         monitor_rx,
-        listener_path,
+        listener_path: installed_listener,
         next_observation: 1,
-        caret: captured.caret,
+        caret: recaptured.caret,
+        semantic_character_count,
         user_intent: false,
         external_caret: None,
         focus_loss_at: None,
-        listener_removed: false,
     });
-    // Every insertion revalidates process identity, focus metadata, security
-    // state, interfaces, and caret before writing. Setup-time AT-SPI events are
-    // queued for this installed session and close any capture-to-arm race.
     Ok(BeginData {
         generation,
         capability,
-        application: captured.application,
+        application: recaptured.application,
     })
+}
+
+async fn cleanup_unarmed(
+    connection: &AccessibilityConnection,
+    state: &mut ConnectedState,
+    listener_path: Option<String>,
+) {
+    if let Some(listener_path) = listener_path {
+        if deregister_device_listener(connection, &listener_path)
+            .await
+            .is_err()
+        {
+            state.connection_failed = true;
+        }
+    }
+    if deregister_all_events(connection, &mut state.registrations)
+        .await
+        .is_err()
+    {
+        state.connection_failed = true;
+    }
+}
+fn semantic_snapshot_valid(caret: i32, character_count: i32) -> bool {
+    caret >= 0 && character_count >= caret
+}
+
+fn drain_prearm_events<S>(
+    events: &mut Pin<Box<S>>,
+    target: &Target,
+) -> Result<(), FocusedOutputReasonCode>
+where
+    S: Stream<Item = Result<Event, atspi::AtspiError>>,
+{
+    loop {
+        match events.next().now_or_never() {
+            None => return Ok(()),
+            Some(Some(Ok(event))) if !prearm_event_invalidates(target, &event) => {}
+            Some(Some(Ok(_))) => return Err(FocusedOutputReasonCode::TargetChanged),
+            Some(Some(Err(_))) | Some(None) => {
+                return Err(FocusedOutputReasonCode::MonitorUnavailable)
+            }
+        }
+    }
+}
+
+fn prearm_event_invalidates(target: &Target, event: &Event) -> bool {
+    match event {
+        Event::Object(ObjectEvents::TextChanged(event)) => same_object(&event.item, target),
+        Event::Object(ObjectEvents::TextCaretMoved(event)) => same_object(&event.item, target),
+        Event::Object(ObjectEvents::TextSelectionChanged(event)) => {
+            same_object(&event.item, target)
+        }
+        Event::Object(ObjectEvents::StateChanged(event)) => {
+            same_object(&event.item, target)
+                && match event.state {
+                    State::Focused | State::Sensitive | State::Editable => !event.enabled,
+                    State::Defunct => event.enabled,
+                    _ => false,
+                }
+        }
+        Event::Focus(FocusEvents::Focus(event)) => !same_object(&event.item, target),
+        Event::Mouse(_) => true,
+        _ => false,
+    }
 }
 
 async fn application_cache_items(
@@ -1135,6 +1350,16 @@ async fn capture_target(
         caret,
         direct,
     })
+}
+
+async fn capture_character_count(
+    connection: &AccessibilityConnection,
+    target: &Target,
+) -> Result<i32, FocusedOutputReasonCode> {
+    let text = text(connection, &target.bus, &target.path).await?;
+    bounded_call(text.character_count())
+        .await
+        .map_err(|_| FocusedOutputReasonCode::TargetUnsupported)
 }
 
 async fn bounded_call<F, T, E>(future: F) -> Result<T, ()>
@@ -1379,6 +1604,42 @@ async fn validate_target(
     })
 }
 
+async fn semantic_character_count(
+    connection: &AccessibilityConnection,
+    session: &SessionRecord,
+) -> Result<i32, FocusedOutputReasonCode> {
+    let proxy = text(connection, &session.target.bus, &session.target.path)
+        .await
+        .map_err(|_| {
+            session.monitor.terminal(T_TARGET);
+            FocusedOutputReasonCode::TargetChanged
+        })?;
+    target_metadata_call(session, proxy.character_count()).await
+}
+
+fn drain_buffered_semantic_events<S>(events: &mut Pin<Box<S>>, session: &mut SessionRecord) -> bool
+where
+    S: Stream<Item = Result<Event, atspi::AtspiError>>,
+{
+    if session.monitor_tier == MonitorTier::Physical {
+        return true;
+    }
+    loop {
+        match events.next().now_or_never() {
+            None => return session.monitor.terminal.load(Ordering::Acquire) == T_NONE,
+            Some(Some(Ok(event))) => process_session_event(session, event),
+            Some(Some(Err(_))) | Some(None) => {
+                session.monitor.terminal(T_MONITOR);
+                publish_terminal(session);
+                return false;
+            }
+        }
+        if session.monitor.terminal.load(Ordering::Acquire) != T_NONE {
+            return false;
+        }
+    }
+}
+
 async fn insert<S>(
     connection: &AccessibilityConnection,
     events: &mut Pin<Box<S>>,
@@ -1492,6 +1753,31 @@ where
     let mut accepted = 0;
     for range in scalar_chunks(&request.text, MAX_SCALARS) {
         let chunk = &request.text[range];
+        if !drain_buffered_semantic_events(events, session) {
+            let terminal = session.monitor.terminal.load(Ordering::Acquire);
+            return verified_prefix(accepted, reason_for_terminal(terminal));
+        }
+        let semantic_count_before = if session.monitor_tier == MonitorTier::AtSpiSemanticOnly {
+            let expected = session
+                .semantic_character_count
+                .expect("semantic-only sessions capture a character count");
+            match semantic_character_count(connection, session).await {
+                Ok(observed) if observed == expected => Some(expected),
+                Ok(observed) => {
+                    log::debug!(
+                        "Linux semantic-only target length changed: expected={expected}, observed={observed}"
+                    );
+                    session.monitor.terminal(T_MIXED);
+                    return verified_prefix(
+                        accepted,
+                        FocusedOutputReasonCode::MixedInputUnavailable,
+                    );
+                }
+                Err(reason) => return verified_prefix(accepted, reason),
+            }
+        } else {
+            None
+        };
         let caret = match validate_target(connection, session).await {
             Ok(caret) if caret == session.caret => caret,
             Ok(observed) => {
@@ -1568,6 +1854,42 @@ where
             }
         }
         drop(observed);
+        if let Some(count_before) = semantic_count_before {
+            let expected_count = match count_before.checked_add(chars) {
+                Some(value) => value,
+                None => {
+                    return verified_prefix_with_deferred_terminal(
+                        session,
+                        accepted,
+                        FocusedOutputReasonCode::MixedInputUnavailable,
+                    );
+                }
+            };
+            let observed_caret = match validate_target(connection, session).await {
+                Ok(value) => value,
+                Err(reason) => {
+                    return verified_prefix_with_deferred_terminal(session, accepted, reason)
+                }
+            };
+            let observed_count = match semantic_character_count(connection, session).await {
+                Ok(value) => value,
+                Err(reason) => {
+                    return verified_prefix_with_deferred_terminal(session, accepted, reason)
+                }
+            };
+            if observed_caret != session.caret || observed_count != expected_count {
+                log::debug!(
+                    "Linux semantic-only post-insert state changed: caret expected={}, observed={observed_caret}; length expected={expected_count}, observed={observed_count}",
+                    session.caret
+                );
+                return verified_prefix_with_deferred_terminal(
+                    session,
+                    accepted,
+                    FocusedOutputReasonCode::MixedInputUnavailable,
+                );
+            }
+            session.semantic_character_count = Some(observed_count);
+        }
         let marker = request.injection_id.get();
         let expected = ExpectedEffect {
             start: caret,
@@ -1580,12 +1902,23 @@ where
         match wait_effect(events, session, expected).await {
             EffectResult::Matched => {}
             EffectResult::Missing | EffectResult::Disconnected => {
-                // Exact direct readback is authoritative for this unit. Missing
-                // monitoring terminates future work without discarding it.
-                session.monitor.terminal(T_MONITOR);
-                break;
+                // Exact direct readback is authoritative for this unit. Defer
+                // termination until the manager commits its verified prefix.
+                return verified_prefix_with_deferred_terminal(
+                    session,
+                    accepted,
+                    FocusedOutputReasonCode::MonitorUnavailable,
+                );
             }
-            EffectResult::Unsafe => break,
+            EffectResult::Unsafe => {
+                let terminal = session.monitor.terminal.load(Ordering::Acquire);
+                let reason = if terminal == T_NONE && session.cancellation.is_cancelled() {
+                    FocusedOutputReasonCode::Cancelled
+                } else {
+                    reason_for_terminal(terminal)
+                };
+                return verified_prefix_with_deferred_terminal(session, accepted, reason);
+            }
         }
     }
     if accepted == request.text.len() {
@@ -1619,12 +1952,27 @@ fn verified_prefix(accepted: usize, reason: FocusedOutputReasonCode) -> InsertOu
         }
     }
 }
+fn verified_prefix_with_deferred_terminal(
+    session: &SessionRecord,
+    accepted: usize,
+    reason: FocusedOutputReasonCode,
+) -> InsertOutcome {
+    debug_assert!(accepted > 0);
+    session.monitor.terminal.store(T_NONE, Ordering::Release);
+    session.monitor.published.store(false, Ordering::Release);
+    InsertOutcome::Partial {
+        accepted_bytes: accepted,
+        receipt: ReceiptConfidence::Verified,
+        reason,
+    }
+}
 
 async fn insert_guarded<S>(
     connection: &AccessibilityConnection,
     events: &mut Pin<Box<S>>,
     session: &mut SessionRecord,
     request: InsertionRequest,
+
     tool: PinnedTool,
 ) -> InsertOutcome
 where
@@ -1999,6 +2347,8 @@ fn classify_event(
                 } else {
                     EventClass::Unsafe(T_EDIT)
                 }
+            } else if session.monitor_tier == MonitorTier::AtSpiSemanticOnly {
+                EventClass::Unsafe(T_MIXED)
             } else if session.user_intent && event.start_pos == session.caret && event.length > 0 {
                 let caret = event.start_pos.saturating_add(event.length);
                 match session.external_caret {
@@ -2050,11 +2400,19 @@ fn classify_event(
             if !same_object(&event.item, &session.target) {
                 EventClass::Foreign
             } else if event.state == State::Focused && !event.enabled {
-                session.focus_loss_at = Some(Instant::now());
-                EventClass::Neutral
+                if session.monitor_tier == MonitorTier::AtSpiSemanticOnly {
+                    EventClass::Unsafe(T_TARGET)
+                } else {
+                    session.focus_loss_at = Some(Instant::now());
+                    EventClass::Neutral
+                }
             } else if event.state == State::Focused && event.enabled {
                 session.focus_loss_at = None;
                 EventClass::Neutral
+            } else if (event.state == State::Sensitive || event.state == State::Editable)
+                && !event.enabled
+            {
+                EventClass::Unsafe(T_TARGET)
             } else if event.state == State::Defunct && event.enabled {
                 EventClass::Unsafe(T_CLOSED)
             } else {
@@ -2078,10 +2436,14 @@ fn same_object(item: &ObjectRefOwned, target: &Target) -> bool {
 }
 
 fn process_idle_event(state: &mut ConnectedState, event: Event) {
-    let foreign_focus = matches!(&event, Event::Focus(_));
     let Some(session) = state.session.as_mut() else {
         return;
     };
+    process_session_event(session, event);
+}
+
+fn process_session_event(session: &mut SessionRecord, event: Event) {
+    let foreign_focus = matches!(&event, Event::Focus(_));
     match classify_event(session, event, None) {
         EventClass::External(chars, caret) => {
             let id = next_observation(session);
@@ -2454,22 +2816,37 @@ impl StopChord {
     }
 }
 
-async fn register_events(
+async fn register_target_events(
     connection: &AccessibilityConnection,
+    registrations: &mut EventRegistrations,
 ) -> Result<(), FocusedOutputReasonCode> {
     let result = async {
         register_event::<TextChangedEvent>(connection).await?;
+        registrations.text_changed = true;
         register_event::<TextCaretMovedEvent>(connection).await?;
+        registrations.caret_moved = true;
         register_event::<TextSelectionChangedEvent>(connection).await?;
+        registrations.selection_changed = true;
         register_event::<StateChangedEvent>(connection).await?;
+        registrations.state_changed = true;
         register_event::<FocusEvent>(connection).await?;
-        register_event::<MouseEvents>(connection).await
+        registrations.focus = true;
+        Ok(())
     }
     .await;
     if result.is_err() {
-        deregister_events(connection).await;
+        let _ = deregister_target_events(connection, registrations).await;
     }
     result
+}
+
+async fn register_pointer_events(
+    connection: &AccessibilityConnection,
+    registrations: &mut EventRegistrations,
+) -> Result<(), FocusedOutputReasonCode> {
+    register_event::<MouseEvents>(connection).await?;
+    registrations.mouse = true;
+    Ok(())
 }
 
 async fn register_event<T>(
@@ -2484,31 +2861,93 @@ where
         .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)
 }
 
-async fn deregister_events(connection: &AccessibilityConnection) {
-    deregister_event::<TextChangedEvent>(connection).await;
-    deregister_event::<TextCaretMovedEvent>(connection).await;
-    deregister_event::<TextSelectionChangedEvent>(connection).await;
-    deregister_event::<StateChangedEvent>(connection).await;
-    deregister_event::<FocusEvent>(connection).await;
-    deregister_event::<MouseEvents>(connection).await;
+async fn deregister_target_events(
+    connection: &AccessibilityConnection,
+    registrations: &mut EventRegistrations,
+) -> Result<(), ()> {
+    let mut removed = true;
+    removed &= deregister_if::<TextChangedEvent>(connection, &mut registrations.text_changed)
+        .await
+        .is_ok();
+    removed &= deregister_if::<TextCaretMovedEvent>(connection, &mut registrations.caret_moved)
+        .await
+        .is_ok();
+    removed &= deregister_if::<TextSelectionChangedEvent>(
+        connection,
+        &mut registrations.selection_changed,
+    )
+    .await
+    .is_ok();
+    removed &= deregister_if::<StateChangedEvent>(connection, &mut registrations.state_changed)
+        .await
+        .is_ok();
+    removed &= deregister_if::<FocusEvent>(connection, &mut registrations.focus)
+        .await
+        .is_ok();
+    removed.then_some(()).ok_or(())
 }
 
-async fn deregister_event<T>(connection: &AccessibilityConnection)
+async fn deregister_pointer_events(
+    connection: &AccessibilityConnection,
+    registrations: &mut EventRegistrations,
+) -> Result<(), ()> {
+    deregister_if::<MouseEvents>(connection, &mut registrations.mouse).await
+}
+
+async fn deregister_all_events(
+    connection: &AccessibilityConnection,
+    registrations: &mut EventRegistrations,
+) -> Result<(), ()> {
+    let pointer = deregister_pointer_events(connection, registrations)
+        .await
+        .is_ok();
+    let target = deregister_target_events(connection, registrations)
+        .await
+        .is_ok();
+    (pointer && target).then_some(()).ok_or(())
+}
+
+async fn deregister_if<T>(
+    connection: &AccessibilityConnection,
+    installed: &mut bool,
+) -> Result<(), ()>
 where
     T: atspi::events::RegistryEventString + atspi::events::DBusMatchRule,
 {
-    let _ = timeout(
-        TARGET_CALL_DEADLINE,
-        connection.remove_registry_event::<T>(),
-    )
-    .await;
-    // atspi 0.30's convenience method accidentally adds the match rule during
-    // deregistration; explicitly remove it from the bus as well.
-    if let Ok(rule) = zbus::MatchRule::try_from(T::MATCH_RULE_STRING) {
-        if let Ok(proxy) = zbus::fdo::DBusProxy::new(connection.connection()).await {
-            let _ = timeout(TARGET_CALL_DEADLINE, proxy.remove_match_rule(rule)).await;
-        }
+    if !*installed {
+        return Ok(());
     }
+    deregister_event::<T>(connection).await?;
+    *installed = false;
+    Ok(())
+}
+
+async fn deregister_event<T>(connection: &AccessibilityConnection) -> Result<(), ()>
+where
+    T: atspi::events::RegistryEventString + atspi::events::DBusMatchRule,
+{
+    let registry_removed = matches!(
+        timeout(
+            TARGET_CALL_DEADLINE,
+            connection.remove_registry_event::<T>(),
+        )
+        .await,
+        Ok(Ok(()))
+    );
+    // Removing the registry event does not remove the local D-Bus match rule.
+    let rule = zbus::MatchRule::try_from(T::MATCH_RULE_STRING).map_err(|_| ())?;
+    let proxy = timeout(
+        TARGET_CALL_DEADLINE,
+        zbus::fdo::DBusProxy::new(connection.connection()),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    let match_removed = matches!(
+        timeout(TARGET_CALL_DEADLINE, proxy.remove_match_rule(rule)).await,
+        Ok(Ok(()))
+    );
+    (registry_removed && match_removed).then_some(()).ok_or(())
 }
 
 type RegisteredKeystrokeListener = (
@@ -2521,13 +2960,20 @@ type RegisteredKeystrokeListener = (
     (bool, bool, bool),
 );
 
+fn registered_keystroke_listener_identity_matches(
+    registration: &RegisteredKeystrokeListener,
+    bus: &str,
+    path: &str,
+) -> bool {
+    registration.0 == bus && registration.1.as_str() == path
+}
+
 fn registered_keystroke_listener_matches(
     registration: &RegisteredKeystrokeListener,
     bus: &str,
     path: &str,
 ) -> bool {
-    registration.0 == bus
-        && registration.1.as_str() == path
+    registered_keystroke_listener_identity_matches(registration, bus, path)
         && registration.2 == 0
         && registration.3 == KEY_EVENT_TYPES
         && registration.4.is_empty()
@@ -2535,12 +2981,92 @@ fn registered_keystroke_listener_matches(
         && registration.6 == (false, false, true)
 }
 
+fn listener_registration_absent(
+    registrations: &[RegisteredKeystrokeListener],
+    bus: &str,
+    path: &str,
+) -> bool {
+    !registrations
+        .iter()
+        .any(|registration| registered_keystroke_listener_identity_matches(registration, bus, path))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalMonitorProbe {
+    Installed,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistrationReceipt {
+    Exact,
+    NoExact,
+    TimedOut,
+    Malformed,
+}
+
+fn physical_probe_decision(
+    receipt: RegistrationReceipt,
+    listener_absent: bool,
+    owner_stable: bool,
+) -> Result<PhysicalMonitorProbe, FocusedOutputReasonCode> {
+    match receipt {
+        RegistrationReceipt::Exact => Ok(PhysicalMonitorProbe::Installed),
+        RegistrationReceipt::NoExact | RegistrationReceipt::TimedOut
+            if listener_absent && owner_stable =>
+        {
+            Ok(PhysicalMonitorProbe::Unsupported)
+        }
+        RegistrationReceipt::NoExact
+        | RegistrationReceipt::TimedOut
+        | RegistrationReceipt::Malformed => Err(FocusedOutputReasonCode::MonitorUnavailable),
+    }
+}
+
 async fn register_device_listener(
     connection: &AccessibilityConnection,
     listener_path: &str,
     shared: Arc<MonitorShared>,
-) -> Result<(), ()> {
-    let controller = controller_identity(connection).await?;
+) -> Result<PhysicalMonitorProbe, FocusedOutputReasonCode> {
+    let controller = controller_identity(connection)
+        .await
+        .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?;
+    let listener_bus = connection
+        .connection()
+        .unique_name()
+        .map(|name| name.as_str().to_owned())
+        .ok_or(FocusedOutputReasonCode::MonitorUnavailable)?;
+    let path: zbus::zvariant::ObjectPath<'_> = listener_path
+        .try_into()
+        .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?;
+    let mode = EventListenerMode {
+        synchronous: false,
+        preemptive: false,
+        global: true,
+    };
+    let signal_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(controller.sender.as_str())
+        .and_then(|builder| builder.path(DEVICE_EVENT_CONTROLLER_PATH))
+        .and_then(|builder| builder.interface(DEVICE_EVENT_LISTENER_INTERFACE))
+        .and_then(|builder| builder.member("KeystrokeListenerRegistered"))
+        .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?
+        .build();
+    let mut registrations = timeout(
+        TARGET_CALL_DEADLINE,
+        zbus::MessageStream::for_match_rule(signal_rule, connection.connection(), Some(1)),
+    )
+    .await
+    .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?
+    .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?;
+    let raw_proxy = zbus::Proxy::new(
+        connection.connection(),
+        REGISTRY,
+        DEVICE_EVENT_CONTROLLER_PATH,
+        DEVICE_EVENT_CONTROLLER_INTERFACE,
+    )
+    .await
+    .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?;
     connection
         .connection()
         .object_server()
@@ -2552,89 +3078,25 @@ async fn register_device_listener(
             },
         )
         .await
-        .map_err(|_| ())?;
-    let path: zbus::zvariant::ObjectPath<'_> = match listener_path.try_into() {
-        Ok(path) => path,
-        Err(_) => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
-    let mode = EventListenerMode {
-        synchronous: false,
-        preemptive: false,
-        global: true,
-    };
-    let signal_rule = match zbus::MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender(controller.sender.as_str())
-        .and_then(|builder| builder.path(DEVICE_EVENT_CONTROLLER_PATH))
-        .and_then(|builder| builder.interface(DEVICE_EVENT_LISTENER_INTERFACE))
-        .and_then(|builder| builder.member("KeystrokeListenerRegistered"))
-    {
-        Ok(builder) => builder.build(),
-        Err(_) => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
-    let mut registrations = match timeout(
-        TARGET_CALL_DEADLINE,
-        zbus::MessageStream::for_match_rule(signal_rule, connection.connection(), Some(1)),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        _ => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
-    let listener_bus = match connection.connection().unique_name() {
-        Some(name) => name.as_str().to_owned(),
-        None => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
-    let raw_proxy = match zbus::Proxy::new(
-        connection.connection(),
-        REGISTRY,
-        DEVICE_EVENT_CONTROLLER_PATH,
-        DEVICE_EVENT_CONTROLLER_INTERFACE,
-    )
-    .await
-    {
-        Ok(proxy) => proxy,
-        Err(_) => {
-            remove_listener(connection, listener_path).await;
-            return Err(());
-        }
-    };
+        .map_err(|_| FocusedOutputReasonCode::MonitorUnavailable)?;
     let keys: [KeyDefinition<'_>; 0] = [];
     let registration_args = (&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES, &mode);
     let registration_signal = async {
         while let Some(message) = registrations.next().await {
-            let Ok(message) = message else {
-                return false;
-            };
-            let Ok(registration) = message.body().deserialize::<RegisteredKeystrokeListener>()
-            else {
-                log::debug!("AT-SPI key registration signal had an unexpected body");
-                continue;
-            };
+            let message = message.map_err(|_| ())?;
+            let registration = message
+                .body()
+                .deserialize::<RegisteredKeystrokeListener>()
+                .map_err(|_| ())?;
             let exact =
                 registered_keystroke_listener_matches(&registration, &listener_bus, listener_path);
             log::debug!("AT-SPI key registration signal matched request: {exact}");
             if exact {
-                return true;
+                return Ok::<bool, ()>(true);
             }
         }
-        false
+        Ok::<bool, ()>(false)
     };
-    // Keep the signal stream polled while the method runs: zbus does not
-    // guarantee delivery to an idle stream, and the registry emits this
-    // signal immediately before returning from the method.
     let (_registration_call, keystrokes) = tokio::join!(
         timeout(
             TARGET_CALL_DEADLINE,
@@ -2642,52 +3104,93 @@ async fn register_device_listener(
         ),
         timeout(TARGET_CALL_DEADLINE, registration_signal),
     );
-    // at-spi2-core's method reply is not authoritative: deployed registryd
-    // versions can return false or never complete it after successful global
-    // grabs. The exact registration signal is emitted only after those X11
-    // grabs succeed, so it is the bounded success receipt.
-    if !matches!(keystrokes, Ok(true)) {
-        deregister_device_listener(connection, listener_path).await;
+    let receipt = match keystrokes {
+        Ok(Ok(true)) => RegistrationReceipt::Exact,
+        Ok(Ok(false)) => RegistrationReceipt::NoExact,
+        Err(_) => RegistrationReceipt::TimedOut,
+        Ok(Err(())) => RegistrationReceipt::Malformed,
+    };
+    if receipt == RegistrationReceipt::Exact {
+        return physical_probe_decision(receipt, true, true);
+    }
+    let listener_absent = rollback_device_listener(connection, listener_path, &listener_bus)
+        .await
+        .is_ok();
+    let owner_stable = controller_identity(connection).await == Ok(controller);
+    physical_probe_decision(receipt, listener_absent, owner_stable)
+}
+
+async fn rollback_device_listener(
+    connection: &AccessibilityConnection,
+    listener_path: &str,
+    listener_bus: &str,
+) -> Result<(), ()> {
+    let path = zbus::zvariant::ObjectPath::try_from(listener_path).map_err(|_| ())?;
+    let raw_proxy = zbus::Proxy::new(
+        connection.connection(),
+        REGISTRY,
+        DEVICE_EVENT_CONTROLLER_PATH,
+        DEVICE_EVENT_CONTROLLER_INTERFACE,
+    )
+    .await
+    .map_err(|_| ())?;
+    let keys: [KeyDefinition<'_>; 0] = [];
+    let _ = timeout(
+        TARGET_CALL_DEADLINE,
+        raw_proxy.call::<_, _, ()>(
+            "DeregisterKeystrokeListener",
+            &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES),
+        ),
+    )
+    .await;
+    let listeners = timeout(
+        TARGET_CALL_DEADLINE,
+        raw_proxy.call::<_, _, Vec<RegisteredKeystrokeListener>>("GetKeystrokeListeners", &()),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    if !listener_registration_absent(&listeners, listener_bus, listener_path) {
         return Err(());
     }
-    // Pointer activity is delivered through the registered AT-SPI MouseEvents
-    // stream; current registryd exposes device listeners only for keystrokes.
-    Ok(())
+    remove_listener(connection, listener_path).await
 }
 
-async fn deregister_device_listener(connection: &AccessibilityConnection, listener_path: &str) {
-    if let Ok(path) = zbus::zvariant::ObjectPath::try_from(listener_path) {
-        if let Ok(raw_proxy) = zbus::Proxy::new(
-            connection.connection(),
-            REGISTRY,
-            DEVICE_EVENT_CONTROLLER_PATH,
-            DEVICE_EVENT_CONTROLLER_INTERFACE,
-        )
-        .await
-        {
-            let keys: [KeyDefinition<'_>; 0] = [];
-            let _ = timeout(
-                TARGET_CALL_DEADLINE,
-                raw_proxy.call::<_, _, ()>(
-                    "DeregisterKeystrokeListener",
-                    &(&path, keys.as_slice(), 0u32, KEY_EVENT_TYPES),
-                ),
-            )
-            .await;
+async fn deregister_device_listener(
+    connection: &AccessibilityConnection,
+    listener_path: &str,
+) -> Result<(), ()> {
+    let listener_bus = connection
+        .connection()
+        .unique_name()
+        .map(|name| name.as_str().to_owned());
+    let result = match listener_bus {
+        Some(listener_bus) => {
+            rollback_device_listener(connection, listener_path, &listener_bus).await
         }
+        None => Err(()),
+    };
+    if result.is_err() {
+        let _ = remove_listener(connection, listener_path).await;
     }
-    remove_listener(connection, listener_path).await;
+    result
 }
 
-async fn remove_listener(connection: &AccessibilityConnection, listener_path: &str) {
-    let _ = timeout(
+async fn remove_listener(
+    connection: &AccessibilityConnection,
+    listener_path: &str,
+) -> Result<(), ()> {
+    timeout(
         TARGET_CALL_DEADLINE,
         connection
             .connection()
             .object_server()
             .remove::<DeviceListener, _>(listener_path),
     )
-    .await;
+    .await
+    .map_err(|_| ())?
+    .map(|_| ())
+    .map_err(|_| ())
 }
 
 fn focus_loss_expired(lost_at: Option<Instant>) -> bool {
@@ -2699,9 +3202,15 @@ async fn drain_monitor(connection: &AccessibilityConnection, state: &mut Connect
         return;
     };
     drain_one_monitor(session);
-    if session.monitor.terminal.load(Ordering::Acquire) != T_NONE && !session.listener_removed {
-        deregister_device_listener(connection, &session.listener_path).await;
-        session.listener_removed = true;
+    if session.monitor.terminal.load(Ordering::Acquire) != T_NONE {
+        if let Some(listener_path) = session.listener_path.take() {
+            if deregister_device_listener(connection, &listener_path)
+                .await
+                .is_err()
+            {
+                state.connection_failed = true;
+            }
+        }
     }
 }
 
@@ -2748,6 +3257,10 @@ fn publish_terminal(session: &mut SessionRecord) {
             observation_id: id,
             kind: UnsafeEditKind::Unknown,
         },
+        T_MIXED => TargetInteractionEvent::UnsafeEdit {
+            observation_id: id,
+            kind: UnsafeEditKind::UnattributedInsertion,
+        },
         T_CARET => TargetInteractionEvent::UnsafeEdit {
             observation_id: id,
             kind: UnsafeEditKind::CaretRepositioned,
@@ -2793,6 +3306,7 @@ fn reason_for_terminal(code: u8) -> FocusedOutputReasonCode {
         T_SELECTION => FocusedOutputReasonCode::SelectionChanged,
         T_COMMAND => FocusedOutputReasonCode::UnsafeKeyboardCommand,
         T_IME => FocusedOutputReasonCode::ImeCompositionUnsupported,
+        T_MIXED => FocusedOutputReasonCode::MixedInputUnavailable,
         T_MONITOR => FocusedOutputReasonCode::MonitorUnavailable,
         T_CLOSED => FocusedOutputReasonCode::TargetClosed,
         T_CANCELLED => FocusedOutputReasonCode::Cancelled,
@@ -2808,7 +3322,7 @@ fn invalidate_bus(state: &mut ConnectedState) {
     }
 }
 
-async fn cleanup(connection: &AccessibilityConnection, session: &mut SessionRecord) {
+async fn cleanup(connection: &AccessibilityConnection, session: &mut SessionRecord) -> bool {
     session.monitor.terminal(T_CANCELLED);
     session.monitor.dispatch.store(false, Ordering::Release);
     session
@@ -2819,9 +3333,11 @@ async fn cleanup(connection: &AccessibilityConnection, session: &mut SessionReco
         .monitor
         .dispatch_text
         .store(false, Ordering::Release);
-    if !session.listener_removed {
-        deregister_device_listener(connection, &session.listener_path).await;
-        session.listener_removed = true;
+    match session.listener_path.take() {
+        Some(listener_path) => deregister_device_listener(connection, &listener_path)
+            .await
+            .is_ok(),
+        None => true,
     }
 }
 
@@ -2829,10 +3345,7 @@ async fn close_all(connection: &AccessibilityConnection, state: &mut ConnectedSt
     if let Some(mut session) = state.session.take() {
         cleanup(connection, &mut session).await;
     }
-    if state.registered {
-        deregister_events(connection).await;
-        state.registered = false;
-    }
+    let _ = deregister_all_events(connection, &mut state.registrations).await;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3140,6 +3653,244 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn runtime_route_policy_downgrades_only_direct_semantic_targets() {
+        assert_eq!(
+            route_policy(true, MonitorTier::Physical),
+            RoutePolicy::Direct(MixedInputSupport::ObservedInsertionsOnly)
+        );
+        assert_eq!(
+            route_policy(true, MonitorTier::AtSpiSemanticOnly),
+            RoutePolicy::Direct(MixedInputSupport::Unavailable)
+        );
+        assert_eq!(
+            route_policy(false, MonitorTier::Physical),
+            RoutePolicy::Guarded
+        );
+        assert_eq!(
+            route_policy(false, MonitorTier::AtSpiSemanticOnly),
+            RoutePolicy::Unavailable
+        );
+    }
+
+    #[test]
+    fn semantic_snapshot_requires_nonnegative_bounded_caret() {
+        assert!(semantic_snapshot_valid(0, 0));
+        assert!(semantic_snapshot_valid(4, 4));
+        assert!(semantic_snapshot_valid(4, 5));
+        assert!(!semantic_snapshot_valid(-1, 0));
+        assert!(!semantic_snapshot_valid(-2, -1));
+        assert!(!semantic_snapshot_valid(5, 4));
+    }
+
+    #[test]
+    fn physical_probe_downgrades_only_after_proven_cleanup() {
+        assert_eq!(
+            physical_probe_decision(RegistrationReceipt::Exact, false, false),
+            Ok(PhysicalMonitorProbe::Installed)
+        );
+        for receipt in [RegistrationReceipt::NoExact, RegistrationReceipt::TimedOut] {
+            assert_eq!(
+                physical_probe_decision(receipt, true, true),
+                Ok(PhysicalMonitorProbe::Unsupported)
+            );
+            assert_eq!(
+                physical_probe_decision(receipt, false, true),
+                Err(FocusedOutputReasonCode::MonitorUnavailable)
+            );
+            assert_eq!(
+                physical_probe_decision(receipt, true, false),
+                Err(FocusedOutputReasonCode::MonitorUnavailable)
+            );
+        }
+        assert_eq!(
+            physical_probe_decision(RegistrationReceipt::Malformed, true, true),
+            Err(FocusedOutputReasonCode::MonitorUnavailable)
+        );
+    }
+
+    #[derive(Default)]
+    struct TestSessionSink {
+        events: Mutex<Vec<TargetInteractionEvent>>,
+    }
+
+    impl SessionEventSink for TestSessionSink {
+        fn publish(&self, _: DictationSessionId, event: TargetInteractionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn test_session_with_sink(monitor_tier: MonitorTier) -> (SessionRecord, Arc<TestSessionSink>) {
+        let cancellation = SessionCancellation::default();
+        let (tx, monitor_rx) = bounded(4);
+        let monitor = Arc::new(MonitorShared {
+            terminal: AtomicU8::new(T_NONE),
+            published: AtomicBool::new(false),
+            dispatch: AtomicBool::new(false),
+            dispatch_text: AtomicBool::new(false),
+            dispatch_direct: AtomicBool::new(false),
+            tool_key_presses: AtomicU64::new(0),
+            expected_tool_key_presses: AtomicU64::new(0),
+            intent_epoch: AtomicU64::new(0),
+            tx,
+            stop_chord: None,
+            physical_callbacks: AtomicU64::new(0),
+            cancellation: cancellation.clone(),
+        });
+        let sink = Arc::new(TestSessionSink::default());
+        let session = SessionRecord {
+            generation: 1,
+            session_id: DictationSessionId(1),
+            target: Target {
+                bus: ":0.0".to_owned(),
+                path: "/org/a11y/atspi/test/default".to_owned(),
+                app_bus: ":0.0".to_owned(),
+                app_path: "/org/a11y/atspi/test/default".to_owned(),
+                pid: 1,
+                start_ticks: 1,
+                owner_generation: 1,
+            },
+            route: Route::Direct,
+            monitor_tier,
+            sink: sink.clone(),
+            cancellation,
+            monitor,
+            monitor_rx,
+            listener_path: None,
+            next_observation: 1,
+            caret: 4,
+            semantic_character_count: (monitor_tier == MonitorTier::AtSpiSemanticOnly).then_some(4),
+            user_intent: false,
+            external_caret: None,
+            focus_loss_at: None,
+        };
+        (session, sink)
+    }
+
+    fn test_session(monitor_tier: MonitorTier) -> SessionRecord {
+        test_session_with_sink(monitor_tier).0
+    }
+
+    fn test_item() -> ObjectRefOwned {
+        atspi::ObjectRef::new_owned(
+            zbus::names::UniqueName::from_static_str_unchecked(":0.0"),
+            zbus::zvariant::ObjectPath::from_static_str_unchecked("/org/a11y/atspi/test/default"),
+        )
+    }
+
+    fn text_insert_event(text: &str) -> Event {
+        Event::Object(ObjectEvents::TextChanged(TextChangedEvent {
+            item: test_item(),
+            operation: Operation::Insert,
+            start_pos: 4,
+            length: i32::try_from(text.chars().count()).unwrap(),
+            text: text.to_owned(),
+        }))
+    }
+
+    #[test]
+    fn semantic_only_insertions_are_unattributed_unless_expected() {
+        let mut session = test_session(MonitorTier::AtSpiSemanticOnly);
+        assert!(matches!(
+            classify_event(&mut session, text_insert_event("x"), None),
+            EventClass::Unsafe(T_MIXED)
+        ));
+        assert_eq!(
+            reason_for_terminal(T_MIXED),
+            FocusedOutputReasonCode::MixedInputUnavailable
+        );
+
+        let expected = ExpectedEffect {
+            start: 4,
+            chars: 1,
+            marker: 7,
+            hash: text_hash(session.generation ^ 7, "x"),
+            caret_after: 5,
+            tool_key_presses: 0,
+        };
+        assert!(matches!(
+            classify_event(&mut session, text_insert_event("x"), Some(expected)),
+            EventClass::ExpectedText
+        ));
+    }
+
+    #[test]
+    fn semantic_only_conflict_reports_unattributed_insertion() {
+        let (mut session, sink) = test_session_with_sink(MonitorTier::AtSpiSemanticOnly);
+        process_session_event(&mut session, text_insert_event("private"));
+        let event = sink.events.lock().unwrap().pop().unwrap();
+        assert!(matches!(
+            event,
+            TargetInteractionEvent::UnsafeEdit {
+                kind: UnsafeEditKind::UnattributedInsertion,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn semantic_only_prewrite_drain_rejects_buffered_target_edits() {
+        let mut session = test_session(MonitorTier::AtSpiSemanticOnly);
+        let events =
+            futures_util::stream::iter([Ok::<_, atspi::AtspiError>(text_insert_event("x"))]);
+        let mut events = Box::pin(events);
+        assert!(!drain_buffered_semantic_events(&mut events, &mut session));
+        assert_eq!(session.monitor.terminal.load(Ordering::Acquire), T_MIXED);
+    }
+
+    #[test]
+    fn semantic_only_prewrite_drain_treats_stream_closure_as_monitor_loss() {
+        let mut session = test_session(MonitorTier::AtSpiSemanticOnly);
+        let events = futures_util::stream::iter(Vec::<Result<Event, atspi::AtspiError>>::new());
+        let mut events = Box::pin(events);
+        assert!(!drain_buffered_semantic_events(&mut events, &mut session));
+        assert_eq!(session.monitor.terminal.load(Ordering::Acquire), T_MONITOR);
+    }
+
+    #[test]
+    fn physical_prewrite_path_does_not_consume_semantic_events() {
+        let mut session = test_session(MonitorTier::Physical);
+        let events =
+            futures_util::stream::iter([Ok::<_, atspi::AtspiError>(text_insert_event("x"))]);
+        let mut events = Box::pin(events);
+        assert!(drain_buffered_semantic_events(&mut events, &mut session));
+        assert!(matches!(events.next().now_or_never(), Some(Some(Ok(_)))));
+    }
+
+    #[test]
+    fn physical_monitor_retains_compatible_external_insertion_classification() {
+        let mut session = test_session(MonitorTier::Physical);
+        session.user_intent = true;
+        assert!(matches!(
+            classify_event(&mut session, text_insert_event("x"), None),
+            EventClass::External(1, Some(5))
+        ));
+    }
+
+    #[test]
+    fn semantic_only_target_state_loss_is_immediately_terminal() {
+        let mut session = test_session(MonitorTier::AtSpiSemanticOnly);
+        for state in [State::Focused, State::Sensitive, State::Editable] {
+            let event = Event::Object(ObjectEvents::StateChanged(StateChangedEvent {
+                item: test_item(),
+                state,
+                enabled: false,
+            }));
+            assert!(matches!(
+                classify_event(&mut session, event, None),
+                EventClass::Unsafe(T_TARGET)
+            ));
+        }
+        let event = Event::Object(ObjectEvents::StateChanged(StateChangedEvent {
+            item: test_item(),
+            state: State::Defunct,
+            enabled: true,
+        }));
+        assert!(matches!(
+            classify_event(&mut session, event, None),
+            EventClass::Unsafe(T_CLOSED)
+        ));
+    }
+    #[test]
     fn allowlist_rejects_unreviewed_and_argv_transports() {
         assert_eq!(tool_request(TypingTool::Auto), Ok(ToolRequest::Auto));
         assert_eq!(tool_request(TypingTool::Wtype), Ok(ToolRequest::Wtype));
@@ -3330,10 +4081,30 @@ mod tests {
             ":1.43",
             "/com/pais/handy/test"
         ));
+        assert!(!listener_registration_absent(
+            std::slice::from_ref(&registration),
+            ":1.42",
+            "/com/pais/handy/test"
+        ));
+        assert!(listener_registration_absent(
+            std::slice::from_ref(&registration),
+            ":1.43",
+            "/com/pais/handy/test"
+        ));
+        assert!(listener_registration_absent(
+            &[],
+            ":1.42",
+            "/com/pais/handy/test"
+        ));
         let mut non_global = registration;
         non_global.6 = (false, false, false);
         assert!(!registered_keystroke_listener_matches(
             &non_global,
+            ":1.42",
+            "/com/pais/handy/test"
+        ));
+        assert!(!listener_registration_absent(
+            std::slice::from_ref(&non_global),
             ":1.42",
             "/com/pais/handy/test"
         ));

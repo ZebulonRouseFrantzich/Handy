@@ -233,11 +233,22 @@ impl FocusedOutputCapability {
         mixed_input_support: MixedInputSupport,
         supports_auto_submit: bool,
     ) -> Self {
-        assert_ne!(
-            mixed_input_support,
-            MixedInputSupport::Unavailable,
-            "a resolved Begin route requires mixed-input monitoring"
-        );
+        if mixed_input_support == MixedInputSupport::Unavailable {
+            assert_eq!(
+                safety_level,
+                FocusedOutputSafetyLevel::VerifiedControl,
+                "routes without mixed-input support must use verified target control"
+            );
+            assert_eq!(
+                route.receipt_confidence,
+                ReceiptConfidence::Verified,
+                "routes without mixed-input support require verified receipts"
+            );
+            assert!(
+                !supports_auto_submit,
+                "routes without mixed-input support cannot auto-submit"
+            );
+        }
         Self {
             available: true,
             safety_level,
@@ -385,6 +396,7 @@ pub enum UnsafeEditKind {
     SubmitOrNewlineAmbiguous,
     CommandShortcut,
     ImeComposition,
+    UnattributedInsertion,
     Unknown,
 }
 
@@ -655,6 +667,49 @@ mod tests {
             .expect("resolved capability must be accepted");
         assert!(receipt.capability.is_resolved());
         assert_eq!(receipt.capability.reason_code(), None);
+    }
+
+    #[test]
+    fn verified_route_can_resolve_without_mixed_input() {
+        let capability = FocusedOutputCapability::verified_control(
+            FocusedOutputBackend::Test,
+            TEST_ROUTE,
+            MixedInputSupport::Unavailable,
+            false,
+        );
+
+        assert!(capability.is_resolved());
+        assert_eq!(
+            capability.mixed_input_support(),
+            MixedInputSupport::Unavailable
+        );
+        assert!(!capability.supports_auto_submit());
+    }
+
+    #[test]
+    fn unavailable_mixed_input_rejects_guarded_and_submit_routes() {
+        let posted = ResolvedInsertionCapability {
+            insertion_transport: InsertionTransport::Test,
+            receipt_confidence: ReceiptConfidence::Posted,
+        };
+        assert!(std::panic::catch_unwind(|| {
+            FocusedOutputCapability::guarded_focused_control(
+                FocusedOutputBackend::Test,
+                posted,
+                MixedInputSupport::Unavailable,
+                false,
+            )
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            FocusedOutputCapability::verified_control(
+                FocusedOutputBackend::Test,
+                TEST_ROUTE,
+                MixedInputSupport::Unavailable,
+                true,
+            )
+        })
+        .is_err());
     }
 
     #[test]

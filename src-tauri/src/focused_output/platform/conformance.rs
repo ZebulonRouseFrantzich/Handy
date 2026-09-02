@@ -31,6 +31,15 @@ pub(crate) fn verified_capability(supports_auto_submit: bool) -> FocusedOutputCa
     )
 }
 
+pub(crate) fn verified_capability_without_mixed_input() -> FocusedOutputCapability {
+    FocusedOutputCapability::verified_control(
+        FocusedOutputBackend::Test,
+        VERIFIED_ROUTE,
+        MixedInputSupport::Unavailable,
+        false,
+    )
+}
+
 pub(crate) fn posted_capability(supports_auto_submit: bool) -> FocusedOutputCapability {
     FocusedOutputCapability::guarded_focused_control(
         FocusedOutputBackend::Test,
@@ -45,6 +54,7 @@ pub(crate) struct FakeSessionScript {
     submit_outcomes: VecDeque<SubmitOutcome>,
     acknowledgements: VecDeque<FakeAcknowledgement>,
     insert_delays: VecDeque<Duration>,
+    insertion_events: VecDeque<TargetInteractionEvent>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +75,7 @@ impl FakeSessionScript {
             submit_outcomes: submit_outcomes.into_iter().collect(),
             acknowledgements: VecDeque::new(),
             insert_delays: VecDeque::new(),
+            insertion_events: VecDeque::new(),
         }
     }
 
@@ -78,6 +89,14 @@ impl FakeSessionScript {
 
     pub(crate) fn with_insert_delays(mut self, delays: impl IntoIterator<Item = Duration>) -> Self {
         self.insert_delays = delays.into_iter().collect();
+        self
+    }
+
+    pub(crate) fn with_insertion_events(
+        mut self,
+        events: impl IntoIterator<Item = TargetInteractionEvent>,
+    ) -> Self {
+        self.insertion_events = events.into_iter().collect();
         self
     }
 
@@ -481,6 +500,9 @@ impl FocusedTargetSession for FakeTargetSession {
                 );
             }
         }
+        if let Some(event) = self.script.insertion_events.pop_front() {
+            self.event_sink.publish(self.session_id, event);
+        }
         outcome
     }
 
@@ -619,6 +641,20 @@ mod tests {
         }
     }
 
+    fn wait_for_reason(manager: &FocusedOutputManager, expected: FocusedOutputReasonCode) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if manager.latest_status().and_then(|status| status.reason) == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "focused manager did not publish the expected reason"
+            );
+            thread::yield_now();
+        }
+    }
+
     #[test]
     fn capability_states_preserve_route_invariants() {
         let unavailable = FocusedOutputCapability::unavailable(
@@ -649,6 +685,14 @@ mod tests {
         assert_eq!(verified.reason_code(), None);
         assert!(verified.supports_auto_submit());
 
+        let verified_without_mixed_input = verified_capability_without_mixed_input();
+        assert!(verified_without_mixed_input.is_resolved());
+        assert_eq!(
+            verified_without_mixed_input.mixed_input_support(),
+            MixedInputSupport::Unavailable
+        );
+        assert!(!verified_without_mixed_input.supports_auto_submit());
+
         let posted = posted_capability(false);
         assert!(posted.is_resolved());
         assert_eq!(
@@ -658,6 +702,173 @@ mod tests {
         assert_eq!(posted.route(), Some(POSTED_ROUTE));
         assert_eq!(posted.reason_code(), None);
         assert!(!posted.supports_auto_submit());
+    }
+
+    #[test]
+    fn verified_route_without_mixed_input_delivers_progressive_and_final_units() {
+        let backend = FakeBackend::new(verified_capability_without_mixed_input());
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let session = backend.session(session_id);
+
+        publish_until_inserted(&manager, &session, 1, session_id, 0, "progressive");
+        let disposition = manager.finalize(
+            session_id,
+            "progressive final".to_owned(),
+            Some(1),
+            finalize_options(false, false),
+        );
+
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                receipt_confidence: ReceiptConfidence::Verified,
+                external_edit_epoch: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            session.inserted_texts(),
+            ["progressive".to_owned(), " final".to_owned()]
+        );
+        assert_eq!(
+            session.call_order(),
+            [
+                FakeCallKind::InsertSpeech,
+                FakeCallKind::InsertSpeech,
+                FakeCallKind::Close,
+            ]
+        );
+        manager.shutdown();
+    }
+
+    #[test]
+    fn verified_prefix_is_committed_before_semantic_conflict_terminates() {
+        let backend = FakeBackend::new(verified_capability_without_mixed_input());
+        backend.queue_script(
+            FakeSessionScript::new(
+                [InsertOutcome::Partial {
+                    accepted_bytes: 4,
+                    receipt: ReceiptConfidence::Verified,
+                    reason: FocusedOutputReasonCode::MixedInputUnavailable,
+                }],
+                [],
+            )
+            .with_insertion_events([TargetInteractionEvent::TargetInvalidated {
+                observation_id: crate::focused_output::types::ObservationId(1),
+                reason: FocusedOutputReasonCode::TargetChanged,
+            }]),
+        );
+        let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+        let session_id = manager.allocate_session_id();
+        manager.begin(context(session_id, false)).unwrap();
+        let disposition = manager.finalize(
+            session_id,
+            "kept".to_owned(),
+            None,
+            finalize_options(false, false),
+        );
+
+        assert!(matches!(
+            disposition,
+            FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::PreservePartial {
+                reason: TerminalReason::UnsafeUserEdit,
+                speech_delivered_chars: 4,
+                ..
+            })
+        ));
+        let status = manager.latest_status().unwrap();
+        assert_eq!(
+            status.reason,
+            Some(FocusedOutputReasonCode::MixedInputUnavailable)
+        );
+        assert_eq!(
+            backend.session(session_id).call_order(),
+            [FakeCallKind::InsertSpeech, FakeCallKind::Close]
+        );
+        manager.shutdown();
+    }
+
+    #[test]
+    fn unavailable_mixed_input_events_stop_before_another_backend_call() {
+        for compatible_event in [true, false] {
+            let backend = FakeBackend::new(verified_capability_without_mixed_input());
+            let manager = FocusedOutputManager::new(Arc::new(backend.clone()));
+            let session_id = manager.allocate_session_id();
+            manager.begin(context(session_id, false)).unwrap();
+            let session = backend.session(session_id);
+            publish_until_inserted(&manager, &session, 1, session_id, 0, "kept");
+            let delivery_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if manager
+                    .latest_status()
+                    .is_some_and(|status| status.speech_delivered_chars == 4)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < delivery_deadline,
+                    "focused manager did not commit the verified prefix"
+                );
+                thread::yield_now();
+            }
+
+            let event = if compatible_event {
+                TargetInteractionEvent::CompatibleExternalInsertion {
+                    observation_id: ObservationId(1),
+                    chars: 1,
+                    caret_after: Some(5),
+                }
+            } else {
+                TargetInteractionEvent::UnsafeEdit {
+                    observation_id: ObservationId(1),
+                    kind: UnsafeEditKind::UnattributedInsertion,
+                }
+            };
+            session.publish_tagged(session_id, event);
+            wait_for_reason(&manager, FocusedOutputReasonCode::MixedInputUnavailable);
+            manager.publish_snapshot(TranscriptSnapshot {
+                session_id,
+                revision: 1,
+                committed: "kept later".to_owned(),
+                tentative: String::new(),
+            });
+            let disposition = manager.finalize(
+                session_id,
+                "kept later".to_owned(),
+                Some(1),
+                finalize_options(false, false),
+            );
+
+            match disposition {
+                FinalDeliveryDisposition::Focused(
+                    FocusedDeliveryDisposition::PreservePartial {
+                        reason,
+                        speech_delivered_chars,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(reason, TerminalReason::UnsafeUserEdit);
+                    assert_eq!(speech_delivered_chars, 4);
+                }
+                FinalDeliveryDisposition::Focused(FocusedDeliveryDisposition::Delivered {
+                    ..
+                }) => panic!("unavailable mixed input unexpectedly delivered"),
+                FinalDeliveryDisposition::LegacyPaste(_) => {
+                    panic!("armed route unexpectedly recovered fallback paste")
+                }
+                FinalDeliveryDisposition::NoText => {
+                    panic!("delivered prefix was not preserved")
+                }
+            }
+            assert_eq!(session.insertion_count(), 1);
+            assert_eq!(
+                session.call_order(),
+                [FakeCallKind::InsertSpeech, FakeCallKind::Close]
+            );
+            manager.shutdown();
+        }
     }
 
     #[test]
