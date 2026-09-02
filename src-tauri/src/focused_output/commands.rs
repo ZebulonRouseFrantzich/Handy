@@ -18,6 +18,15 @@ impl TauriFocusedOutputStatusSink {
 
 impl FocusedOutputStatusSink for TauriFocusedOutputStatusSink {
     fn publish(&self, event: &FocusedOutputStatusEvent) {
+        log::debug!(
+            "Focused output status: session={} status={:?} reason={:?} delivered_chars={} external_edit_epoch={} history_available={}",
+            event.session_id.get(),
+            event.status,
+            event.reason,
+            event.speech_delivered_chars,
+            event.external_edit_epoch,
+            event.history_available
+        );
         let _ = event.clone().emit(&self.app);
     }
 }

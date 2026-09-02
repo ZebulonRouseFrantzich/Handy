@@ -1958,6 +1958,7 @@ impl MonitorShared {
             .compare_exchange(T_NONE, code, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            log::debug!("Linux focused input monitor entered terminal state: code={code}");
             self.cancellation.cancel();
         }
     }
